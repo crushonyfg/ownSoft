@@ -6,7 +6,7 @@ import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import { buildPrompt } from "./codex.mjs";
 
-function executable() {
+export function executable() {
   if (process.platform !== "win32") return "claude";
   const paths = (process.env.PATH || "").split(delimiter).filter(Boolean);
   paths.unshift(join(homedir(), ".local", "bin"));
@@ -44,9 +44,9 @@ export class Claude {
     return env;
   }
 
-  #spawn(args) {
+  #spawn(args, cwd = this.directory) {
     return spawn(executable(), args, {
-      cwd: this.directory, env: this.#env(), windowsHide: true, stdio: ["pipe", "pipe", "pipe"]
+      cwd, env: this.#env(), windowsHide: true, stdio: ["pipe", "pipe", "pipe"]
     });
   }
 
@@ -104,7 +104,8 @@ export class Claude {
     return this.#login;
   }
 
-  async answer(input, { signal, update, model, effort }) {
+  async answer(input, { signal, update, activity = () => {}, tool = () => {}, usage = () => {}, limits = () => {},
+    model, effort, cwd }) {
     const prompt = buildPrompt(input);
     if (!(await this.account()).signedIn) throw new Error("请先用 Claude 订阅登录 Claude Code。");
     signal.throwIfAborted();
@@ -112,8 +113,8 @@ export class Claude {
     if (effort && !effortLevels.includes(effort)) throw new Error("此 Claude Effort 不可用。");
     const args = [
       "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-      "--no-session-persistence", "--strict-mcp-config", "--tools", "",
-      "--setting-sources", "", "--permission-mode", "dontAsk",
+      "--no-session-persistence", "--strict-mcp-config", "--tools", "default",
+      "--setting-sources", "", "--permission-mode", "auto",
       "--settings", '{"disableAllHooks":true}'
     ];
     if (model) args.push("--model", model);
@@ -135,7 +136,7 @@ export class Claude {
     }
     signal.throwIfAborted();
     return new Promise((resolve, reject) => {
-      const child = this.#spawn(args);
+      const child = this.#spawn(args, cwd || this.directory);
       const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
       let output = "";
       let result;
@@ -143,12 +144,44 @@ export class Claude {
       let stderr = "";
       const cancel = () => child.kill();
       signal.addEventListener("abort", cancel, { once: true });
-      const timer = setTimeout(() => { timedOut = true; cancel(); }, 180_000);
+      const timer = setTimeout(() => { timedOut = true; cancel(); }, 600_000);
       child.stderr.setEncoding("utf8").on("data", (text) => { stderr = (stderr + text).slice(-1600); });
       lines.on("line", (line) => {
         let event;
         try { event = JSON.parse(line); } catch { return; }
-        if (event.type === "result") result = event;
+        if (event.type === "result") {
+          result = event;
+          const counts = event.usage || {};
+          usage({
+            inputTokens: (counts.input_tokens || 0) + (counts.cache_read_input_tokens || 0) +
+              (counts.cache_creation_input_tokens || 0),
+            outputTokens: counts.output_tokens || 0
+          });
+        }
+        // Claude Code reports its subscription limit only as a status, with a percentage when close.
+        if (event.type === "rate_limit_event" && event.rate_limit_info) {
+          const info = event.rate_limit_info;
+          const reset = Number(info.resetsAt ?? info.resets_at);
+          const kind = String(info.rateLimitType ?? info.rate_limit_type ?? "limit");
+          const labels = { five_hour: "5 小时", seven_day: "每周", seven_day_opus: "每周 · Opus", seven_day_sonnet: "每周 · Sonnet" };
+          const utilization = Number(info.utilization);
+          limits([{ key: kind, label: labels[kind] || kind, status: String(info.status || ""),
+            usedPercent: Number.isFinite(utilization) ? Math.round(utilization <= 1 ? utilization * 100 : utilization) : null,
+            resetsAt: reset ? (reset < 1e12 ? reset * 1000 : reset) : null, observed: Date.now() }]);
+        }
+        const block = event.type === "stream_event" && event.event?.content_block;
+        if (block?.type === "tool_use" && block.name) {
+          activity(`正在使用 ${block.name}`);
+          tool({ id: block.id || `claude:${event.event.index}`, title: block.name,
+            detail: "", status: "running" });
+        }
+        if (event.type === "user") {
+          for (const item of event.message?.content || []) {
+            if (item.type === "tool_result" && item.tool_use_id) {
+              tool({ id: item.tool_use_id, status: item.is_error ? "failed" : "done" });
+            }
+          }
+        }
         const delta = event.type === "stream_event" && event.event?.delta;
         if (delta?.type === "text_delta") {
           output += delta.text;

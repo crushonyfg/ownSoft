@@ -4,8 +4,8 @@ export function initialNotebook() {
   return {
     title: "我的工作笔记",
     blocks: [
-      { id: "starter-1", kind: "paragraph", text: "把要阅读和整理的回答放进这份笔记。选中一句话，可以加高亮、写批注，或者打开侧边对话继续追问。", marks: [] },
-      { id: "starter-2", kind: "paragraph", text: "新分支从你选中的段落开始。侧边回答中有用的解释，可以摘成页边批注，留在原文旁。", marks: [] }
+      { id: "starter-1", kind: "paragraph", text: "把要阅读和整理的回答放进这份笔记。选中一句话，可以加高亮、写批注，或者打开侧边对话继续追问。", marks: [], included: false },
+      { id: "starter-2", kind: "paragraph", text: "新分支从你选中的段落开始。侧边回答中有用的解释，可以摘成页边批注，留在原文旁。", marks: [], included: false }
     ],
     notes: [],
     branches: []
@@ -23,22 +23,80 @@ export function splitReply(reply) {
   return splitMarkdown(reply);
 }
 
-const included = (block) => !block.removed && block.included !== false;
+const includedBlock = (block) => !block.removed && block.included !== false;
+
+// Paragraphs of one reply share a turnId; replies from different group members stay separate
+// messages. Older replies have no turnId and merge with their neighbours, as before.
+export function sameMessage(previous, block) {
+  return previous?.kind === "reply" && block?.kind === "reply" && (previous.turnId ?? null) === (block.turnId ?? null);
+}
+
+export function messageGroups(blocks) {
+  const groups = [];
+  for (const block of blocks) {
+    const last = groups.at(-1);
+    if (last && sameMessage(last.blocks.at(-1), block)) last.blocks.push(block);
+    else groups.push({ kind: block.kind, blocks: [block] });
+  }
+  return groups;
+}
+
+// The main chat's context: every earlier message, or (once chosen) only the chosen messages plus
+// everything added after the choice, so the conversation can carry on from there.
+export function contextBlockIds(notebook) {
+  const chosen = notebook.context;
+  if (!chosen || !Array.isArray(chosen.ids)) return null;
+  const ids = new Set(chosen.ids);
+  const allowed = new Set();
+  for (const group of messageGroups(notebook.blocks)) {
+    if (ids.has(group.blocks[0].id)) for (const block of group.blocks) allowed.add(block.id);
+  }
+  const cutoff = notebook.blocks.findIndex((block) => block.id === chosen.cutoff);
+  for (const block of notebook.blocks.slice(cutoff + 1)) allowed.add(block.id);
+  return allowed;
+}
 
 export function mainHistory(notebook) {
   const history = [];
   let turn;
+  let previous;
+  const allowed = contextBlockIds(notebook);
+  const included = (block) => includedBlock(block) && (!allowed || allowed.has(block.id));
   for (const block of notebook.blocks) {
     if (block.kind === "question") {
       turn = { question: included(block) ? block.text.trim() : "", replies: [],
         attachments: included(block) ? block.attachments || [] : [] };
       history.push(turn);
-    } else if (block.kind === "reply" && turn && included(block) && block.text.trim()) {
-      turn.replies.push(block.text);
+    } else if (block.kind === "reply" && turn) {
+      if (!sameMessage(previous, block) || !turn.replies.length) turn.replies.push({ speaker: block.source?.memberName, texts: [] });
+      if (included(block) && block.text.trim()) turn.replies.at(-1).texts.push(block.text);
     }
+    if (block.kind !== "paragraph") previous = block;
   }
-  return history.map(({ question, replies, attachments }) => ({ question, answer: replies.join("\n\n"), attachments }))
-    .filter((turn) => turn.question || turn.answer || turn.attachments.length);
+  return history.map(({ question, replies, attachments }) => {
+    const spoken = replies.filter((reply) => reply.texts.length);
+    const labelled = spoken.some((reply) => reply.speaker);
+    const answer = spoken.map((reply) => (labelled && reply.speaker ? `【${reply.speaker}】\n` : "") +
+      reply.texts.join("\n\n")).join("\n\n");
+    return { question, answer, attachments };
+  }).filter((turn) => turn.question || turn.answer || turn.attachments.length);
+}
+
+export function sharedNoteIncluded(block) {
+  return !block.removed && block.included !== false &&
+    (block.included === true || !["starter-1", "starter-2"].includes(block.id));
+}
+
+export function sharedNoteBlocks(notebook) {
+  const allowed = contextBlockIds(notebook);
+  return notebook.blocks.filter((block) => block.kind === "paragraph" && sharedNoteIncluded(block) &&
+    (!allowed || allowed.has(block.id)));
+}
+
+export function sharedNoteContext(notebook) {
+  const content = sharedNoteBlocks(notebook).map((block) => block.noteType === "image"
+    ? `图片「${block.attachments?.[0]?.name || "图片"}」：${block.text}` : block.text).filter(Boolean).join("\n\n");
+  return [commentContext(notebook.origin), content && `公共笔记：\n${content}`].filter(Boolean).join("\n\n");
 }
 
 export function noteOrigin(notebook, note) {
@@ -74,10 +132,23 @@ export function commentInput(origin, turns, question) {
   };
 }
 
+// Annotations chosen as main-chat context (by default none are), with the passage each one marks.
+export function contextNotes(notebook) {
+  const ids = new Set(notebook.context?.notes || []);
+  return notebook.notes.filter((note) => ids.has(note.id));
+}
+
+function annotationContext(notebook) {
+  const notes = contextNotes(notebook);
+  if (!notes.length) return "";
+  return "选入的批注：\n" + notes.map((note) =>
+    `- ${note.author || "批注"}（标在「${note.anchor.label || note.anchor.quote}」旁）：${note.text}`).join("\n");
+}
+
 export function turnInput(notebook, branch, question) {
   if (!branch) {
     return {
-      context: commentContext(notebook.origin),
+      context: [sharedNoteContext(notebook), annotationContext(notebook)].filter(Boolean).join("\n\n"),
       memories: notebook.notes.filter((note) => note.pinned && (notebook.mainMemoryIds || []).includes(note.id))
         .map((note) => note.text),
       history: mainHistory(notebook).map(({ question, answer }) => ({ question, answer })),
@@ -85,10 +156,16 @@ export function turnInput(notebook, branch, question) {
     };
   }
   return {
-    context: branch.context,
+    context: [branch.context, sharedNoteContext(notebook)].filter(Boolean).join("\n\n"),
     memories: notebook.notes.filter((note) => note.pinned && branch.memoryIds.includes(note.id))
       .map((note) => note.text),
     history: branch.turns.map(({ question, answer }) => ({ question, answer })),
     question
   };
+}
+
+// Models sometimes sign their answer anyway ("claude2：…", "【claude2】…"); the name is shown already.
+export function stripSpeaker(answer, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return answer.replace(new RegExp(`^\\s*(?:【${escaped}】|\\*\\*${escaped}\\*\\*\\s*[:：]|${escaped}\\s*[:：])\\s*`, "i"), "").trim() || answer;
 }

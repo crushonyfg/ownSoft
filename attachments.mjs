@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, extname, join } from "node:path";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
@@ -19,7 +19,8 @@ let pdfModule;
 export function allAttachmentRefs(state) {
   return [
     ...state.blocks.flatMap((block) => block.attachments || []),
-    ...state.branches.flatMap((branch) => branch.turns.flatMap((turn) => turn.attachments || []))
+    ...state.branches.flatMap((branch) => branch.turns.flatMap((turn) => turn.attachments || [])),
+    ...(state.notes || []).flatMap((note) => note.attachments || [])
   ];
 }
 
@@ -107,19 +108,32 @@ export async function readPdf(data, name, { signal, addImage, addText }) {
 export class AttachmentStore {
   #pending = new Map();
 
-  constructor(directory, work) {
+  // Saved files that no message uses any more go to `trash` instead of being deleted, so restoring
+  // an older backup of the notes can bring them back.
+  constructor(directory, work, trash = join(dirname(directory), "attachments-trash")) {
     this.directory = directory;
     this.work = work;
+    this.trash = trash;
+  }
+
+  async #discard(name) {
+    await rename(join(this.directory, name), join(this.trash, name));
   }
 
   async initialize(saved) {
-    await Promise.all([mkdir(this.directory, { recursive: true }), mkdir(this.work, { recursive: true })]);
+    await Promise.all([this.directory, this.work, this.trash].map((dir) => mkdir(dir, { recursive: true })));
     const keep = new Set(saved.map((ref) => ref.id + ref.extension));
-    for (const [dir, retain] of [[this.directory, keep], [this.work, new Set()]]) {
-      const names = await readdir(dir, { withFileTypes: true });
-      await Promise.allSettled(names.filter((entry) => entry.isFile() && storedName.test(entry.name) && !retain.has(entry.name))
-        .map((entry) => unlink(join(dir, entry.name))));
-    }
+    const present = new Set((await readdir(this.directory)).filter((name) => storedName.test(name)));
+    // Files referenced again (for example after restoring a backup) come back from the trash.
+    await Promise.allSettled([...keep].filter((name) => storedName.test(name) && !present.has(name))
+      .map(async (name) => {
+        await access(join(this.trash, name));
+        await rename(join(this.trash, name), join(this.directory, name));
+      }));
+    await Promise.allSettled([...present].filter((name) => !keep.has(name)).map((name) => this.#discard(name)));
+    const work = await readdir(this.work, { withFileTypes: true });
+    await Promise.allSettled(work.filter((entry) => entry.isFile() && storedName.test(entry.name))
+      .map((entry) => unlink(join(this.work, entry.name))));
   }
 
   path(ref) {
@@ -134,16 +148,22 @@ export class AttachmentStore {
     if (!Array.isArray(paths) || !Number.isInteger(available) || available < 1 || available > maxFilesPerMessage) {
       throw new Error(`每条消息最多添加 ${maxFilesPerMessage} 个附件。`);
     }
-    for (const path of paths.slice(0, available)) {
-      if (typeof path !== "string" || !path) {
+    // Each entry is a local path, or { name, data } for pasted or dragged content that has no file.
+    for (const entry of paths.slice(0, available)) {
+      const inline = entry && typeof entry === "object" && ArrayBuffer.isView(entry.data);
+      if (!inline && (typeof entry !== "string" || !entry)) {
         errors.push("请选择或拖入本机文件。");
         continue;
       }
-      const name = basename(path);
+      const name = inline ? String(entry.name || "粘贴的图片.png").slice(0, 120) : basename(entry);
       const extension = extname(name).toLowerCase();
       try {
         if (!extensions.has(extension)) throw new Error(`「${name}」不是支持的 PDF、PNG、JPG 或 WebP 文件。`);
-        const data = await readCandidate(path, name);
+        if (inline && (entry.data.byteLength < 1 || entry.data.byteLength > maxFileSize)) {
+          throw new Error(`「${name}」需要是 20 MB 以内的非空文件。`);
+        }
+        const data = inline ? Buffer.from(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength)
+          : await readCandidate(entry, name);
         if (!isExpectedFile(data, extension)) throw new Error(`「${name}」的内容与文件格式不匹配。`);
         const ref = { id: randomUUID(), extension, name, size: data.length };
         await writeFile(this.path(ref), data, { flag: "wx" });
@@ -155,6 +175,10 @@ export class AttachmentStore {
     }
     if (paths.length > available) errors.push(`每条消息最多添加 ${maxFilesPerMessage} 个附件。`);
     return { items, errors };
+  }
+
+  pendingRef(id) {
+    return this.#pending.get(id);
   }
 
   pending(ids = []) {
@@ -179,7 +203,7 @@ export class AttachmentStore {
 
   async deleteSaved(refs, retained) {
     const keep = new Set(retained.map((ref) => ref.id));
-    await Promise.allSettled(refs.filter((ref) => !keep.has(ref.id)).map((ref) => unlink(this.path(ref))));
+    await Promise.allSettled(refs.filter((ref) => !keep.has(ref.id)).map((ref) => this.#discard(basename(this.path(ref)))));
   }
 
   async prepare(refs, signal, screenshot) {

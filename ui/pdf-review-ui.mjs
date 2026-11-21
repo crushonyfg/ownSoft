@@ -15,6 +15,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   const view = get("pdf-view");
   const sheet = get("review-page-sheet");
   const scroll = get("review-scroll");
+  const stack = get("review-page-stack");
   const textLayer = get("review-text");
   const canvas = get("review-canvas");
   const boxLayer = get("review-box-layer");
@@ -37,6 +38,12 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   let textTask;
   let sequence = 0;
   let frame = 0;
+  let visibleFrame = 0;
+  let slots = [];
+  let firstPageRatio = 1.414;
+  const pageRatios = new Map();
+  const previewJobs = new Map();
+  let previewGeneration = 0;
 
   const attempt = (work) => Promise.resolve().then(work).catch((error) => notify(error.message));
   const all = () => [...(state?.comments || [])].sort(byPage);
@@ -149,6 +156,107 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     }
   }
 
+  function pageWidth(originalWidth) {
+    const zoom = Number(get("review-zoom").value);
+    const inset = parseFloat(getComputedStyle(scroll).paddingLeft) + parseFloat(getComputedStyle(scroll).paddingRight);
+    return Math.min(Math.max(220, scroll.clientWidth - inset - 3), originalWidth * 1.45) * zoom;
+  }
+
+  function clearPreviews() {
+    previewGeneration += 1;
+    for (const job of previewJobs.values()) job.task?.cancel();
+    previewJobs.clear();
+    for (const slot of slots) slot.querySelector(":scope > canvas")?.remove();
+  }
+
+  function sizeSlots() {
+    if (!pdf) return;
+    const width = pageWidth((awaitedFirstPageWidth || 612));
+    for (const [index, slot] of slots.entries()) {
+      slot.style.height = `${Math.max(200, Math.round(width * (pageRatios.get(index + 1) || firstPageRatio)))}px`;
+    }
+  }
+
+  let awaitedFirstPageWidth = 612;
+  const stackTop = () => stack.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop;
+  function buildSlots() {
+    clearPreviews();
+    slots = Array.from({ length: pdf.numPages }, (_, index) => {
+      const slot = make("div", "review-page-slot");
+      slot.dataset.page = String(index + 1);
+      slot.append(make("span", "page-placeholder", `第 ${index + 1} 页`));
+      return slot;
+    });
+    stack.replaceChildren(...slots);
+    sizeSlots();
+    slots[pageNumber - 1]?.append(sheet);
+  }
+
+  async function renderPreview(number) {
+    if (!pdf || number === pageNumber || previewJobs.has(number)) return;
+    const slot = slots[number - 1];
+    if (!slot || slot.querySelector(":scope > canvas")) return;
+    const generation = previewGeneration;
+    const document = pdf;
+    const job = { task: null };
+    previewJobs.set(number, job);
+    try {
+      const page = await document.getPage(number);
+      if (generation !== previewGeneration || document !== pdf || number === pageNumber) return;
+      const original = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: pageWidth(original.width) / original.width });
+      pageRatios.set(number, original.height / original.width);
+      slot.style.height = `${Math.round(viewport.height)}px`;
+      const canvas = make("canvas");
+      canvas.setAttribute("aria-label", `PDF 第 ${number} 页`);
+      const pixelRatio = Math.min(devicePixelRatio || 1, 2);
+      canvas.width = Math.round(viewport.width * pixelRatio);
+      canvas.height = Math.round(viewport.height * pixelRatio);
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+      slot.append(canvas);
+      job.task = page.render({ canvas, viewport,
+        transform: pixelRatio === 1 ? null : [pixelRatio, 0, 0, pixelRatio, 0, 0],
+        annotationMode: pdfjs.AnnotationMode.DISABLE });
+      await job.task.promise;
+    } catch (error) {
+      if (!["RenderingCancelledException", "AbortException"].includes(error.name)) notify(error.message);
+    } finally {
+      if (previewJobs.get(number) === job) previewJobs.delete(number);
+    }
+  }
+
+  function visiblePage() {
+    const target = scroll.scrollTop + scroll.clientHeight * .38 - stackTop();
+    let low = 0;
+    let high = slots.length - 1;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      const slot = slots[middle];
+      if (slot.offsetTop + slot.offsetHeight < target) low = middle + 1;
+      else high = middle;
+    }
+    return Math.min(slots.length, low + 1);
+  }
+
+  function scheduleVisible() {
+    if (visibleFrame || !pdf || view.hidden || !slots.length) return;
+    visibleFrame = requestAnimationFrame(() => {
+      visibleFrame = 0;
+      const number = visiblePage();
+      if (number && number !== pageNumber) attempt(() => changePage(number, undefined, false));
+      for (let page = Math.max(1, number - 2); page <= Math.min(pdf.numPages, number + 2); page++) {
+        if (page !== pageNumber) void renderPreview(page);
+      }
+      for (const [index, slot] of slots.entries()) {
+        if (Math.abs(index + 1 - number) > 3) {
+          slot.querySelector(":scope > canvas")?.remove();
+          previewJobs.get(index + 1)?.task?.cancel();
+        }
+      }
+    });
+  }
+
   async function renderPage() {
     if (!pdf || view.hidden) return;
     if (selection) {
@@ -159,13 +267,16 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     const token = ++sequence;
     rendering?.cancel();
     textTask?.cancel();
-    const page = await pdf.getPage(pageNumber);
+    const number = pageNumber;
+    const slot = slots[number - 1];
+    if (!slot) return;
+    slot.append(sheet);
+    const page = await pdf.getPage(number);
     if (token !== sequence) return;
-    const zoom = Number(get("review-zoom").value);
     const original = page.getViewport({ scale: 1 });
-    const inset = parseFloat(getComputedStyle(scroll).paddingLeft) + parseFloat(getComputedStyle(scroll).paddingRight);
-    const width = Math.min(Math.max(220, scroll.clientWidth - inset - 3), original.width * 1.45);
-    const viewport = page.getViewport({ scale: width * zoom / original.width });
+    const viewport = page.getViewport({ scale: pageWidth(original.width) / original.width });
+    pageRatios.set(number, original.height / original.width);
+    slot.style.height = `${Math.round(viewport.height)}px`;
     const pixelRatio = Math.min(devicePixelRatio || 1, 2);
     sheet.style.width = `${viewport.width}px`;
     sheet.style.height = `${viewport.height}px`;
@@ -184,7 +295,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     textTask = layer;
     try {
       await Promise.all([renderTask.promise, layer.render()]);
-      if (token === sequence) renderedPage = pageNumber;
+      if (token === sequence) renderedPage = number;
     } catch (error) {
       if (token === sequence && !["RenderingCancelledException", "AbortException"].includes(error.name)) throw error;
     } finally {
@@ -199,11 +310,19 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     if (frame || !pdf || view.hidden) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
-      attempt(renderPage);
+      attempt(async () => { await renderPage(); scheduleVisible(); });
     });
   }
 
-  async function changePage(number, selected) {
+  function reflowPages() {
+    if (!pdf || view.hidden) return;
+    clearPreviews();
+    sizeSlots();
+    scroll.scrollTop = (slots[pageNumber - 1]?.offsetTop || 0) + stackTop();
+    scheduleRender();
+  }
+
+  async function changePage(number, selected, jump = true) {
     if (!pdf) return;
     const newPage = Math.max(1, Math.min(pdf.numPages, Number.isInteger(number) ? number : pageNumber));
     const changed = newPage !== pageNumber;
@@ -212,12 +331,17 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     selection = undefined;
     if (changed) {
       setBoxMode(false);
-      scroll.scrollTop = 0;
-      get("review-comment-list").closest("aside").scrollTop = 0;
+      if (jump) {
+        scroll.scrollTop = slots[newPage - 1].offsetTop + stackTop();
+        get("review-comment-list").closest("aside").scrollTop = 0;
+      }
     }
     refreshToolbar();
     refreshComments();
-    if (changed) await Promise.all([renderPage(), remember()]);
+    if (changed) {
+      await Promise.all([renderPage(), remember()]);
+      scheduleVisible();
+    }
   }
 
   async function selectComment(item, fromPage) {
@@ -402,6 +526,12 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
       pdf = loaded;
       state = { id: opened.id, comments: opened.comments };
       pageNumber = Math.max(1, Math.min(pdf.numPages, opened.page || 1));
+      const firstPage = await pdf.getPage(1);
+      const firstSize = firstPage.getViewport({ scale: 1 });
+      awaitedFirstPageWidth = firstSize.width;
+      firstPageRatio = firstSize.height / firstSize.width;
+      pageRatios.clear();
+      buildSlots();
       activeId = selection = undefined;
       closeSelectionChat();
       setBoxMode(false);
@@ -413,11 +543,12 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
       get("review-page").max = pdf.numPages;
       get("review-layout").hidden = get("review-nav").hidden = get("review-selection-tools").hidden = get("review-save").hidden = false;
       get("review-empty").hidden = true;
-      scroll.scrollTop = 0;
+      scroll.scrollTop = slots[pageNumber - 1].offsetTop + stackTop();
       get("review-comment-list").closest("aside").scrollTop = 0;
       refreshToolbar();
       refreshComments();
       await Promise.all([renderPage(), remember()]);
+      scheduleVisible();
     } catch (error) {
       if (opened && opened.id !== state?.id) {
         await task?.destroy().catch(() => {});
@@ -457,7 +588,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   get("review-prev").addEventListener("click", () => attempt(() => changePage(pageNumber - 1)));
   get("review-next").addEventListener("click", () => attempt(() => changePage(pageNumber + 1)));
   get("review-page").addEventListener("change", (event) => attempt(() => changePage(Number(event.target.value))));
-  get("review-zoom").addEventListener("change", scheduleRender);
+  get("review-zoom").addEventListener("change", reflowPages);
   get("review-comment-prev").addEventListener("click", () => attempt(() => stepComment(-1)));
   get("review-comment-next").addEventListener("click", () => attempt(() => stepComment(1)));
   get("review-add").addEventListener("pointerdown", (event) => { captureSelection(); event.preventDefault(); });
@@ -501,7 +632,8 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     selection = undefined;
     refreshToolbar();
   });
-  new ResizeObserver(scheduleRender).observe(scroll);
+  scroll.addEventListener("scroll", scheduleVisible, { passive: true });
+  new ResizeObserver(reflowPages).observe(scroll);
   window.addEventListener("beforeunload", (event) => {
     if (dirty) {
       event.preventDefault();

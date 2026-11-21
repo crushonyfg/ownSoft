@@ -53,3 +53,17 @@ test("attachments retain text and visual PDF pages, and clean up temporary rende
   }
   assert.deepEqual(await readdir(work), []);
 });
+
+test("pasted images without a file path are staged from their bytes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "notebook-paste-test-"));
+  const store = new AttachmentStore(join(directory, "saved"), join(directory, "work"));
+  await store.initialize([]);
+  const canvas = createCanvas(8, 8);
+  const png = new Uint8Array(await canvas.encode("png"));
+  const { items, errors } = await store.stage([{ name: "截图 2026-11-21.png", data: png },
+    { name: "假图片.png", data: new TextEncoder().encode("not a png") }], 6);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].name, "截图 2026-11-21.png");
+  assert.match(errors[0], /格式不匹配/);
+  assert.deepEqual(await readdir(join(directory, "saved")), [items[0].id + ".png"]);
+});

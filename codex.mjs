@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 
-function codexExecutable() {
+export function codexExecutable() {
   if (process.platform !== "win32") return "codex";
   const architecture = process.arch === "arm64" ? "arm64" : "x64";
   const target = architecture === "arm64" ? "aarch64" : "x86_64";
@@ -19,22 +19,55 @@ function codexExecutable() {
       if (existsSync(candidate)) return candidate;
     }
   }
-  throw new Error("找不到 Codex CLI。安装官方 Codex CLI 后，再打开此应用。");
+  const bundled = desktopCodex();
+  if (bundled) return bundled;
+  throw new Error("找不到 Codex CLI。安装 Codex 桌面版或官方 Codex CLI 后，再打开此应用。");
+}
+
+// Without a standalone CLI, use the codex.exe that ships inside the Codex desktop app (a Store
+// package, whose install folder Windows only reveals through Get-AppxPackage). Looked up once.
+let desktopLookup;
+function desktopCodex() {
+  if (desktopLookup !== undefined) return desktopLookup;
+  desktopLookup = null;
+  try {
+    const shell = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const location = execFileSync(shell, ["-NoProfile", "-NonInteractive", "-Command",
+      "(Get-AppxPackage -Name 'OpenAI.Codex' | Sort-Object Version -Descending | Select-Object -First 1).InstallLocation"],
+    { encoding: "utf8", timeout: 15_000, windowsHide: true }).trim();
+    const candidate = location && join(location, "app", "resources", "codex.exe");
+    if (candidate && existsSync(candidate)) desktopLookup = candidate;
+  } catch {}
+  return desktopLookup;
 }
 
 const options = [
   'model_provider="openai"', 'forced_login_method="chatgpt"',
-  'web_search="disabled"', 'history.persistence="none"',
-  "features.shell_tool=false", "features.shell_snapshot=false",
+  'web_search="live"', 'history.persistence="none"',
   "features.apps=false", "features.plugins=false", "features.hooks=false",
-  "features.memories=false", "features.multi_agent=false", "features.fast_mode=false",
-  "skills.include_instructions=false", "mcp_servers={}"
+  "features.memories=false", "skills.include_instructions=false", "mcp_servers={}"
 ].flatMap((option) => ["-c", option]);
 
-export function buildPrompt({ context, memories, history, question, documents = [], images = [] }) {
+// In the group chat each model is told who it is and who else is present; earlier answers in the
+// history are prefixed with the speaker, e.g. 【gpt1】.
+function personaSection({ name, provider, others = [], round = [], role = "" }) {
+  const position = round.indexOf(name);
+  return [role ? `你的角色设定（始终按它回答，优先于下面的一般说明）：\n${role}\n\n` : "",
+    `你是群聊里的成员「${name}」（${provider}）。`,
+    others.length ? `群里还有：${others.join("、")}。用户用 @名字 指定谁回答。` : "",
+    round.length > 1 ? `这次提问点名了 ${round.join("、")}，按这个顺序依次回答，你是第 ${position + 1} 位` +
+      (position > 0 ? "，前面成员的回答在下面" : "，后面的成员会接着回答") +
+      "。只回答提问里给你的部分，不要替其他成员回答或评价他们还没说的话。" : "",
+    "历史里以【成员名】开头的回答是那位成员说的；没有标注的旧回答来自之前的模型，不一定是你说的。",
+    "直接回答，不要在开头写自己的名字。"].filter(Boolean).join("");
+}
+
+export function buildPrompt({ context, memories, history, question, documents = [], images = [], persona, peers = "" }) {
   const sections = [];
+  if (persona) sections.push("你的身份\n" + personaSection(persona));
   if (history.length) sections.push("已有对话\n" + JSON.stringify(history));
-  if (context) sections.push("引用的原文段落\n" + context);
+  if (peers) sections.push("本轮其他成员已经回答了同一个问题\n" + peers);
+  if (context) sections.push("笔记上下文\n" + context);
   if (memories.length) sections.push("我选入的记忆\n" + memories.map((text, index) => `${index + 1}. ${text}`).join("\n"));
   if (documents.length) sections.push("PDF 正文\n" + documents.map(({ file, page, text }) =>
     `「${file}」第 ${page} 页\n${text}`).join("\n\n"));
@@ -59,10 +92,11 @@ export class Codex extends EventEmitter {
   #requestId = 0;
   #pending = new Map();
 
-  constructor(directory, configDirectory) {
+  constructor(directory, configDirectory, approve) {
     super();
     this.directory = directory;
     this.configDirectory = configDirectory;
+    this.approve = approve;
   }
 
   async connect() {
@@ -143,9 +177,25 @@ export class Codex extends EventEmitter {
       return;
     }
     if (message.method && message.id !== undefined) {
-      if (child.stdin.writable) {
-        this.#write({ id: message.id, error: { code: -32601, message: "This notebook only supports text replies." } });
+      const approvals = new Set([
+        "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+        "item/permissions/requestApproval"
+      ]);
+      if (!approvals.has(message.method)) {
+        if (child.stdin.writable) this.#write({ id: message.id,
+          error: { code: -32601, message: "This request is not supported by the notebook." } });
+        return;
       }
+      void Promise.resolve().then(() => this.approve?.(message.method, message.params))
+        .then((result) => {
+          if (child === this.#child && child.stdin.writable) this.#write({ id: message.id,
+            result: result || (message.method === "item/permissions/requestApproval"
+              ? { permissions: {}, scope: "turn" } : { decision: "decline" }) });
+        }).catch(() => {
+          if (child === this.#child && child.stdin.writable) this.#write({ id: message.id,
+            result: message.method === "item/permissions/requestApproval"
+              ? { permissions: {}, scope: "turn" } : { decision: "decline" } });
+        });
       return;
     }
     if (message.method) {
@@ -188,7 +238,26 @@ export class Codex extends EventEmitter {
     return models;
   }
 
-  async answer(payload, { signal, update, model: selectedModel, effort }) {
+  // The ChatGPT plan's usage windows (5-hour and weekly), as percentages used.
+  async rateLimits() {
+    await this.connect();
+    const result = await this.#request("account/rateLimits/read", undefined);
+    const limits = result?.rateLimits ?? result;
+    const label = (window, fallback) => {
+      const minutes = Number(window.windowDurationMins);
+      if (minutes === 300) return "5 小时";
+      if (minutes === 10080) return "每周";
+      return minutes ? (minutes % 1440 ? `${Math.round(minutes / 60)} 小时` : `${minutes / 1440} 天`) : fallback;
+    };
+    return [[limits?.primary, "短期"], [limits?.secondary, "长期"]].filter(([window]) => window).map(([window, fallback]) => {
+      const reset = Number(window.resetsAt ?? window.resetAt);
+      return { key: fallback, label: label(window, fallback), usedPercent: Number(window.usedPercent),
+        resetsAt: reset ? (reset < 1e12 ? reset * 1000 : reset) : null };
+    });
+  }
+
+  async answer(payload, { signal, update, activity = () => {}, tool = () => {}, usage = () => {},
+    model: selectedModel, effort, cwd }) {
     let text = buildPrompt(payload);
     const account = await this.account();
     if (!account.signedIn) throw new Error("请先用 ChatGPT 订阅登录 Codex。");
@@ -202,7 +271,7 @@ export class Codex extends EventEmitter {
     }
     signal.throwIfAborted();
     const { thread } = await this.#request("thread/start", {
-      cwd: this.directory, ephemeral: true, sandbox: "read-only", approvalPolicy: "never",
+      cwd: cwd || this.directory, ephemeral: true, sandbox: "workspace-write", approvalPolicy: "on-request",
       model: model.id
     });
     try {
@@ -219,13 +288,14 @@ export class Codex extends EventEmitter {
       signal.throwIfAborted();
       const input = [{ type: "text", text },
         ...(payload.images || []).map(({ path }) => ({ type: "localImage", path }))];
-      return await this.#turn(thread.id, input, { signal, update, effort: effort || model.defaultEffort });
+      return await this.#turn(thread.id, input, { signal, update, activity, tool, usage,
+        effort: effort || model.defaultEffort });
     } finally {
       if (this.#child) await this.#request("thread/unsubscribe", { threadId: thread.id }).catch(() => {});
     }
   }
 
-  #turn(threadId, input, { signal, update, effort }) {
+  #turn(threadId, input, { signal, update, activity, tool, usage, effort }) {
     return new Promise((resolve, reject) => {
       const messages = new Map();
       let turnId;
@@ -263,10 +333,31 @@ export class Codex extends EventEmitter {
       const timeout = setTimeout(() => {
         finish(new Error("Codex 生成超时。可以重新发送问题。"));
         this.close();
-      }, 180_000);
+      }, 600_000);
       add("disconnected", (error) => finish(error));
+      const toolLabels = { webSearch: "搜索网页", commandExecution: "运行命令",
+        fileChange: "修改文件", mcpToolCall: "调用外部工具",
+        imageView: "查看图片", collabToolCall: "调用助手" };
+      const reportTool = (params, status) => {
+        if (params.threadId !== threadId || !toolLabels[params.item?.type]) return;
+        const item = params.item;
+        const detail = item.query || item.command || item.tool || item.name || item.path || "";
+        tool({ id: item.id || `${item.type}:${detail}`, title: toolLabels[item.type], detail, status });
+      };
+      add("item/started", (params) => {
+        if (params.threadId !== threadId) return;
+        if (toolLabels[params.item?.type]) activity(`正在${toolLabels[params.item.type]}`);
+        reportTool(params, "running");
+      });
+      add("item/completed", (params) => reportTool(params,
+        params.item?.status === "failed" ? "failed" : "done"));
       add("item/started", record);
       add("item/completed", record);
+      add("thread/tokenUsage/updated", (params) => {
+        if (params.threadId !== threadId) return;
+        const counts = params.tokenUsage?.total ?? params.tokenUsage?.last;
+        if (counts) usage({ inputTokens: counts.inputTokens, outputTokens: counts.outputTokens });
+      });
       add("item/agentMessage/delta", (params) => {
         if (params.threadId !== threadId) return;
         const item = messages.get(params.itemId) || { text: "" };
