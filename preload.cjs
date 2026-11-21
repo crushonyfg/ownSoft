@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld("notebook", {
   read: () => invoke("notebook:read"),
   library: () => invoke("library:read"),
   openNotebook: (id) => invoke("library:open", id),
+  openNotebookWindow: (id) => invoke("window:open", id),
   createNotebook: (title, folderId) => invoke("library:create", { title, folderId }),
   renameNotebook: (id, title) => invoke("library:rename", { id, title }),
   moveNotebook: (id, folderId) => invoke("library:move", { id, folderId }),
@@ -67,6 +68,7 @@ contextBridge.exposeInMainWorld("notebook", {
   openAttachment: (id) => invoke("attachments:open", id),
   openLink: (url) => invoke("notebook:open-link", url),
   openReview: (file) => invoke("review:open", webUtils.getPathForFile(file)),
+  openAttachmentReview: (id) => invoke("review:open-attachment", id),
   recentReview: () => invoke("review:recent"),
   restoreReview: () => invoke("review:restore"),
   visitReview: (details) => invoke("review:visit", details),
@@ -79,5 +81,6 @@ contextBridge.exposeInMainWorld("notebook", {
   onTool: (callback) => { ipcRenderer.on("turn:tool", (_event, data) => callback(data)); },
   onMember: (callback) => { ipcRenderer.on("turn:member", (_event, data) => callback(data)); },
   onSaved: (callback) => { ipcRenderer.on("turn:saved", (_event, data) => callback(data)); },
-  onAccount: (callback) => { ipcRenderer.on("account:status", (_event, data) => callback(data)); }
+  onAccount: (callback) => { ipcRenderer.on("account:status", (_event, data) => callback(data)); },
+  onLibraryChanged: (callback) => { ipcRenderer.on("library:changed", () => callback()); }
 });

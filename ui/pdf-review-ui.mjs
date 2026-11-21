@@ -489,7 +489,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     });
   }
 
-  async function load(file) {
+  async function load(file, attachmentId) {
     const checkPending = () => {
       if (state && commentChats.pending(`pdf:${state.id}:`)) {
         throw new Error("请先完成或停止当前审阅的批注追问。");
@@ -502,7 +502,8 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     let task;
     let opened;
     try {
-      opened = file ? await api.openReview(file) : await api.restoreReview();
+      opened = attachmentId ? await api.openAttachmentReview(attachmentId) :
+        file ? await api.openReview(file) : await api.restoreReview();
       if (!opened) return;
       pdfjs ||= await import("./pdf-runtime/build/pdf.min.mjs");
       const asset = (path) => new URL(`./pdf-runtime/${path}`, location.href).href;
@@ -641,6 +642,10 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     }
   });
   return {
+    openAttachment: (id) => {
+      if (dirty && !window.confirm("当前 PDF 批注未保存。要放弃改动并打开附件吗？")) return false;
+      return load(null, id).then(() => true);
+    },
     activate: () => {
       if (state) return scheduleRender();
       attempt(async () => {

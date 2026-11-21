@@ -58,6 +58,12 @@
     </div>
   </header>
 
+  <div id="focus-shade" class="focus-shade" hidden></div>
+  <div id="focus-bar" class="focus-bar" hidden>
+    <button type="button" data-action="close-focus" aria-label="返回主聊天">← 返回主聊天</button>
+    <span id="focus-parent"></span><span aria-hidden="true">›</span><strong id="focus-title"></strong>
+  </div>
+
   <div class="workspace-layout">
     <aside id="notebook-library" class="notebook-library" aria-label="笔记列表">
       <div class="library-create-actions">
@@ -126,7 +132,7 @@
       <aside id="side-chat" class="side-chat" aria-label="侧边对话" hidden>
         <header class="side-header">
           <div><p class="eyebrow" id="chat-provider">GPT</p><h2>侧边对话</h2></div>
-          <button type="button" data-action="close-chat">收起</button>
+          <div class="side-header-actions"><button type="button" data-action="focus-branch" title="放大分支">放大</button><button type="button" data-action="close-chat">收起</button></div>
         </header>
         <div class="side-actions">
           <button type="button" data-action="locate-branch">定位原文</button>
@@ -172,6 +178,7 @@
 
   <main id="pdf-view" class="pdf-review-view" aria-label="PDF 审阅" hidden>
     <div class="review-toolbar">
+      <button type="button" data-action="close-focus" class="review-back">← 返回聊天</button>
       <input type="file" id="review-file" accept=".aipdf,.pdf" hidden>
       <button type="button" id="review-open">打开</button>
       <div class="review-file-info"><strong id="review-name">PDF 审阅</strong><span id="review-dirty" hidden>未保存</span></div>

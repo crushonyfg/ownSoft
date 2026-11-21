@@ -42,6 +42,7 @@ if (override) {
   app.setPath("userData", override);
 }
 let window;
+const windows = new Set();
 let store;
 let profiles;
 let attachments;
@@ -56,11 +57,18 @@ const sessions = new Map();
 
 function handle(name, operation) {
   ipcMain.handle(name, async (event, payload) => {
-    if (event.sender !== window?.webContents || event.senderFrame?.url !== entryUrl) {
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || !windows.has(owner) || event.senderFrame?.url !== entryUrl) {
       return { ok: false, error: "请求来源无效。" };
     }
     try {
-      return { ok: true, data: await operation(payload) };
+      const data = await operation(payload, owner);
+      if (/^(?:notebook:change|note:add-images|members:change|turn:send|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
+        for (const other of windows) if (other !== owner && !other.isDestroyed()) {
+          other.webContents.send("library:changed");
+        }
+      }
+      return { ok: true, data };
     } catch (error) {
       return { ok: false, error: String(error.message || error) };
     }
@@ -68,13 +76,15 @@ function handle(name, operation) {
 }
 
 function notify(event, value) {
-  if (window && !window.isDestroyed()) window.webContents.send(event, value);
+  for (const target of windows) if (!target.isDestroyed()) target.webContents.send(event, value);
 }
+
+const dialogWindow = () => BrowserWindow.getFocusedWindow() || window;
 
 async function approveCodex(method, params) {
   const permissions = method === "item/permissions/requestApproval";
   const fallback = permissions ? { permissions: {}, scope: "turn" } : { decision: "decline" };
-  if (!window || window.isDestroyed()) return fallback;
+  if (!dialogWindow() || dialogWindow().isDestroyed()) return fallback;
   const network = params.networkApprovalContext;
   const message = permissions ? "允许模型获取额外权限？" : network ? "允许模型访问网络地址？" :
     method === "item/fileChange/requestApproval" ? "允许模型修改文件？" : "允许模型运行命令？";
@@ -85,7 +95,7 @@ async function approveCodex(method, params) {
     params.grantRoot,
     permissions && JSON.stringify(params.permissions)
   ].filter(Boolean).join("\n\n").slice(0, 6000);
-  const { response } = await dialog.showMessageBox(window, {
+  const { response } = await dialog.showMessageBox(dialogWindow(), {
     type: "question", title: "模型工具权限", message, detail: details,
     buttons: ["拒绝", "允许本次"], defaultId: 0, cancelId: 0, noLink: true
   });
@@ -355,7 +365,7 @@ function requireIdle() {
 }
 
 async function confirm(message, detail, action) {
-  const { response } = await dialog.showMessageBox(window, {
+  const { response } = await dialog.showMessageBox(dialogWindow(), {
     type: "warning", title: "数据管理", message, detail, buttons: ["取消", action], defaultId: 0, cancelId: 0, noLink: true
   });
   return response === 1;
@@ -386,7 +396,7 @@ function setupDataHandlers() {
   });
   handle("data:restore", (name) => restoreFrom(backups.path(name), name));
   handle("data:import", async () => {
-    const choice = await dialog.showOpenDialog(window, {
+    const choice = await dialog.showOpenDialog(dialogWindow(), {
       title: "从备份恢复", properties: ["openFile"],
       filters: [{ name: "AI 笔记本备份", extensions: ["zip", "sqlite"] }]
     });
@@ -402,7 +412,7 @@ function setupDataHandlers() {
   });
   handle("data:export", async () => {
     const day = new Date().toISOString().slice(0, 10);
-    const choice = await dialog.showSaveDialog(window, {
+    const choice = await dialog.showSaveDialog(dialogWindow(), {
       title: "导出完整备份", defaultPath: `AI笔记本备份-${day}.zip`,
       filters: [{ name: "AI 笔记本备份", extensions: ["zip"] }]
     });
@@ -414,7 +424,7 @@ function setupDataHandlers() {
   handle("data:move", async () => {
     requireIdle();
     if (dataSource === "env") throw new Error("数据位置由环境变量 AI_NOTEBOOK_DATA_DIR 指定，请先移除该变量。");
-    const choice = await dialog.showOpenDialog(window, {
+    const choice = await dialog.showOpenDialog(dialogWindow(), {
       title: "选择新的数据文件夹", properties: ["openDirectory", "createDirectory"]
     });
     if (choice.canceled || !choice.filePaths[0]) return false;
@@ -439,7 +449,7 @@ function setupDataHandlers() {
   });
   handle("notebook:choose-folder", async (notebookId) => {
     const notebook = store.read(notebookId);
-    const choice = await dialog.showOpenDialog(window, {
+    const choice = await dialog.showOpenDialog(dialogWindow(), {
       title: "选择这个聊天的工作文件夹", defaultPath: notebook.workDir,
       properties: ["openDirectory", "createDirectory"]
     });
@@ -453,27 +463,34 @@ function setupDataHandlers() {
   });
 }
 
-function createWindow() {
-  window = new BrowserWindow({
+function createWindow(notebookId) {
+  const target = new BrowserWindow({
     title: "AI 笔记本",
     width: 1360, height: 930, minWidth: 730, minHeight: 540, show: false,
     icon: join(base, "notebook.ico"),
     autoHideMenuBar: true,
     webPreferences: { preload: join(base, "preload.cjs"), sandbox: true, contextIsolation: true, nodeIntegration: false }
   });
-  window.setMenu(null);
-  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  window.webContents.on("will-navigate", (event) => event.preventDefault());
-  window.webContents.on("will-prevent-unload", (event) => {
-    const answer = dialog.showMessageBoxSync(window, {
+  target.notebookId = notebookId || store.activeId();
+  windows.add(target);
+  window ||= target;
+  target.setMenu(null);
+  target.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  target.webContents.on("will-navigate", (event) => event.preventDefault());
+  target.webContents.on("will-prevent-unload", (event) => {
+    const answer = dialog.showMessageBoxSync(target, {
       type: "question", message: "PDF 批注有未保存的改动。",
       buttons: ["继续编辑", "放弃改动并关闭"], defaultId: 0, cancelId: 0
     });
     if (answer === 1) event.preventDefault();
   });
-  window.once("ready-to-show", () => window.show());
-  window.on("closed", () => { window = undefined; });
-  window.loadURL(entryUrl);
+  target.once("ready-to-show", () => target.show());
+  target.on("closed", () => {
+    windows.delete(target);
+    if (window === target) window = windows.values().next().value;
+  });
+  target.loadURL(entryUrl);
+  return target;
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -532,27 +549,48 @@ if (!app.requestSingleInstanceLock()) {
     profiles = new Profiles(store.db);
     attachments = new AttachmentStore(join(local, "attachments"), join(local, "attachment-work"));
     await attachments.initialize(storedAttachments());
-    handle("notebook:read", () => store.read());
+    handle("notebook:read", (_payload, owner) => store.read(owner.notebookId));
     handle("library:read", () => store.library());
-    handle("library:open", (id) => store.open(id));
-    handle("library:create", ({ title, folderId }) => store.create(title, { folderId }));
+    handle("library:open", (id, owner) => {
+      const result = store.open(id);
+      owner.notebookId = result.state.id;
+      return result;
+    });
+    handle("window:open", (id) => {
+      store.read(id);
+      const target = createWindow(id);
+      target.once("ready-to-show", () => target.focus());
+      return true;
+    });
+    handle("library:create", ({ title, folderId }, owner) => {
+      const result = store.create(title, { folderId });
+      owner.notebookId = result.state.id;
+      return result;
+    });
     handle("library:rename", ({ id, title }) => store.renameNotebook(id, title));
     handle("library:move", ({ id, folderId }) => store.moveNotebook(id, folderId));
-    handle("library:delete", async (id) => {
+    handle("library:delete", async (id, owner) => {
       if (activeTurn?.notebookId === id) throw new Error("请先停止生成，再删除会话。");
       const before = allAttachmentRefs(store.read(id));
       const result = store.deleteNotebook(id);
+      for (const target of windows) if (target.notebookId === id) target.notebookId = result.state.id;
       await attachments.deleteSaved(before, storedAttachments());
       return result;
     });
     handle("folder:create", (name) => store.createFolder(name));
     handle("folder:rename", ({ id, name }) => store.renameFolder(id, name));
     handle("folder:delete", (id) => store.deleteFolder(id));
-    handle("library:create-from-messages", ({ sourceId, ids }) => store.createFromMessages(sourceId, ids));
-    handle("comment:fork", (payload) => {
+    handle("library:create-from-messages", ({ sourceId, ids }, owner) => {
+      const result = store.createFromMessages(sourceId, ids);
+      owner.notebookId = result.state.id;
+      return result;
+    });
+    handle("comment:fork", (payload, owner) => {
       const { origin, turns } = commentTarget(payload);
       const label = (origin.kind === "pdf" ? origin.title : origin.text).trim().split(/\r?\n/, 1)[0].slice(0, 44);
-      return store.create(`批注分支 · ${label || "追问"}`, { origin, turns });
+      const result = store.create(`批注分支 · ${label || "追问"}`, { origin, turns });
+      owner.notebookId = result.state.id;
+      return result;
     });
     handle("comment:send", generateComment);
     handle("notebook:change", async (action) => {
@@ -597,6 +635,16 @@ if (!app.requestSingleInstanceLock()) {
       const error = await shell.openPath(attachments.path(ref));
       if (error) throw new Error(`无法打开「${ref.name}」。`);
     });
+    handle("review:open-attachment", async (id) => {
+      const ref = storedAttachments().find((item) => item.id === id && item.extension === ".pdf") ||
+        attachments.pendingRef(id);
+      if (!ref) throw new Error("找不到这份 PDF 附件。");
+      if (ref.extension !== ".pdf") throw new Error("这份附件不是 PDF。");
+      const opened = await loadReview(attachments.path(ref));
+      opened.name = ref.name;
+      reviews.get(opened.id).name = ref.name;
+      return opened;
+    });
     handle("review:open", (path) => loadReview(path));
     handle("review:recent", () => {
       const recent = store.recentReview();
@@ -618,7 +666,7 @@ if (!app.requestSingleInstanceLock()) {
       if (!current) throw new Error("当前审阅文件已经切换。");
       let path = current.path;
       if (!path || saveAs) {
-        const choice = await dialog.showSaveDialog(window, {
+        const choice = await dialog.showSaveDialog(dialogWindow(), {
           title: "保存 PDF 审阅文件",
           defaultPath: path || `${basename(current.name, extname(current.name))}.aipdf`,
           filters: [{ name: "AI 笔记 PDF 审阅", extensions: ["aipdf"] }]

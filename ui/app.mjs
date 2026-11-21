@@ -46,6 +46,8 @@ let libraryFolders = [];
 const collapsedFolders = new Set();
 let libraryBusy = false;
 let activeView = "document";
+let focusMode = null;
+let focusedNoteId = null;
 let activeBlock;
 let selectedText = null;
 let selectedAnswer = null;
@@ -155,7 +157,7 @@ function renderLibrary() {
     control.dataset.notebookId = item.id;
     control.title = title;
     if (selected) control.setAttribute("aria-current", "page");
-    const actions = [button("重命名", "rename-notebook"), button("移到主题…", "move-notebook"),
+    const actions = [button("在新窗口打开", "open-notebook-window"), button("重命名", "rename-notebook"), button("移到主题…", "move-notebook"),
       button("删除会话", "delete-notebook", "danger")];
     for (const action of actions) action.dataset.notebookId = item.id;
     row.append(control, menu(title, actions));
@@ -200,6 +202,7 @@ async function switchNotebook(open) {
     if (state) mainDrafts.set(state.id, get("main-question").value);
     const oldProfileId = currentProfile()?.id;
     state = result.state;
+    setFocus(null);
     libraryItems = result.items;
     libraryFolders = result.folders || [];
     activeBlock = state.blocks.find((item) => !item.removed)?.id;
@@ -352,6 +355,7 @@ async function finishAnnotationPick(target) {
 function annotation(note) {
   const card = node("article", "annotation");
   card.dataset.noteId = note.id;
+  card.classList.toggle("is-focused", focusMode === "note" && focusedNoteId === note.id);
   const editingThis = editingNote?.id === note.id;
   const collapsed = collapsedNotes.has(note.id) && !editingThis;
   card.classList.toggle("is-collapsed", collapsed);
@@ -366,7 +370,10 @@ function annotation(note) {
   collapse.setAttribute("aria-expanded", String(!collapsed));
   const edit = iconButton("edit", "edit-note", "编辑批注");
   const remove = iconButton("trash", "delete-note", "删除批注");
-  commands.append(collapse, edit, remove, pin);
+  const expand = button("↗", "focus-note", "note-expand");
+  expand.title = "放大批注和追问";
+  expand.setAttribute("aria-label", "放大批注和追问");
+  commands.append(expand, collapse, edit, remove, pin);
   const content = node("div", "markdown-content note-content");
   renderMarkdown(content, note.text);
   const head = node("div", "annotation-head");
@@ -425,6 +432,12 @@ function annotation(note) {
 }
 
 const isImageRef = (ref) => [".png", ".jpg", ".jpeg", ".webp"].includes(ref.extension);
+const storedAttachment = (id) => [
+  ...state.blocks.flatMap((block) => block.attachments || []),
+  ...state.notes.flatMap((note) => note.attachments || []),
+  ...state.branches.flatMap((branch) => branch.turns.flatMap((turn) => turn.attachments || [])),
+  ...[...draftFiles.values()].flat()
+].find((ref) => ref.id === id);
 
 // Images show as a picture (click to open full size); other files as a name.
 function attachmentChip(ref, kind) {
@@ -452,6 +465,12 @@ function attachmentChip(ref, kind) {
   }
   const name = node("span", "", ref.name);
   name.title = ref.name;
+  if (ref.extension === ".pdf") {
+    const preview = button("审阅", "open-attachment", "preview-file");
+    preview.dataset.attachmentId = ref.id;
+    preview.setAttribute("aria-label", `审阅 PDF：${ref.name}`);
+    chip.append(preview);
+  }
   const remove = button("×", "remove-attachment", "remove-file");
   remove.dataset.attachmentId = ref.id;
   remove.dataset.composer = kind;
@@ -1174,6 +1193,7 @@ function renderDocument() {
   renderMainContext();
   renderWorkDir();
   renderLibrary();
+  if (activeView === "document") document.title = `${state.title} · AI 笔记本`;
 }
 
 function showNotes(visible) {
@@ -1184,6 +1204,8 @@ function showNotes(visible) {
 
 function updateView() {
   document.body.dataset.view = activeView;
+  document.title = `${activeView === "pdf" ? "PDF 审阅" : activeView === "canvas" ? "分支画布" :
+    activeView === "apps" ? "应用与账户" : state?.title || "AI 笔记本"} · AI 笔记本`;
   get("document-view").hidden = activeView !== "document";
   get("canvas-view").hidden = activeView !== "canvas";
   get("pdf-view").hidden = activeView !== "pdf";
@@ -1196,6 +1218,31 @@ function updateView() {
   if (activeView === "pdf") pdfReview.activate();
   if (activeView === "apps") openApps().catch((error) => say(error.message));
   renderSelectionBar();
+}
+
+function setFocus(mode, noteId = null) {
+  focusMode = mode;
+  focusedNoteId = noteId;
+  document.body.dataset.focus = mode || "";
+  get("focus-shade").hidden = !mode;
+  get("focus-bar").hidden = !mode;
+  if (mode) {
+    get("focus-parent").textContent = state?.title || "主聊天";
+    get("focus-title").textContent = mode === "pdf" ? "PDF 审阅" : mode === "branch" ?
+      branchTitle(currentBranch()) : "批注与追问";
+  }
+}
+
+function closeFocus() {
+  if (focusMode === "pdf") {
+    activeView = "document";
+    updateView();
+    chatOpen(false);
+  } else if (focusMode === "branch") {
+    chatOpen(false);
+  }
+  setFocus(null);
+  if (activeView === "document") renderDocument();
 }
 
 function chatOpen(open) {
@@ -1240,6 +1287,7 @@ function openChat(branchId) {
   updateView();
   chatOpen(true);
   renderChat();
+  setFocus("branch");
   get("side-question").focus();
 }
 
@@ -2076,11 +2124,22 @@ async function handleAction(control) {
         await switchNotebook(() => api.openNotebook(control.dataset.notebookId));
       }
       break;
+    case "open-notebook-window":
+      await api.openNotebookWindow(control.dataset.notebookId);
+      say("会话已在新窗口打开，可拖到另一台显示器。");
+      break;
     case "choose-files":
       get(`${control.dataset.composer}-files`).click();
       break;
     case "open-attachment":
-      await api.openAttachment(control.dataset.attachmentId);
+      if (storedAttachment(control.dataset.attachmentId)?.extension === ".pdf") {
+        if (!await pdfReview.openAttachment(control.dataset.attachmentId)) break;
+        activeView = "pdf";
+        updateView();
+        setFocus("pdf");
+      } else {
+        await api.openAttachment(control.dataset.attachmentId);
+      }
       break;
     case "remove-attachment": {
       const key = draftKey(control.dataset.composer);
@@ -2215,7 +2274,16 @@ async function handleAction(control) {
       showNotes(!notesVisible);
       break;
     case "locate-note":
-      if (note) locate(note.anchor);
+      if (note) {
+        if (focusMode === "note") closeFocus();
+        locate(note.anchor);
+      }
+      break;
+    case "focus-note":
+      if (!note) break;
+      if (collapsedNotes.has(note.id)) collapsedNotes.delete(note.id);
+      setFocus("note", note.id);
+      renderDocument();
       break;
     case "toggle-note":
       if (!note) break;
@@ -2251,6 +2319,7 @@ async function handleAction(control) {
       if (action === "delete-note" && !window.confirm("删除这条批注及其追问？")) break;
       await change({ type: action, id: note.id });
       if (action === "delete-note") {
+        if (focusedNoteId === note.id) closeFocus();
         commentChats.forget(`note:${state.id}:${note.id}`);
         collapsedNotes.delete(note.id);
       }
@@ -2269,9 +2338,11 @@ async function handleAction(control) {
       break;
     case "close-chat":
       chatOpen(false);
+      setFocus(null);
       actionButton("ask").focus();
       break;
     case "locate-branch":
+      setFocus(null);
       locate(currentBranch().anchor);
       break;
     case "delete-chat": {
@@ -2287,6 +2358,7 @@ async function handleAction(control) {
       get("side-turns").replaceChildren();
       get("side-question").value = "";
       chatOpen(false);
+      setFocus(null);
       actionButton("ask").focus();
       say("侧边对话已删除。");
       break;
@@ -2322,6 +2394,12 @@ async function handleAction(control) {
       break;
     case "cancel-editor":
       get("editor").close();
+      break;
+    case "close-focus":
+      closeFocus();
+      break;
+    case "focus-branch":
+      if (currentBranch()) setFocus("branch");
       break;
   }
 }
@@ -2359,12 +2437,17 @@ document.addEventListener("click", async (event) => {
     }
     activeView = control.dataset.view;
     updateView();
+    setFocus(activeView === "pdf" ? "pdf" : null);
   }
   try {
     await handleAction(control);
   } catch (error) {
     say(error.message);
   }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && focusMode && !document.querySelector("dialog[open]") &&
+      (focusMode !== "pdf" || get("review-box-layer").hidden)) closeFocus();
 });
 get("document-view").addEventListener("change", (event) => {
   const noteCheck = event.target.closest(".note-select");
@@ -2680,6 +2763,31 @@ api.onSaved(({ requestId, notebook }) => {
   }
   renderPending();
 });
+let syncingLibrary = false;
+async function refreshFromStore() {
+  if (!state || editingMessage || editingNote || syncingLibrary) return;
+  syncingLibrary = true;
+  try {
+    const [next, library] = await Promise.all([api.read(), api.library()]);
+    const libraryChanged = JSON.stringify(library.items) !== JSON.stringify(libraryItems) ||
+      JSON.stringify(library.folders || []) !== JSON.stringify(libraryFolders);
+    libraryItems = library.items;
+    libraryFolders = library.folders || [];
+    if (next.id !== state.id) {
+      await switchNotebook(async () => ({ state: next, ...library }));
+    } else if ((next.revision || 0) > (state.revision || 0)) {
+      accept(next);
+      if (focusMode === "branch" && !currentBranch()) closeFocus();
+      if (focusMode === "note" && !state.notes.some((note) => note.id === focusedNoteId)) closeFocus();
+      renderDocument();
+      renderChat();
+    } else if (libraryChanged) renderLibrary();
+  } catch (error) { say(error.message); }
+  finally { syncingLibrary = false; }
+}
+api.onLibraryChanged(refreshFromStore);
+window.addEventListener("focus", refreshFromStore);
+setInterval(refreshFromStore, 2500);
 // The top bar and ribbon edit this chat's default member.
 get("member-picker").addEventListener("change", (event) => {
   changeMembers({ type: "member-default", id: event.target.value }).catch((error) => say(error.message));

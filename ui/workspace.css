@@ -148,6 +148,31 @@ body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon { display: none; }
 .notebook-library { display: flex; flex-direction: column; }
 .notebook-library .data-manage { flex: none; margin-top: auto; color: var(--muted); }
 .notebook-library .data-manage:hover { color: var(--accent); }
+.side-header-actions { display: flex; gap: 6px; }
+.note-expand { width: 26px; min-height: 26px; padding: 2px; font-size: 17px; line-height: 1; }
+.annotation:not(.is-focused) .note-content { max-height: 220px; overflow: hidden; mask-image: linear-gradient(#000 72%, transparent); }
+.annotation:not(.is-focused) .comment-conversation:not([hidden]) { max-height: 330px; overflow: auto; }
+.focus-shade { position: fixed; inset: 0; z-index: 40; background: light-dark(#16263d99, #05080dbb); backdrop-filter: blur(2px); }
+.focus-shade::before, .focus-shade::after { content: ""; position: absolute; left: clamp(20px, 4vw, 70px); right: clamp(18px, 3vw, 55px); top: 56px; bottom: 13px; border-radius: 15px; background: var(--paper); opacity: .44; transform: translate(-16px, 13px) rotate(-.5deg); }
+.focus-shade::after { transform: translate(-8px, 7px) rotate(-.25deg); opacity: .7; }
+.focus-bar { position: fixed; z-index: 70; top: 8px; left: max(22px, 5vw); right: max(22px, 5vw); height: 40px; display: flex; align-items: center; gap: 9px; color: #fff; min-width: 0; }
+.focus-bar button { background: var(--paper); color: var(--text); }
+body[data-focus="note"] .document-layout, body[data-focus="branch"] .document-layout { z-index: auto; }
+.focus-bar span, .focus-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body[data-focus="note"] .annotation.is-focused { position: fixed; z-index: 60; inset: 56px max(20px, 7vw) 22px max(20px, 7vw); width: auto; max-height: none; overflow: auto; padding: clamp(18px, 3vw, 36px); border-radius: 14px; box-shadow: 0 18px 70px #0005; align-content: start; gap: 14px; }
+body[data-focus="note"] .annotation.is-focused .note-content { font-size: 16px; line-height: 1.8; }
+body[data-focus="note"] .annotation.is-focused .comment-thread { max-width: 900px; width: 100%; margin-inline: auto; }
+body[data-focus="branch"] .side-chat { position: fixed; z-index: 60; inset: 56px max(20px, 7vw) 22px max(20px, 7vw); max-height: none; width: auto; padding: clamp(18px, 3vw, 36px); border-radius: 14px; box-shadow: 0 18px 70px #0005; }
+body[data-focus="branch"] .side-chat > * { width: min(100%, 1050px); margin-inline: auto; }
+body[data-focus="branch"] .side-chat .side-turns { width: min(100%, 1050px); }
+body[data-focus="pdf"] .pdf-review-view { position: fixed; z-index: 60; inset: 56px 18px 16px 44px; height: auto; min-height: 0; background: var(--paper); border-radius: 13px; overflow: hidden; box-shadow: 0 18px 70px #0005; }
+body[data-focus="pdf"] .review-back { display: inline-flex; }
+.review-back { display: none; }
+@media (max-width: 700px) {
+  body[data-focus="note"] .annotation.is-focused, body[data-focus="branch"] .side-chat { inset: 56px 10px 10px; }
+  body[data-focus="pdf"] .pdf-review-view { inset: 56px 8px 8px; }
+  .focus-bar { left: 10px; right: 10px; }
+}
 .data-dialog { width: min(720px, calc(100% - 28px)); }
 .data-section { margin-top: 6px; padding-top: 4px; }
 .data-section + .data-section { margin-top: 16px; border-top: 1px solid var(--line); }

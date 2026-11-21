@@ -1,7 +1,7 @@
 {
   "name": "ai-notebook",
   "productName": "AI 笔记本",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "A local notebook for editing, annotating, and branching Codex conversations",
   "main": "main.mjs",
