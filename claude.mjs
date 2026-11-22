@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import { buildPrompt } from "./codex.mjs";
+import { ownsoftMcp } from "./mcp-configuration.mjs";
 
 export function executable() {
   if (process.platform !== "win32") return "claude";
@@ -34,9 +35,10 @@ const modelCatalog = [
 export class Claude {
   #login;
 
-  constructor(directory, configDirectory) {
+  constructor(directory, configDirectory, dataDir) {
     this.directory = directory;
     this.configDirectory = configDirectory;
+    this.dataDir = dataDir;
   }
 
   #env() {
@@ -127,6 +129,8 @@ export class Claude {
       "--setting-sources", "", "--permission-mode", "auto",
       "--settings", '{"disableAllHooks":true}'
     ];
+    const mcp = ownsoftMcp(this.dataDir);
+    if (mcp) args.push("--mcp-config", JSON.stringify({ mcpServers: { ownsoft: mcp } }));
     const sessionId = resumed ? resumeSession : randomUUID();
     if (persistSession) args.push(resumed ? "--resume" : "--session-id", sessionId);
     else args.push("--no-session-persistence");

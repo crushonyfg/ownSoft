@@ -98,6 +98,9 @@ body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon, body[data-view="m
 .review-underline:is(:hover,[aria-pressed="true"]) { border-bottom: 2px solid #1762ab; }
 .review-comments { overflow: auto; padding: 14px 13px; background: var(--chrome); border-left: 1px solid var(--line); }
 .review-comments > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 7px; }
+.review-comments .review-pane > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 7px; }
+.review-comment-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.review-comment-actions button { min-height: 27px; padding: 3px 7px; font-size: 12px; }
 .review-comments > header p { margin-top: 2px; color: var(--muted); font-size: 12px; }
 .review-comment-nav { display: flex; gap: 5px; margin-block: 9px; }
 .review-comment-nav button, .review-card footer button { min-height: 26px; font-size: 12px; }
@@ -265,6 +268,13 @@ body[data-focus="pdf"] .review-back { display: inline-flex; }
 .model-session-controls label { font-weight: 600; cursor: pointer; }
 .model-session-controls button { min-height: 26px; padding: 2px 8px; font-size: 12px; }
 .model-session-controls small { flex-basis: 100%; color: var(--muted); }
+.inline-editor { position: relative; }
+.slash-link-menu { position: absolute; z-index: 30; left: 10px; right: 10px; max-height: 230px; overflow: auto;
+  padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); box-shadow: 0 8px 24px var(--shadow); }
+.slash-link-menu button { display: block; width: 100%; overflow: hidden; text-overflow: ellipsis; text-align: left; border: 0; }
+.md-note { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--chrome); }
+.md-note-open { justify-self: start; }
+.md-note-preview { max-height: 180px; overflow: auto; color: var(--muted); }
 #main-context.is-chosen > summary { color: var(--accent); }
 .chat-row.out-of-context .paper-block { opacity: .45; filter: grayscale(.4); }
 .chat-row.out-of-context:hover .paper-block { opacity: .8; }

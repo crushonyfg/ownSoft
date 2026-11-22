@@ -162,6 +162,7 @@ export function reviewCommentsText(comments = []) {
 
 function sharedNoteText(block) {
   const file = block.attachments?.[0]?.name;
+  if (block.noteType === "md") return `Markdown 笔记「${block.text}」（文档 ID：${block.mdId}；需要原文时用 ownsoft 的 read_markdown 工具读取）`;
   if (block.noteType === "image") return `图片「${file || "图片"}」：${block.text}`;
   if (block.noteType === "pdf") {
     const comments = reviewCommentsText(block.review?.comments);

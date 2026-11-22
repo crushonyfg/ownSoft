@@ -15,6 +15,9 @@ function safeUrl(value) {
   try {
     const url = new URL(value);
     if (["https:", "http:"].includes(url.protocol) && !url.username && !url.password) return url.href;
+    if (url.protocol === "ownsoft:" && !url.username && !url.password && !url.search && !url.hash &&
+        ((["chat", "md"].includes(url.hostname) && /^\/[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(url.pathname)) ||
+          (url.hostname === "pdf" && /^\/[\da-f]{64}$/i.test(url.pathname)))) return url.href;
   } catch {
     // Relative or malformed links are rendered as text.
   }

@@ -44,6 +44,11 @@ export function fileNoteBlock(ref) {
     attachments: [ref], marks: [], included: true };
 }
 
+export function markdownNoteBlock(doc) {
+  return { id: randomUUID(), kind: "paragraph", noteType: "md", mdId: doc.id, text: doc.name,
+    marks: [], included: true };
+}
+
 const reviewHash = /^[\da-f]{64}$/;
 
 function findThread(state, id) {
@@ -179,6 +184,37 @@ function messageBlocks(state, ids) {
     throw new Error("消息已改变，请重试。");
   }
   return blocks;
+}
+
+function convertedMessage(state, blocks) {
+  if (blocks.some((block) => block.removed)) throw new Error("消息已改变，请重试。");
+  const backup = structuredClone(blocks);
+  const attachments = blocks.flatMap((block) => block.attachments || []);
+  const text = blocks.map((block) => block.text).join("\n\n").trim() ||
+    (attachments.length ? `（附件：${attachments.map((ref) => ref.name).join("、")}）` : "");
+  if (!text) throw new Error("这条消息是空的。");
+  const speaker = blocks[0].source;
+  const author = blocks[0].kind === "question" ? "我的消息" : blocks[0].kind === "paragraph" ? "笔记块"
+    : `${speaker?.memberName || (speaker?.provider === "claude" ? "Claude" : speaker?.provider === "gemini" ? "Gemini" : "GPT")} 的回答`;
+  blocks[0].conversionBackup = backup;
+  for (const block of blocks) {
+    block.removed = true;
+    block.text = "";
+    block.marks = [];
+    delete block.attachments;
+  }
+  return { text, author, attachments, speaker, sourceMessageId: blocks[0].id };
+}
+
+function restoreConvertedMessage(state, messageId) {
+  const first = find(state.blocks, messageId);
+  const backup = first.conversionBackup;
+  if (!Array.isArray(backup) || !backup.length) throw new Error("原消息已无法撤销。");
+  for (const original of backup) {
+    const index = state.blocks.findIndex((block) => block.id === original.id);
+    if (index < 0 || !state.blocks[index].removed) throw new Error("原消息已改变，不能撤销。");
+    state.blocks[index] = original;
+  }
 }
 
 // Index of the first block of the message containing beforeId.
@@ -370,7 +406,6 @@ export function applyChange(state, action) {
     // Move a message out of the conversation into a margin annotation on the nearest other message.
     case "message-to-annotation": {
       const blocks = messageBlocks(state, action.ids);
-      const live = blocks.filter((block) => !block.removed);
       const own = new Set(blocks.map((block) => block.id));
       // Where it hangs: the passage or message the user picked, else the nearest other message.
       let anchor;
@@ -385,21 +420,21 @@ export function applyChange(state, action) {
         const start = target.text.search(/\S/);
         anchor = { blockId: target.id, start, quote: target.text.slice(start).split(/\r?\n/, 1)[0].slice(0, 40) };
       }
-      const attachments = live.flatMap((block) => block.attachments || []);
-      const text = live.map((block) => block.text).join("\n\n").trim() ||
-        (attachments.length ? `（附件：${attachments.map((ref) => ref.name).join("、")}）` : "");
-      if (!text) throw new Error("这条消息是空的。");
-      const speaker = blocks[0].source;
-      const author = blocks[0].kind === "question" ? "我的消息" : blocks[0].kind === "paragraph" ? "笔记块"
-        : `${speaker?.memberName || (speaker?.provider === "claude" ? "Claude" : speaker?.provider === "gemini" ? "Gemini" : "GPT")} 的回答`;
+      const { text, author, attachments, speaker, sourceMessageId } = convertedMessage(state, blocks);
       state.notes.push({ id: randomUUID(), anchor, text: requireText(text, 160_000),
-        author, pinned: false, ...(attachments.length ? { attachments } : {}), ...(speaker ? { source: speaker } : {}) });
-      for (const block of blocks) {
-        block.removed = true;
-        block.text = "";
-        block.marks = [];
-        delete block.attachments;
-      }
+        author, pinned: false, sourceMessageId,
+        ...(attachments.length ? { attachments } : {}), ...(speaker ? { source: speaker } : {}) });
+      break;
+    }
+    case "undo-message-to-annotation": {
+      const note = find(state.notes, action.id);
+      if (!note.sourceMessageId) throw new Error("这条批注不是从消息转来的。");
+      if (note.turns?.length) throw new Error("这条批注已有追问，请先处理追问再撤销。");
+      restoreConvertedMessage(state, note.sourceMessageId);
+      state.notes = state.notes.filter((item) => item.id !== note.id);
+      if (state.context?.notes) state.context.notes = state.context.notes.filter((id) => id !== note.id);
+      state.mainMemoryIds = (state.mainMemoryIds || []).filter((id) => id !== note.id);
+      for (const branch of state.branches) branch.memoryIds = branch.memoryIds.filter((id) => id !== note.id);
       break;
     }
     case "add-blocks":
@@ -1191,6 +1226,49 @@ export class NotebookStore {
   change(action, id) {
     const state = applyChange(this.read(id), action);
     return this.write(state);
+  }
+
+  addMarkdownBlock(notebookId, mdId, afterId) {
+    const doc = this.mdDocument(mdId);
+    if (!doc) throw new Error("Markdown 文档不存在。");
+    const state = this.read(notebookId);
+    state.blocks.splice(insertionIndex(state, afterId), 0, markdownNoteBlock(doc));
+    return this.write(state);
+  }
+
+  moveMessageToPdfAnnotation(notebookId, ids, hash, anchor) {
+    const state = this.read(notebookId);
+    if (state.parent?.kind !== "pdf-chat" || state.parent.hash !== hash) throw new Error("只能把这份 PDF 全文对话里的消息挂到该 PDF 上。");
+    const review = this.pdfReview(hash);
+    if (!review) throw new Error("PDF 审阅不存在。");
+    const blocks = messageBlocks(state, ids);
+    const { text, author, sourceMessageId } = convertedMessage(state, blocks);
+    const comment = validateComments([{ id: randomUUID(), ...anchor, title: author,
+      text: requireText(text, 9000), priority: "", movedFrom: { notebookId, messageId: sourceMessageId } }])[0];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.write(state);
+      this.savePdfReview(hash, review.name, { ...review, comments: [...review.comments, comment] });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return { comment, notebookId, hash };
+  }
+
+  undoPdfMessageConversion(hash, commentId) {
+    const review = this.pdfReview(hash);
+    const comment = review?.comments.find((item) => item.id === commentId);
+    if (!comment?.movedFrom) throw new Error("这条批注不是从消息转来的。");
+    if (comment.turns?.length) throw new Error("这条批注已有追问，请先处理追问再撤销。");
+    const state = this.read(comment.movedFrom.notebookId);
+    if (state.parent?.kind !== "pdf-chat" || state.parent.hash !== hash) throw new Error("来源会话已改变，不能撤销。");
+    restoreConvertedMessage(state, comment.movedFrom.messageId);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.write(state);
+      this.savePdfReview(hash, review.name, { ...review, comments: review.comments.filter((item) => item.id !== commentId) });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return { notebookId: state.id, hash, commentId };
   }
 
   saveModelSession(id, memberId, record) {

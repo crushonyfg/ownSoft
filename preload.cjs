@@ -45,6 +45,10 @@ contextBridge.exposeInMainWorld("notebook", {
   addNoteImages: async (notebookId, files, afterId) => invoke("note:add-images", {
     notebookId, afterId, paths: await fileEntries(files)
   }),
+  addMarkdownBlock: (notebookId, mdId, afterId) => invoke("note:add-md", { notebookId, mdId, afterId }),
+  moveMessageToPdfAnnotation: (notebookId, ids, hash, anchor) =>
+    invoke("review:move-message", { notebookId, ids, hash, anchor }),
+  undoPdfMessageConversion: (hash, commentId) => invoke("review:undo-message", { hash, commentId }),
   forkComment: (target) => invoke("comment:fork", target),
   chooseFolder: (notebookId) => invoke("notebook:choose-folder", notebookId),
   openFolder: (notebookId) => invoke("notebook:open-folder", notebookId),

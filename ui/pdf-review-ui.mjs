@@ -35,6 +35,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
   let pageNumber = 1;
   let activeId;
   let selection;
+  let pendingMessageConversion = null;
   let selectionKey;
   let boxDrag;
   let renderedPage;
@@ -124,6 +125,9 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
     get("review-prev").disabled = pageNumber <= 1;
     get("review-next").disabled = !pdf || pageNumber >= pdf.numPages;
     get("review-add").disabled = !selection || selection.rects.length > 70 || selection.quote.length > 8000;
+    get("review-move-message").hidden = !pendingMessageConversion;
+    get("review-move-message").disabled = !pendingMessageConversion || !selection ||
+      selection.rects.length > 70 || selection.quote.length > 8000;
     get("review-ask").disabled = !selection || selection.quote.length > 20_000;
     get("review-ask-float").hidden = get("review-ask").disabled || !boxLayer.hidden;
   }
@@ -158,6 +162,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       const actions = make("footer");
       const revise = make("button", "", "编辑");
       const remove = make("button", "", "删除");
+      const undo = item.movedFrom ? make("button", "", "撤销转批注") : null;
       revise.type = remove.type = "button";
       revise.addEventListener("click", () => edit({
         heading: item.title || "编辑批注", reference: item.quote, text: item.text, limit: 9000,
@@ -180,7 +185,20 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
         refreshComments();
         if (chatTarget === item.id) mountDocumentChat(false, null);
       });
-      actions.append(revise, remove);
+      if (undo) {
+        undo.type = "button";
+        undo.addEventListener("click", () => attempt(async () => {
+          if (commentChats.pending(key)) throw new Error("请先停止这条批注的追问。");
+          if (dirty) await save();
+          await api.undoPdfMessageConversion(state.hash, item.id);
+          state.comments = state.comments.filter((comment) => comment.id !== item.id);
+          if (active) activeId = undefined;
+          refreshComments();
+          onSaved();
+          notify("已恢复原消息，PDF 批注已移除。");
+        }));
+      }
+      actions.append(revise, ...(undo ? [undo] : []), remove);
       card.append(actions);
       // The follow-up is a full chat, shown in the lower pane.
       const follow = make("button", "review-follow", item.turns?.length ? `追问 · ${item.turns.length} 轮` : "追问");
@@ -563,6 +581,31 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
     });
   }
 
+  function beginMessageConversion(request) {
+    if (!state || state.hash !== request.hash) throw new Error("请先打开这条消息所属的 PDF。");
+    if (chatTarget) throw new Error("请先切回 PDF 全文对话，再转为 PDF 批注。");
+    pendingMessageConversion = request;
+    refreshToolbar();
+    notify("请在 PDF 左侧选中文字，再点「挂选中为批注」。");
+  }
+
+  async function moveMessageToSelection() {
+    captureSelection();
+    if (!pendingMessageConversion || !selection) throw new Error("请先在 PDF 中选中文字。");
+    if (dirty) await save();
+    const request = pendingMessageConversion;
+    const result = await api.moveMessageToPdfAnnotation(request.notebookId, request.ids, request.hash, selection);
+    state.comments.push(result.comment);
+    pendingMessageConversion = null;
+    activeId = result.comment.id;
+    selection = undefined;
+    window.getSelection()?.removeAllRanges();
+    refreshToolbar();
+    refreshComments();
+    onSaved();
+    notify("已挂到 PDF 原文；聊天中的 PDF 笔记也会显示这条批注。批注上可撤销转化。");
+  }
+
   // source: { file } picked on disk (PDF or .aipdf), { attachmentId }, { notebookId, blockId } of a PDF
   // note, or { hash } of a PDF reviewed before.
   async function load(source) {
@@ -609,6 +652,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       }
       pdf = loaded;
       state = { id: opened.id, hash: opened.hash, comments: opened.comments, chat: opened.chat || [], name: opened.name };
+      pendingMessageConversion = null;
       pageNumber = Math.max(1, Math.min(pdf.numPages, opened.page || 1));
       const firstPage = await pdf.getPage(1);
       const firstSize = firstPage.getViewport({ scale: 1 });
@@ -688,6 +732,8 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
   get("review-comment-next").addEventListener("click", () => attempt(() => stepComment(1)));
   get("review-add").addEventListener("pointerdown", (event) => { captureSelection(); event.preventDefault(); });
   get("review-add").addEventListener("click", newComment);
+  get("review-move-message").addEventListener("pointerdown", (event) => { captureSelection(); event.preventDefault(); });
+  get("review-move-message").addEventListener("click", () => attempt(moveMessageToSelection));
   for (const id of ["review-ask", "review-ask-float"]) {
     get(id).addEventListener("pointerdown", (event) => { captureSelection(); event.preventDefault(); });
     get(id).addEventListener("click", askText);
@@ -778,6 +824,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       await save();
     },
     current: () => state && { hash: state.hash, name: state.name },
+    beginMessageConversion,
     activate: () => {
       if (opening || !state) return;
       mountDocumentChat();

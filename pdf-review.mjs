@@ -64,7 +64,7 @@ export function validateComments(comments) {
   if (!Array.isArray(comments) || comments.length > 1500) throw new Error("审阅批注列表无效。");
   const ids = new Set();
   return comments.map((comment) => {
-    const { id, page, rects, title, text, quote = "", priority = "", turns } = comment || {};
+    const { id, page, rects, title, text, quote = "", priority = "", turns, movedFrom } = comment || {};
     if (!/^[a-zA-Z\d_-]{1,80}$/.test(id || "") || ids.has(id) ||
         !Number.isInteger(page) || page < 1 || page > 3000 ||
         !Array.isArray(rects) || rects.length > 70 ||
@@ -79,7 +79,13 @@ export function validateComments(comments) {
           !rect.every((value) => Number.isFinite(value) && value >= 0 && value <= 1) ||
           rect[2] <= rect[0] || rect[3] <= rect[1]) throw new Error("批注下划线的位置无效。");
     }
-    return { id, page, rects, title, text, quote, priority, ...(turns !== undefined ? { turns: validateTurns(turns) } : {}) };
+    if (movedFrom && (!/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(movedFrom.notebookId || "") ||
+        !/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(movedFrom.messageId || ""))) {
+      throw new Error("批注的来源消息无效。");
+    }
+    return { id, page, rects, title, text, quote, priority,
+      ...(turns !== undefined ? { turns: validateTurns(turns) } : {}),
+      ...(movedFrom ? { movedFrom: { notebookId: movedFrom.notebookId, messageId: movedFrom.messageId } } : {}) };
   });
 }
 

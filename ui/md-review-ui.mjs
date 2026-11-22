@@ -3,6 +3,7 @@
 import { renderMarkdown, selectionSource, sourceRange } from "./markdown-dom.mjs";
 import { shiftAnnotations } from "./md-document.mjs";
 import { embedChat } from "./embedded-chat.mjs";
+import { attachSlashLinks } from "./internal-links.mjs";
 
 const make = (tag, className = "", text = "") => {
   const element = document.createElement(tag);
@@ -16,10 +17,17 @@ const control = (text, className = "") => {
   return element;
 };
 
-export function setupMdReview(api, { edit, notify, commentChats, onSaved = () => {} }) {
+ export function setupMdReview(api, { edit, notify, commentChats, onSaved = () => {} }) {
   const get = (id) => document.getElementById(id);
   const view = get("md-view");
   const source = get("md-source");
+  attachSlashLinks(source, source.parentElement, async () => {
+    const [library, docs] = await Promise.all([api.library(), api.mdList()]);
+    return [
+      ...library.items.map(({ id, title }) => ({ id, title, kind: "chat" })),
+      ...docs.map(({ id, name }) => ({ id, title: name, kind: "md" }))
+    ];
+  }, (error) => notify(error.message));
   const preview = get("md-preview");
   const tools = get("md-tools");
   let doc = null;

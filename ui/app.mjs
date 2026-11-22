@@ -2,6 +2,7 @@ import { contextBlockIds, findAnchor, mainHistory, messageGroups, sharedNoteBloc
 import { renderMarkdown, selectionSource, sourceRange } from "./markdown-dom.mjs";
 import { setupPdfReview } from "./pdf-review-ui.mjs";
 import { setupMdReview } from "./md-review-ui.mjs";
+import { attachSlashLinks } from "./internal-links.mjs";
 import { embedChat } from "./embedded-chat.mjs";
 import { setupCommentChats, toolDetails as renderToolDetails } from "./comment-chat.mjs";
 import { createComposer } from "./chat-composer.mjs";
@@ -34,7 +35,7 @@ const iconPaths = {
   fold: "M6 9l6 6 6-6", edit: "M12 20h9 M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
   trash: "M4 7h16 M10 11v6 M14 11v6 M6 7l1 13h10l1-13 M9 7V4h6v3",
   note: "M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6",
-  margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5",
+  margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5", undo: "M9 14 4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-2",
   pin: "M8 3h8l-1 5 3 3v2H6v-2l3-3z M12 13v8",
   popout: "M14 4h6v6 M20 4l-8 8 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"
 };
@@ -318,7 +319,18 @@ function markedText(element, block, notes, focusId = null) {
 
 let annotationPick = null;
 
-function startAnnotationPick(messageId, ids) {
+async function startAnnotationPick(messageId, ids) {
+  if (state.parent?.kind === "pdf-chat") {
+    const request = { hash: state.parent.hash, notebookId: state.id, ids };
+    if (embedId && window.parent !== window) {
+      window.parent.postMessage({ type: "ownsoft:pdf-message-annotation", ...request }, location.origin);
+    } else {
+      await openSavedReview(request.hash);
+      pdfReview.beginMessageConversion(request);
+    }
+    say("请在 PDF 左侧选中文字，再点「挂选中为批注」。");
+    return;
+  }
   annotationPick = { messageId, ids };
   window.getSelection()?.removeAllRanges();
   document.body.classList.add("picking-annotation");
@@ -382,11 +394,12 @@ function annotation(note, { focused = false } = {}) {
   collapse.setAttribute("aria-expanded", String(!collapsed));
   const edit = iconButton("edit", "edit-note", "编辑批注");
   const remove = iconButton("trash", "delete-note", "删除批注");
+  const undo = note.sourceMessageId ? iconButton("undo", "undo-note-conversion", "撤销转批注，恢复原消息") : null;
   const expand = button("↗", "focus-note", "note-expand");
   expand.title = "放大批注和追问";
   expand.setAttribute("aria-label", "放大批注和追问");
-  if (focused) commands.append(edit, remove, pin);
-  else commands.append(expand, collapse, edit, remove, pin);
+  if (focused) commands.append(edit, ...(undo ? [undo] : []), remove, pin);
+  else commands.append(expand, collapse, edit, ...(undo ? [undo] : []), remove, pin);
   const content = node("div", "markdown-content note-content");
   renderMarkdown(content, note.text);
   const head = node("div", "annotation-head");
@@ -912,6 +925,15 @@ function inlineEditor(author) {
     input.setAttribute("aria-label", `编辑${author}`);
     input.style.minHeight = `${Math.max(100, Math.min(560, editingMessage.height || 120))}px`;
     panel.append(input);
+    if (editingMessage.kind === "note") {
+      attachSlashLinks(input, panel, async () => {
+        const [library, docs] = await Promise.all([api.library(), api.mdList()]);
+        return [
+          ...library.items.map(({ id, title }) => ({ id, title, kind: "chat" })),
+          ...docs.map(({ id, name }) => ({ id, title: name, kind: "md" }))
+        ];
+      }, (error) => say(error.message));
+    }
   }
   const actions = node("div", "inline-editor-actions");
   const include = node("input", "include-block");
@@ -936,9 +958,10 @@ function insertGap(afterId, beforeId) {
   const tools = node("div", "insert-gap-tools");
   const text = button("＋ 笔记块", "insert-note-here");
   const image = button("＋ 图片/PDF", "insert-image-here");
+  const md = button("＋ MD文档", "insert-md-here");
   text.title = "在这里插入笔记块";
   image.title = "在这里插入图片或 PDF 笔记";
-  tools.append(text, image);
+  tools.append(text, image, md);
   gap.append(node("span", "insert-gap-line"), tools, node("span", "insert-gap-line"));
   return gap;
 }
@@ -1030,14 +1053,15 @@ function renderDocument() {
     }
     const image = kind === "note" && visible[0]?.noteType === "image" ? visible[0].attachments?.[0] : null;
     const pdfNote = kind === "note" && visible[0]?.noteType === "pdf" ? visible[0] : null;
+    const mdNote = kind === "note" && visible[0]?.noteType === "md" ? visible[0] : null;
     const threadNote = kind === "note" && visible[0]?.noteType === "thread" ? visible[0] : null;
-    const message = node("article", `paper-block is-${kind}${pdfNote ? " is-pdf-note" : ""}${threadNote ? " is-thread-note" : ""}`);
+    const message = node("article", `paper-block is-${kind}${pdfNote ? " is-pdf-note" : ""}${mdNote ? " is-md-note" : ""}${threadNote ? " is-thread-note" : ""}`);
     if (editingThis) {
       message.classList.add("editing-inline");
       message.style.width = `${editingMessage.width || 600}px`;
     }
     const author = kind === "user" ? "你" : kind === "agent" ? speakerName(speaker) : image ? "图片笔记"
-      : pdfNote ? "PDF 笔记" : threadNote ? `私聊记录 · ${speakerName(threadNote.source)}` : "笔记块";
+      : pdfNote ? "PDF 笔记" : mdNote ? "Markdown 笔记" : threadNote ? `私聊记录 · ${speakerName(threadNote.source)}` : "笔记块";
     const meta = node("div", "message-meta");
     if (kind === "note") {
       const handle = node("span", "shared-drag-handle", "⠿");
@@ -1100,6 +1124,7 @@ function renderDocument() {
       contentBody.append(inlineEditor(author));
     } else {
       if (pdfNote) contentBody.append(pdfNoteCard(pdfNote));
+      if (mdNote) contentBody.append(mdNoteCard(mdNote));
       if (image) {
         const picture = node("img", "shared-image");
         picture.src = `notebook://app/note-image/${image.id}`;
@@ -1109,8 +1134,8 @@ function renderDocument() {
       }
       for (const block of visible) {
         // A PDF note's card already names the file; a caption of its own still shows (and can be annotated).
-        const bareName = block === pdfNote && block.text === block.attachments?.[0]?.name &&
-          !attached.some((note) => note.anchor.blockId === block.id);
+        const bareName = (block === pdfNote && block.text === block.attachments?.[0]?.name ||
+          block === mdNote && block.text === mdNote.text) && !attached.some((note) => note.anchor.blockId === block.id);
         const element = kind === "user" ? node("div", "body-text") :
           node("div", "body-text markdown-content");
         element.dataset.blockId = block.id;
@@ -1173,8 +1198,9 @@ function focusMessage(group, note, source) {
   const first = visible[0];
   const image = kind === "note" && first?.noteType === "image" ? first.attachments?.[0] : null;
   const pdf = kind === "note" && first?.noteType === "pdf" ? first.attachments?.[0] : null;
+  const md = kind === "note" && first?.noteType === "md" ? first : null;
   const speaker = kind === "agent" ? group.blocks[0].source ?? source : null;
-  const author = kind === "user" ? "你" : kind === "agent" ? speakerName(speaker) : image ? "图片笔记" : pdf ? "PDF 笔记"
+  const author = kind === "user" ? "你" : kind === "agent" ? speakerName(speaker) : image ? "图片笔记" : pdf ? "PDF 笔记" : md ? "Markdown 笔记"
     : first?.noteType === "thread" ? `私聊记录 · ${speakerName(first.source)}` : "笔记块";
   const holds = group.blocks.some((block) => block.id === note.anchor.blockId);
   const row = node("div", `note-focus-row is-${kind}${holds ? " is-anchor" : ""}`);
@@ -1194,8 +1220,10 @@ function focusMessage(group, note, source) {
     paper.append(picture);
   }
   if (pdf) paper.append(attachmentChip(pdf));
+  if (md) paper.append(mdNoteCard(md));
   for (const block of visible) {
-    if ((image || pdf) && block === first && block.text === (image || pdf).name && !holds) continue;
+    if (block === first && !holds && ((image || pdf) && block.text === (image || pdf).name ||
+      md && block.text === md.text)) continue;
     const element = node("div", kind === "user" ? "body-text" : "body-text markdown-content");
     element.dataset.blockId = block.id;
     markedText(element, block, state.notes.filter((item) => item.anchor.blockId === block.id), note.id);
@@ -1337,6 +1365,20 @@ function fillPdfSummary(side, block, summary) {
   }));
   if (summary.commentCount > latest.length) list.append(node("p", "pdf-note-more", `还有 ${summary.commentCount - latest.length} 条…`));
   slot.replaceChildren(list);
+}
+
+function mdNoteCard(block) {
+  const card = node("div", "md-note");
+  const open = button("打开 · 编辑与追问 ↗", "open-md", "md-note-open");
+  open.dataset.mdId = block.mdId;
+  card.append(node("strong", "", `▤ ${block.text}`), open);
+  const preview = node("div", "md-note-preview markdown-content", "正在载入预览…");
+  card.append(preview);
+  api.mdOpen(block.mdId).then(({ doc }) => {
+    if (!preview.isConnected) return;
+    renderMarkdown(preview, doc.text.slice(0, 1000) + (doc.text.length > 1000 ? "\n\n…" : ""));
+  }).catch(() => { preview.textContent = "文档已移除或无法预览。"; });
+  return card;
 }
 
 function pdfNoteCard(block) {
@@ -2149,7 +2191,7 @@ async function handleAction(control) {
       const id = control.dataset.messageId;
       const group = messageGroups(state.blocks).find((item) => item.blocks[0].id === id);
       if (!group) throw new Error("消息已改变，请重试。");
-      startAnnotationPick(id, group.blocks.map((block) => block.id));
+      await startAnnotationPick(id, group.blocks.map((block) => block.id));
       break;
     }
     case "pick-selection":
@@ -2176,6 +2218,28 @@ async function handleAction(control) {
         ? control.closest(".insert-gap").dataset.afterId || null : insertionPoint();
       get("note-image-files").click();
       break;
+    case "insert-md-here": {
+      const docs = await api.mdList();
+      if (!docs.length) throw new Error("还没有 Markdown 文档。先在左侧 MD 文档里新建或打开一份。");
+      const gap = control.closest(".insert-gap");
+      const select = node("select", "insert-md-select");
+      select.append(node("option", "", "选择 Markdown 文档…"), ...docs.map((doc) => {
+        const option = node("option", "", doc.name);
+        option.value = doc.id;
+        return option;
+      }));
+      gap.querySelector(".insert-md-select")?.remove();
+      gap.querySelector(".insert-gap-tools").append(select);
+      select.addEventListener("change", async () => {
+        try {
+          accept(await api.addMarkdownBlock(state.id, select.value, gap.dataset.afterId || null));
+          renderDocument();
+          say("已插入 Markdown 笔记；点击卡片可编辑并继续追问。");
+        } catch (error) { say(error.message); }
+      });
+      select.focus();
+      break;
+    }
     case "toggle-message": {
       const id = control.dataset.messageId;
       if (collapsedMessages.has(id)) collapsedMessages.delete(id);
@@ -2669,15 +2733,17 @@ async function handleAction(control) {
       break;
     case "pin-note":
     case "delete-note":
+    case "undo-note-conversion":
       if (!note) return;
       if (action === "delete-note" && !window.confirm("删除这条批注及其追问？")) break;
-      await change({ type: action, id: note.id });
-      if (action === "delete-note") {
+      await change({ type: action === "undo-note-conversion" ? "undo-message-to-annotation" : action, id: note.id });
+      if (action === "delete-note" || action === "undo-note-conversion") {
         if (focusedNoteId === note.id) closeFocus();
         commentChats.forget(`note:${state.id}:${note.id}`);
         collapsedNotes.delete(note.id);
       }
       redrawNotes();
+      if (action === "undo-note-conversion") say("已恢复原消息。");
       break;
     case "ask":
     case "branch":
@@ -2784,7 +2850,14 @@ document.addEventListener("click", async (event) => {
   const link = event.target.closest("[data-markdown-link]");
   if (link) {
     event.preventDefault();
-    api.openLink(link.dataset.markdownLink).catch((error) => say(error.message));
+    const url = new URL(link.dataset.markdownLink);
+    if (url.protocol === "ownsoft:") {
+      const id = url.pathname.slice(1);
+      const open = url.hostname === "chat" ? (embedId ? api.openNotebookWindow(id) :
+        switchNotebook(() => api.openNotebook(id))) : url.hostname === "md" ?
+        showMd(() => mdReview.open(id)) : openSavedReview(id);
+      Promise.resolve(open).catch((error) => say(error.message));
+    } else api.openLink(link.dataset.markdownLink).catch((error) => say(error.message));
     return;
   }
   const control = event.target.closest("button");
@@ -3209,7 +3282,19 @@ const pdfReview = setupPdfReview(api, { edit: showEditor, notify: say, commentCh
   onSaved: () => {
     reviewSummaries.clear();
     void renderReviewList();
+    if (state) renderDocument();
   } });
+window.addEventListener("message", (event) => {
+  if (event.origin !== location.origin || event.data?.type !== "ownsoft:pdf-message-annotation") return;
+  const { notebookId, hash, ids } = event.data;
+  const frame = [...document.querySelectorAll("iframe.embedded-chat")].find((item) =>
+    item.contentWindow === event.source && item.dataset.chatId === notebookId);
+  if (!frame) return;
+  void (async () => {
+    if (pdfReview.current()?.hash !== hash || activeView !== "pdf") await openSavedReview(hash);
+    pdfReview.beginMessageConversion({ notebookId, hash, ids });
+  })().catch((error) => say(error.message));
+});
 
 try {
   const [notebook, savedSettings, library] = await Promise.all([api.read(embedId), api.settings(), api.library()]);

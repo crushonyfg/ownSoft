@@ -38,6 +38,7 @@ const files = new Map([
   ["/index.html", "ui/index.html"], ["/style.css", "ui/style.css"],
   ["/app.mjs", "ui/app.mjs"], ["/notebook.mjs", "notebook.mjs"], ["/context-budget.mjs", "context-budget.mjs"],
   ["/markdown-dom.mjs", "ui/markdown-dom.mjs"],
+  ["/internal-links.mjs", "ui/internal-links.mjs"],
   ["/pdf-review-ui.mjs", "ui/pdf-review-ui.mjs"], ["/workspace.css", "ui/workspace.css"],
   ["/comment-chat.mjs", "ui/comment-chat.mjs"], ["/pixel-avatars.mjs", "ui/pixel-avatars.mjs"],
   ["/chat-composer.mjs", "ui/chat-composer.mjs"], ["/threads-ui.mjs", "ui/threads-ui.mjs"],
@@ -65,6 +66,7 @@ let local;
 let dataSource;
 let backups;
 let backupTimer;
+let externalChangeTimer;
 // Answers being generated, by request id. Several can run at once (side conversations with
 // different members, the main chat, annotation follow-ups); each lane allows one at a time.
 const activeTurns = new Map();
@@ -92,7 +94,7 @@ function handle(name, operation) {
     }
     try {
       const data = await operation(payload, owner);
-      if (/^(?:notebook:change|note:add-images|members:change|turn:send|turn:detach|thread:send|review:save|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
+      if (/^(?:notebook:change|note:(?:add-images|add-md)|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
         for (const frame of frames()) if (frame !== event.senderFrame) {
           try { frame.send("library:changed"); } catch {}
         }
@@ -146,8 +148,8 @@ function session(profile) {
   mkdirSync(work, { recursive: true });
   // AI_NOTEBOOK_FAKE_MODELS=1 answers with canned text, for trying the interface without a subscription.
   const client = process.env.AI_NOTEBOOK_FAKE_MODELS === "1" ? new FakeModel(profile.provider)
-    : profile.provider === "gpt" ? new Codex(work, directory, approveCodex)
-    : profile.provider === "gemini" ? new Antigravity(work) : new Claude(work, directory);
+    : profile.provider === "gpt" ? new Codex(work, directory, approveCodex, local)
+    : profile.provider === "gemini" ? new Antigravity(work) : new Claude(work, directory, local);
   if (profile.provider === "gpt" && client.on) {
     client.on("account/login/completed", ({ success }) => {
       if (success) store.clearProfileModelSessions(profile.id);
@@ -438,7 +440,7 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
         { inline: index ? [] : files, ...(source.pdf ? { pdf: source.pdf } : {}) });
       try {
         const { answer, source, tools, sessionId } = await modelReply(speaker,
-          { ...input, files: prepared.files, images: prepared.images, dirs: prepared.dirs }, controller, requestId, cwd,
+          { ...input, notebookId: first.id, files: prepared.files, images: prepared.images, dirs: prepared.dirs }, controller, requestId, cwd,
           queue.map(({ member }) => member.name), { persistSession, resumeSession });
         // Moved to a private window while it was answering: the reply goes there, and members still
         // queued behind it are not asked (the user can ask them separately).
@@ -506,7 +508,7 @@ async function generateThread({ requestId, notebookId, threadId, question, attac
     const sharedFiles = sharedNoteBlocks(notebook).flatMap((block) => block.attachments || []);
     prepared = await attachments.provide([...sharedFiles, ...earlier, ...files], controller.signal, { inline: files });
     const input = threadInput(notebook, thread, text);
-    const reply = await modelReply(speaker, { ...input, files: prepared.files, images: prepared.images, dirs: prepared.dirs },
+    const reply = await modelReply(speaker, { ...input, notebookId: notebook.id, files: prepared.files, images: prepared.images, dirs: prepared.dirs },
       controller, requestId, cwd);
     const turn = { id: randomUUID(), question: text, ...reply, ...(files.length ? { attachments: files } : {}) };
     const saved = store.saveThreadReply(notebook.id, threadId, turn);
@@ -711,7 +713,8 @@ async function generateComment(payload) {
     prepared = await attachments.provide([...earlier, ...files], controller.signal,
       { inline: files, screenshot: target.screenshot, pdf: target.pdf });
     const input = commentInput(target.origin, target.turns, question);
-    Object.assign(input, { files: prepared.files, images: prepared.images, dirs: prepared.dirs });
+    Object.assign(input, { notebookId: target.notebookId || ownerId, files: prepared.files,
+      images: prepared.images, dirs: prepared.dirs });
     const reply = await modelReply(speaker, input, controller, requestId, cwd);
     const turn = { id: randomUUID(), question, ...reply, ...(files.length ? { attachments: files } : {}) };
     const notebook = target.noteId ? store.saveNoteReply(target.notebookId, target.noteId, turn) : undefined;
@@ -736,6 +739,7 @@ function autoBackup() {
 
 function shutDown() {
   clearInterval(backupTimer);
+  clearInterval(externalChangeTimer);
   for (const turn of activeTurns.values()) turn.controller.abort(new Error("应用已关闭。"));
   for (const client of sessions.values()) client.close?.();
   sessions.clear();
@@ -973,6 +977,16 @@ if (!app.requestSingleInstanceLock()) {
       }
     }
     backupTimer = setInterval(autoBackup, autoBackupInterval);
+    let dataVersion = store.db.prepare("PRAGMA data_version").get().data_version;
+    externalChangeTimer = setInterval(() => {
+      try {
+        const next = store.db.prepare("PRAGMA data_version").get().data_version;
+        if (next !== dataVersion) {
+          dataVersion = next;
+          notify("library:changed");
+        }
+      } catch (error) { console.error("Could not refresh external notebook changes:", error); }
+    }, 1500);
     profiles = new Profiles(store.db);
     attachments = new AttachmentStore(join(local, "attachments"), join(local, "attachment-work"));
     await attachments.initialize(storedAttachments());
@@ -1187,6 +1201,10 @@ if (!app.requestSingleInstanceLock()) {
       return { exported: path };
     });
     handle("md:list", () => store.mdDocuments());
+    handle("note:add-md", ({ notebookId, mdId, afterId }) => store.addMarkdownBlock(notebookId, mdId, afterId));
+    handle("review:move-message", ({ notebookId, ids, hash, anchor }) =>
+      store.moveMessageToPdfAnnotation(notebookId, ids, hash, anchor));
+    handle("review:undo-message", ({ hash, commentId }) => store.undoPdfMessageConversion(hash, commentId));
     handle("md:open", async (id) => openMd(mdDoc(id)));
     handle("md:open-path", async (path) => {
       if (typeof path !== "string" || !path) throw new Error("请选择电脑上的 .md 文件。");

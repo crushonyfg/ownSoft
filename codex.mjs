@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import { maxPromptChars } from "./context-budget.mjs";
+import { codexMcpConfig } from "./mcp-configuration.mjs";
 
 export function codexExecutable() {
   if (process.platform !== "win32") return "codex";
@@ -46,7 +47,7 @@ const options = [
   'model_provider="openai"', 'forced_login_method="chatgpt"',
   'web_search="live"',
   "features.apps=false", "features.plugins=false", "features.hooks=false",
-  "features.memories=false", "skills.include_instructions=false", "mcp_servers={}"
+  "features.memories=false", "skills.include_instructions=false"
 ].flatMap((option) => ["-c", option]);
 
 // In the group chat each model is told who it is and who else is present; earlier answers in the
@@ -79,9 +80,12 @@ function filesSection(files) {
     "否则读抽取好的文字。回答时说明依据的是第几页。）\n" + lines.join("\n");
 }
 
-export function buildPrompt({ context, memories, history, question, files = [], images = [], persona, peers = "" }) {
+export function buildPrompt({ context, memories, history, question, files = [], images = [], persona, peers = "", notebookId }) {
   const sections = [];
   if (persona) sections.push("你的身份\n" + personaSection(persona));
+  if (notebookId && persona?.provider !== "Gemini") sections.push(`当前 AI 笔记本会话 ID：${notebookId}。` +
+    "需要追查局部引句以外的消息、工具依据或关联 Markdown 时，按需调用 ownsoft 的 search_library、read_chat、read_message、read_markdown；不要猜测未读取的内容。" +
+    "用户要求保存成果或修改批注时，可用相应的 ownsoft 写入工具。笔记内的 ownsoft://chat/… 和 ownsoft://md/… 链接可按 ID 继续追溯。");
   if (history.length) sections.push("已有对话\n" + JSON.stringify(history));
   if (peers) sections.push("本轮其他成员已经回答了同一个问题\n" + peers);
   if (context) sections.push("笔记上下文\n" + context);
@@ -108,11 +112,12 @@ export class Codex extends EventEmitter {
   #requestId = 0;
   #pending = new Map();
 
-  constructor(directory, configDirectory, approve) {
+  constructor(directory, configDirectory, approve, dataDir) {
     super();
     this.directory = directory;
     this.configDirectory = configDirectory;
     this.approve = approve;
+    this.dataDir = dataDir;
   }
 
   async connect() {
@@ -122,7 +127,8 @@ export class Codex extends EventEmitter {
         ...(this.configDirectory ? ["CODEX_HOME", "CODEX_SQLITE_HOME"] : [])].includes(key.toUpperCase())));
     if (this.configDirectory) env.CODEX_HOME = this.configDirectory;
     const profileOptions = this.configDirectory ? ["-c", 'cli_auth_credentials_store="file"'] : [];
-    const child = spawn(codexExecutable(), ["app-server", "--listen", "stdio://", ...options, ...profileOptions], {
+    const child = spawn(codexExecutable(), ["app-server", "--listen", "stdio://", ...options,
+      "-c", codexMcpConfig(this.dataDir), ...profileOptions], {
       cwd: this.directory, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"]
     });
     this.#child = child;
