@@ -177,6 +177,7 @@ h2 { font-size: 17px; }
 .quote-button:hover { color: var(--accent); }
 .annotation-actions { display: flex; flex: none; gap: 2px; }
 .annotation-actions .message-icon { width: 26px; height: 26px; padding: 4px; }
+.annotation-actions .annotation-undo { min-height: 26px; padding: 2px 6px; font-size: 11px; white-space: nowrap; }
 .annotation-actions button[aria-pressed="true"] { background: var(--tint); color: var(--accent); }
 
 .side-chat {

@@ -22,6 +22,27 @@ test("a chat annotation can restore the original message", () => {
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("an older note-block annotation without source metadata can be restored", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ownsoft-legacy-undo-"));
+  const store = new NotebookStore(join(dir, "notebook.sqlite"));
+  try {
+    const chat = store.saveReply(null, "问题", "回答", undefined);
+    const question = chat.blocks.find((block) => block.kind === "question");
+    const added = store.change({ type: "add-shared-block", text: "原来的笔记块" }, chat.id);
+    const paragraph = added.blocks.find((block) => block.kind === "paragraph" && block.text === "原来的笔记块");
+    const moved = store.change({ type: "message-to-annotation", ids: [paragraph.id],
+      anchor: { blockId: question.id, start: 0, quote: "问题" } }, chat.id);
+    const legacy = store.read(chat.id);
+    delete legacy.notes[0].sourceMessageId;
+    delete legacy.blocks.find((block) => block.id === paragraph.id).conversionBackup;
+    store.write(legacy);
+    const restored = store.change({ type: "undo-message-to-annotation", id: moved.notes[0].id }, chat.id);
+    assert.equal(restored.blocks.find((block) => block.id === paragraph.id).text, "原来的笔记块");
+    assert.equal(restored.blocks.find((block) => block.id === paragraph.id).removed, false);
+    assert.equal(restored.notes.length, 0);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a PDF chat message can hang on selected PDF text and restore on undo", () => {
   const dir = mkdtempSync(join(tmpdir(), "ownsoft-pdf-move-"));
   const store = new NotebookStore(join(dir, "notebook.sqlite"));

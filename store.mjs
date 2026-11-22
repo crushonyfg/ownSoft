@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { applyMemberChange } from "./members.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { findAnchor, initialNotebook, messageGroups, sameMessage, splitReply } from "./notebook.mjs";
+import { annotationOriginalKind, findAnchor, initialNotebook, messageGroups, sameMessage, splitReply } from "./notebook.mjs";
 import { validateComments, validateTurns } from "./pdf-review.mjs";
 import { mdTextLimit, reanchor } from "./md-document.mjs";
 import { appendTurn, chatTurns, childKey, childKinds, syncTurns } from "./child-chats.mjs";
@@ -217,6 +217,30 @@ function restoreConvertedMessage(state, messageId) {
   }
 }
 
+function restoreLegacyConvertedMessage(state, note) {
+  const kind = annotationOriginalKind(note);
+  if (!kind) throw new Error("这条批注没有可恢复的来源消息。");
+  const text = requireText(note.text, 160_000);
+  const attachments = note.attachments?.length ? { attachments: note.attachments } : {};
+  const candidates = state.blocks.filter((block) => block.kind === kind && block.removed && !block.text &&
+    !block.conversionBackup && !state.notes.some((item) => item.sourceMessageId === block.id));
+  if (candidates.length === 1) {
+    const block = candidates[0];
+    block.text = text;
+    block.removed = false;
+    block.marks = [];
+    block.included = true;
+    Object.assign(block, attachments);
+    return;
+  }
+  // Older records do not identify their original block. When that blank slot is ambiguous, keep
+  // every existing tombstone intact and restore a new message beside the passage it annotated.
+  state.blocks.splice(insertionIndex(state, note.anchor.blockId), 0, {
+    id: randomUUID(), kind, text, marks: [], included: true, ...attachments,
+    ...(kind === "reply" ? { turnId: randomUUID(), ...(note.source ? { source: note.source } : {}) } : {})
+  });
+}
+
 // Index of the first block of the message containing beforeId.
 function messageStart(state, beforeId) {
   let index = state.blocks.findIndex((block) => block.id === beforeId);
@@ -428,9 +452,10 @@ export function applyChange(state, action) {
     }
     case "undo-message-to-annotation": {
       const note = find(state.notes, action.id);
-      if (!note.sourceMessageId) throw new Error("这条批注不是从消息转来的。");
+      if (!note.sourceMessageId && !annotationOriginalKind(note)) throw new Error("这条批注不是从消息转来的。");
       if (note.turns?.length) throw new Error("这条批注已有追问，请先处理追问再撤销。");
-      restoreConvertedMessage(state, note.sourceMessageId);
+      if (note.sourceMessageId) restoreConvertedMessage(state, note.sourceMessageId);
+      else restoreLegacyConvertedMessage(state, note);
       state.notes = state.notes.filter((item) => item.id !== note.id);
       if (state.context?.notes) state.context.notes = state.context.notes.filter((id) => id !== note.id);
       state.mainMemoryIds = (state.mainMemoryIds || []).filter((id) => id !== note.id);

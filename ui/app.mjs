@@ -1,4 +1,4 @@
-import { contextBlockIds, findAnchor, mainHistory, messageGroups, sharedNoteBlocks, sharedNoteIncluded } from "./notebook.mjs";
+import { annotationOriginalKind, contextBlockIds, findAnchor, mainHistory, messageGroups, sharedNoteBlocks, sharedNoteIncluded } from "./notebook.mjs";
 import { renderMarkdown, selectionSource, sourceRange } from "./markdown-dom.mjs";
 import { setupPdfReview } from "./pdf-review-ui.mjs";
 import { setupMdReview } from "./md-review-ui.mjs";
@@ -35,7 +35,7 @@ const iconPaths = {
   fold: "M6 9l6 6 6-6", edit: "M12 20h9 M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
   trash: "M4 7h16 M10 11v6 M14 11v6 M6 7l1 13h10l1-13 M9 7V4h6v3",
   note: "M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6",
-  margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5", undo: "M9 14 4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-2",
+  margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5",
   pin: "M8 3h8l-1 5 3 3v2H6v-2l3-3z M12 13v8",
   popout: "M14 4h6v6 M20 4l-8 8 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"
 };
@@ -394,7 +394,9 @@ function annotation(note, { focused = false } = {}) {
   collapse.setAttribute("aria-expanded", String(!collapsed));
   const edit = iconButton("edit", "edit-note", "编辑批注");
   const remove = iconButton("trash", "delete-note", "删除批注");
-  const undo = note.sourceMessageId ? iconButton("undo", "undo-note-conversion", "撤销转批注，恢复原消息") : null;
+  const undo = note.sourceMessageId || annotationOriginalKind(note)
+    ? button("撤销转批注", "undo-note-conversion", "annotation-undo") : null;
+  if (undo) undo.title = note.sourceMessageId ? "恢复原消息" : "恢复旧版批注中的消息内容";
   const expand = button("↗", "focus-note", "note-expand");
   expand.title = "放大批注和追问";
   expand.setAttribute("aria-label", "放大批注和追问");

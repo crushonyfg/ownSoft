@@ -42,6 +42,15 @@ export function messageGroups(blocks) {
   return groups;
 }
 
+// Older message-to-annotation records did not save a source block ID. Their author label still
+// identifies the original message kind, so the user can recover the text from the annotation.
+export function annotationOriginalKind(note) {
+  if (note?.author === "笔记块") return "paragraph";
+  if (note?.author === "我的消息") return "question";
+  if (typeof note?.author === "string" && note.author.endsWith(" 的回答")) return "reply";
+  return null;
+}
+
 // The main chat's context: every earlier message, or (once chosen) only the chosen messages plus
 // everything added after the choice, so the conversation can carry on from there.
 export function contextBlockIds(notebook) {
