@@ -5,7 +5,12 @@ import { turnInput } from "./notebook.mjs";
 // transcript, selected notes, inherited source, identity, account or working folder changes.
 export function modelContextFingerprint(notebook, branch, parent) {
   const base = turnInput(notebook, branch, "", false);
-  return createHash("sha256").update(JSON.stringify({ base, parent })).digest("hex");
+  // PDF bytes are already identified by the review's content hash. Serializing a Buffer here
+  // would turn every byte into a JSON number, several times per turn for a PDF conversation.
+  const source = { context: parent?.context || "", history: parent?.history || [],
+    refs: (parent?.refs || []).map(({ id, name, extension }) => ({ id, name, extension })),
+    pdf: parent?.pdf ? { hash: notebook.parent?.hash || "", name: parent.pdf.name } : null };
+  return createHash("sha256").update(JSON.stringify({ base, source })).digest("hex");
 }
 
 export function modelSessionIdentity({ member, group }) {

@@ -38,3 +38,20 @@ test("native session resumes only while the selected chat context and identity s
     store.close();
   }
 });
+
+test("PDF session fingerprint uses the content hash without serializing PDF bytes", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const state = { ...store.read(), parent: { kind: "pdf-comment", hash: "content-hash" } };
+    const source = { context: "第 3 页的批注", pdf: { name: "paper.pdf",
+      get bytes() { throw new Error("PDF bytes must not be serialized"); } } };
+    const fingerprint = modelContextFingerprint(state, null, source);
+    assert.equal(fingerprint, modelContextFingerprint(state, null, source));
+    assert.notEqual(fingerprint, modelContextFingerprint({ ...state, parent: { ...state.parent, hash: "updated" } },
+      null, source));
+    assert.notEqual(fingerprint, modelContextFingerprint(state, null,
+      { ...source, refs: [{ id: "attachment-1", name: "figure.png", extension: ".png" }] }));
+  } finally {
+    store.close();
+  }
+});

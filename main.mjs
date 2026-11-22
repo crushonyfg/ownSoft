@@ -434,7 +434,7 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
       const earlier = current ? current.turns.flatMap((turn) => turn.attachments || [])
         : mainHistory(notebook).flatMap((turn) => turn.attachments);
       const sharedImages = sharedNoteBlocks(notebook).flatMap((block) => block.attachments || []);
-      const prepared = await attachments.provide([...sharedImages, ...earlier, ...files], controller.signal,
+      const prepared = await attachments.provide([...sharedImages, ...earlier, ...(source.refs || []), ...files], controller.signal,
         { inline: index ? [] : files, ...(source.pdf ? { pdf: source.pdf } : {}) });
       try {
         const { answer, source, tools, sessionId } = await modelReply(speaker,
@@ -451,7 +451,7 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
         const beforeSave = await withReviews(store.read(first.id));
         const beforeSaveBranch = branchId ? beforeSave.branches.find((item) => item.id === branchId) : null;
         const contextUnchanged = (beforeSave.modelSessionEpoch || 0) === epoch &&
-          modelContextFingerprint(beforeSave, beforeSaveBranch, branchId ? {} : await parentContext(beforeSave)) === fingerprint;
+          modelContextFingerprint(beforeSave, beforeSaveBranch, branchId ? {} : await parentContext(beforeSave, false)) === fingerprint;
         saved = store.saveReply(branchId, text, answer, source, index ? [] : files, first.id, tools,
           { continueTurn: index > 0, recentMember: memberIds?.length && !index ? speaker.member.id : undefined });
         const unchanged = await withReviews(store.read(first.id));
@@ -643,7 +643,7 @@ function reviewChild(payload) {
 
 // What a child chat grew from, told to members answering in it as a full chat (and the PDF
 // itself, for a PDF's conversations).
-async function parentContext(notebook) {
+async function parentContext(notebook, includePdf = true) {
   const parent = notebook.parent;
   if (!parent) return {};
   try {
@@ -651,7 +651,7 @@ async function parentContext(notebook) {
       const owner = store.read(parent.notebookId);
       if (parent.kind === "note") {
         const note = owner.notes.find((item) => item.id === parent.noteId);
-        return note ? { context: commentContext(noteOrigin(owner, note)) } : {};
+        return note ? { context: commentContext(noteOrigin(owner, note)), refs: note.attachments || [] } : {};
       }
       if (parent.kind === "branch") {
         const branch = owner.branches.find((item) => item.id === parent.branchId);
@@ -666,7 +666,8 @@ async function parentContext(notebook) {
     if (parent.kind === "pdf-chat" || parent.kind === "pdf-comment") {
       const review = store.pdfReview(parent.hash);
       if (!review) return {};
-      const pdf = { bytes: await readFile(join(reviewFolder(), `${parent.hash}.pdf`)), name: review.name };
+      const pdf = { name: review.name,
+        ...(includePdf ? { bytes: await readFile(join(reviewFolder(), `${parent.hash}.pdf`)) } : {}) };
       const comment = review.comments.find((item) => item.id === parent.commentId);
       const origin = comment ? pdfCommentOrigin(review.name, comment) : documentOrigin(review.name, review.comments);
       return { context: commentContext(origin), pdf };
