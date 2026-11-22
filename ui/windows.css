@@ -1,0 +1,166 @@
+/* ---- Drag handles between panes ---- */
+.splitter { position: relative; z-index: 2; background: transparent; touch-action: none; }
+.splitter::after { content: ""; position: absolute; border-radius: 3px; background: var(--line); transition: background .15s; }
+.splitter.is-columns { cursor: col-resize; }
+.splitter.is-columns::after { top: 50%; left: 50%; width: 3px; height: 44px; transform: translate(-50%, -50%); }
+.splitter.is-rows { cursor: row-resize; height: 8px; }
+.splitter.is-rows::after { top: 50%; left: 50%; width: 44px; height: 3px; transform: translate(-50%, -50%); }
+.splitter:hover::after, .splitter.is-dragging::after { background: var(--accent); }
+.splitter.is-columns:hover, .splitter.is-columns.is-dragging { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.splitter.is-rows:hover, .splitter.is-rows.is-dragging { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+body.is-resizing-x, body.is-resizing-x * { cursor: col-resize !important; user-select: none; }
+body.is-resizing-y, body.is-resizing-y * { cursor: row-resize !important; user-select: none; }
+
+/* ---- PDF review: pages | annotations over whole-document conversation ---- */
+.review-layout { grid-template-columns: minmax(0, 1fr) 8px min(var(--review-side, 400px), 65%); }
+#review-split { border-left: 1px solid var(--line); }
+.review-comments { display: grid; grid-template-rows: var(--review-top, minmax(0, 1fr)) 8px minmax(0, 1fr);
+  overflow: hidden; padding: 0; border-left: 0; }
+.review-pane { min-height: 0; overflow: auto; padding: 12px 13px; }
+.review-pane.is-flash { animation: pane-flash .9s ease-out; }
+#review-side-split { border-top: 1px solid var(--line); }
+.review-chat-pane { display: block; }
+.review-chat-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.review-chat-head h2 { font-size: 15px; }
+#review-chat-count { color: var(--muted); font-size: 12px; }
+.review-chat-pane > .muted { font-size: 12px; margin-bottom: 8px; }
+.review-chat-pane .chat-composer { position: sticky; bottom: -12px; padding: 8px 0 10px; background: var(--chrome); }
+@keyframes pane-flash { from { background: color-mix(in srgb, var(--accent) 12%, transparent); } to { background: transparent; } }
+@media (max-width: 1030px) { .review-layout { grid-template-columns: minmax(0, 1fr) 8px var(--review-side, 300px); } }
+
+/* A window that shows one PDF note on its own (moved to another screen). */
+body[data-window-mode="review"] .app-header,
+body[data-window-mode="review"] .notebook-library,
+body[data-window-mode="review"] .focus-bar,
+body[data-window-mode="review"] .focus-shade,
+body[data-window-mode="review"] .review-back,
+body[data-window-mode="review"] #review-popout,
+body[data-window-mode="review"] .thread-dock,
+body[data-window-mode="review"] .thread-windows { display: none !important; }
+body[data-window-mode="review"] .pdf-review-view { position: fixed; inset: 0 !important; height: auto; border-radius: 0 !important;
+  box-shadow: none !important; z-index: 60; }
+
+/* ---- Main chat: an answer still running can move into a private window ---- */
+.pending-actions { display: inline-flex; gap: 6px; }
+.pending-actions button { min-height: 27px; padding: 2px 10px; font-size: 12px; }
+
+/* ---- Private conversations: avatars on the right edge ---- */
+.thread-dock { position: fixed; z-index: 36; right: 12px; bottom: 92px; display: flex; flex-direction: column-reverse;
+  align-items: center; gap: 9px; }
+body:not([data-view="document"]) .thread-dock, body:not([data-view="document"]) .thread-windows { display: none; }
+body[data-focus]:not([data-focus=""]) .thread-dock { display: none; }
+.thread-dock .thread-head { position: relative; width: 46px; height: 46px; min-height: 0; padding: 0; border: 0;
+  border-radius: 14px; background: transparent; }
+.thread-dock .thread-head .pixel-avatar { width: 46px; height: 46px; border-radius: 14px; }
+.thread-dock .thread-head .pixel-avatar svg { width: 34px; height: 34px; }
+.thread-dock .thread-head .avatar-signal { display: none !important; }
+.thread-dock .thread-head.is-open .pixel-avatar { outline: 3px solid var(--accent); outline-offset: 1px; }
+.thread-dock .thread-head:hover .pixel-avatar { transform: translateY(-2px); }
+.thread-head-ring { position: absolute; inset: -5px; border-radius: 17px; border: 3px solid transparent;
+  border-top-color: #e29b2f; border-right-color: #e29b2f; animation: thread-spin 1s linear infinite; pointer-events: none; }
+.thread-head-count { position: absolute; top: -6px; right: -6px; min-width: 20px; height: 20px; padding: 0 5px;
+  border-radius: 10px; background: #2f9e5b; color: #fff; font-size: 11.5px; font-weight: 800; line-height: 20px;
+  border: 2px solid var(--paper); box-shadow: 0 2px 6px #0003; }
+.thread-head-dot { position: absolute; top: -3px; right: -3px; width: 12px; height: 12px; border-radius: 6px;
+  background: #2f9e5b; border: 2px solid var(--paper); }
+.thread-add { width: 38px; height: 38px; min-height: 0; padding: 0; border-radius: 13px; font-size: 20px; line-height: 1;
+  color: var(--accent); background: var(--paper); box-shadow: 0 4px 14px #243d4326; }
+.thread-add[aria-expanded="true"] { background: var(--tint); }
+.thread-menu { position: absolute; right: 54px; bottom: 0; width: 230px; padding: 6px; display: grid; gap: 2px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 13px; box-shadow: 0 14px 40px #1c294e40; }
+.thread-menu-title { padding: 4px 8px; color: var(--muted); font-size: 12px; }
+.thread-menu-item { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 4px 8px; border: 0;
+  border-radius: 8px; background: transparent; text-align: left; font-size: 13px; white-space: normal; }
+.thread-menu-item:hover { background: var(--tint); }
+.thread-menu-item .pixel-avatar { width: 24px; height: 24px; border-radius: 7px; border-width: 1px; box-shadow: none; }
+.thread-menu-item .pixel-avatar svg { width: 18px; height: 18px; }
+.thread-menu-item .avatar-signal { display: none !important; }
+@keyframes thread-spin { to { transform: rotate(360deg); } }
+
+/* ---- Private conversations: floating windows ---- */
+.thread-windows { position: fixed; inset: 0; z-index: 35; pointer-events: none; }
+.thread-windows[data-snap-hint="left-half"]::before, .thread-windows[data-snap-hint="right-half"]::before,
+.thread-windows[data-snap-hint="maximize"]::before { content: ""; position: absolute; top: calc(var(--ribbon-height) + 8px); bottom: 10px;
+  border: 2px dashed var(--accent); border-radius: 14px; background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.thread-windows[data-snap-hint="left-half"]::before { left: 8px; right: 50%; }
+.thread-windows[data-snap-hint="right-half"]::before { left: 50%; right: 66px; }
+.thread-windows[data-snap-hint="maximize"]::before { left: 8px; right: 66px; }
+.thread-window { position: absolute; pointer-events: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px 12px;
+  min-width: 0; min-height: 0; background: var(--paper); color: var(--text); border: 1px solid var(--line); border-radius: 15px;
+  box-shadow: 0 16px 48px #1c294e40; animation: thread-window-in .18s ease-out; }
+@keyframes thread-window-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
+.thread-window-head { display: flex; align-items: center; gap: 8px; cursor: grab; user-select: none; padding-bottom: 6px;
+  border-bottom: 1px solid var(--line); }
+.thread-window-head:active { cursor: grabbing; }
+.thread-window .thread-who { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+.thread-window .thread-who > div { display: grid; min-width: 0; }
+.thread-window .thread-who strong { font-size: 14px; }
+.thread-window .thread-who span { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-window .thread-who .pixel-avatar { width: 32px; height: 32px; border-radius: 9px; }
+.thread-window .thread-who .pixel-avatar svg { width: 24px; height: 24px; }
+.thread-badge { flex: none; padding: 1px 8px; border-radius: 9px; font-size: 11px; background: var(--surface); color: var(--muted); }
+.thread-tools { display: flex; align-items: center; gap: 4px; flex: none; }
+.thread-tools > button { min-height: 26px; padding: 1px 9px; font-size: 12px; }
+.thread-tools .thread-minimize, .thread-tools .thread-close { width: 26px; padding: 0; font-size: 15px; line-height: 1; }
+.thread-layout-menu { position: relative; }
+.thread-layout-menu summary { list-style: none; display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid var(--line);
+  border-radius: 6px; cursor: pointer; font-size: 14px; }
+.thread-layout-menu summary::-webkit-details-marker { display: none; }
+.thread-layout-options { position: absolute; right: 0; top: 30px; z-index: 3; width: 120px; padding: 4px; display: grid; gap: 1px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px; box-shadow: 0 10px 28px #1c294e33; }
+.thread-layout-options button { min-height: 26px; padding: 2px 8px; border: 0; background: transparent; text-align: left; font-size: 12px; }
+.thread-layout-options button:hover { background: var(--tint); }
+.thread-window .thread-turns { flex: 1; min-height: 0; overflow: auto; display: grid; align-content: start; gap: 10px; padding: 2px; }
+.thread-window .thread-empty { color: var(--muted); font-size: 12.5px; padding: 6px 2px; }
+.thread-window > .chat-composer { flex: none; }
+.thread-window .chat-composer textarea { min-height: 48px; }
+.thread-origin { padding: 6px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--chrome); font-size: 12.5px; }
+.thread-origin summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+.thread-origin .markdown-content { max-height: 240px; overflow: auto; margin-top: 6px; }
+.thread-grip { position: absolute; z-index: 2; }
+.thread-grip.is-w { left: -4px; top: 14px; bottom: 14px; width: 8px; cursor: ew-resize; }
+.thread-grip.is-e { right: -4px; top: 14px; bottom: 14px; width: 8px; cursor: ew-resize; }
+.thread-grip.is-n { top: -4px; left: 14px; right: 14px; height: 8px; cursor: ns-resize; }
+.thread-grip.is-s { bottom: -4px; left: 14px; right: 14px; height: 8px; cursor: ns-resize; }
+.thread-grip.is-nw { left: -5px; top: -5px; width: 16px; height: 16px; cursor: nwse-resize; }
+.thread-grip.is-se { right: -5px; bottom: -5px; width: 16px; height: 16px; cursor: nwse-resize; }
+.thread-grip.is-ne { right: -5px; top: -5px; width: 16px; height: 16px; cursor: nesw-resize; }
+.thread-grip.is-sw { left: -5px; bottom: -5px; width: 16px; height: 16px; cursor: nesw-resize; }
+@media (prefers-reduced-motion: reduce) { .thread-head-ring, .thread-window { animation: none; } }
+
+/* ---- Right-click menu for PDFs ---- */
+.context-menu { position: fixed; z-index: 95; min-width: 170px; max-width: 280px; padding: 5px; display: grid; gap: 1px;
+  background: var(--paper); color: var(--text); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 34px #1c294e40; }
+.context-menu-title { padding: 4px 9px 5px; color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  border-bottom: 1px solid var(--line); margin-bottom: 3px; }
+.context-menu button { min-height: 30px; padding: 4px 9px; border: 0; border-radius: 7px; background: transparent; text-align: left; font-size: 13px; }
+.context-menu button:hover, .context-menu button:focus-visible { background: var(--tint); outline: none; }
+
+/* ---- Sidebar: every reviewed PDF, each its own conversation ---- */
+.review-library { margin-top: 6px; }
+.review-library-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.review-library-head h2 { margin-inline: 8px 0; }
+.notebook-library .review-library-head button { width: auto; flex: none; margin-top: 12px; padding: 2px 8px; min-height: 24px; font-size: 12px; color: var(--accent); }
+.review-list { display: grid; gap: 2px; max-height: 260px; overflow: auto; }
+.notebook-library .review-list-item { display: grid; gap: 1px; min-height: 0; padding: 5px 9px; }
+.review-list-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.review-list-meta { color: var(--muted); font-size: 11px; }
+.review-list-empty { padding: 2px 9px; color: var(--muted); font-size: 12px; }
+#review-save:disabled { opacity: 1; background: transparent; border-color: transparent; color: var(--muted); font-size: 12px; }
+
+/* ---- An answer moved into a private window: a folded card in the chat ---- */
+.chat-row.is-thread-stub .thread-stub-card { width: min(100%, 760px); border-style: dashed; border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--chat-agent, #fff) 85%, var(--tint)); }
+.thread-stub-card .message-meta { align-items: center; }
+.thread-stub-tag { padding: 0 7px; border-radius: 8px; background: var(--surface); font-size: 11px; }
+.thread-stub-state { font-size: 11.5px; }
+.thread-stub-state.is-running { color: #b7771f; opacity: 1 !important; animation: typing-pulse 1.4s ease-in-out infinite; }
+.thread-stub-actions { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; opacity: 1 !important; }
+.thread-stub-actions button:not(.message-icon) { min-height: 26px; padding: 1px 10px; font-size: 12px; }
+.thread-stub-question { margin: 0 0 6px; color: var(--muted); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.thread-stub-preview { position: relative; max-height: 4.9em; overflow: hidden; font-size: 14px; line-height: 1.6;
+  mask-image: linear-gradient(#000 55%, transparent); }
+.thread-stub-history { display: grid; gap: 12px; }
+.thread-stub-turn + .thread-stub-turn { padding-top: 10px; border-top: 1px solid var(--line); }
+.thread-stub-turn .thread-stub-question { -webkit-line-clamp: unset; color: var(--accent); }

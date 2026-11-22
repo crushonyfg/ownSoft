@@ -119,6 +119,8 @@ export class Claude {
     ];
     if (model) args.push("--model", model);
     if (effort) args.push("--effort", effort);
+    // Attached files are read from the app's attachment folders.
+    for (const dir of input.dirs || []) args.push("--add-dir", dir);
     let stdin = prompt;
     if (input.images?.length) {
       const content = [{ type: "text", text: prompt }];

@@ -1,4 +1,9 @@
+// Conversations attached to something: an annotation, a PDF annotation, a PDF selection or a
+// whole PDF. They use the same question box as the group chat (members as @ chips, several
+// members answer in turn, attachments), and keep their state while the page re-renders.
 import { renderMarkdown } from "./markdown-dom.mjs";
+import { createComposer, providerLabel } from "./chat-composer.mjs";
+import { pixelAvatar } from "./pixel-avatars.mjs";
 
 const create = (tag, className, text) => {
   const element = document.createElement(tag);
@@ -7,16 +12,13 @@ const create = (tag, className, text) => {
   return element;
 };
 
-const button = (text) => {
-  const control = create("button", "", text);
+const button = (text, className = "") => {
+  const control = create("button", className, text);
   control.type = "button";
   return control;
 };
 
-const providerLabel = (provider) => ({ claude: "Claude", gemini: "Gemini" })[provider] || "GPT";
-const speakerLabel = (source) => source?.memberName || providerLabel(source?.provider);
-
-function toolDetails(items = []) {
+export function toolDetails(items = []) {
   if (!items.length) return null;
   const details = create("details", "tool-details");
   details.append(create("summary", "", `工具调用 · ${items.length} 项`));
@@ -33,12 +35,61 @@ function toolDetails(items = []) {
   return details;
 }
 
-export function setupCommentChats(api, { profile, notify, openFork }) {
+const isImage = (ref) => [".png", ".jpg", ".jpeg", ".webp"].includes(ref.extension);
+
+export function turnAttachments(refs = [], open) {
+  if (!refs.length) return null;
+  const group = create("div", "attachments sent");
+  group.append(...refs.map((ref) => {
+    const link = button("", isImage(ref) ? "attachment-thumb" : "attachment-chip");
+    link.title = ref.name;
+    if (isImage(ref)) {
+      const picture = create("img");
+      picture.src = `notebook://app/note-image/${ref.id}`;
+      picture.alt = ref.name;
+      link.append(picture);
+    } else link.append(create("span", "", ref.name));
+    link.addEventListener("click", () => open?.(ref));
+    return link;
+  }));
+  return group;
+}
+
+// One finished exchange as chat bubbles: the question on the right, the member's answer on the left.
+export function chatTurn(turn, { speaker, openAttachment, actions = [] }) {
+  const item = create("article", "comment-turn");
+  const asked = create("div", "comment-ask");
+  asked.append(create("p", "question-bubble", turn.question));
+  const files = turnAttachments(turn.attachments, openAttachment);
+  if (files) asked.append(files);
+  const who = speaker(turn.source);
+  const reply = create("div", "comment-reply");
+  const meta = create("div", "comment-reply-meta");
+  meta.append(pixelAvatar(who.avatar, "idle", ""), create("strong", "", who.name),
+    create("span", "", [providerLabel(turn.source?.provider), turn.source?.model].filter(Boolean).join(" · ")));
+  if (actions.length) {
+    const tools = create("span", "comment-turn-actions");
+    tools.append(...actions);
+    meta.append(tools);
+  }
+  const body = create("div", "markdown-content");
+  renderMarkdown(body, turn.answer);
+  reply.append(meta);
+  const tools = toolDetails(turn.tools);
+  if (tools) reply.append(tools);
+  reply.append(body);
+  item.append(asked, reply);
+  return item;
+}
+
+export function setupCommentChats(api, { members, defaultMember, describe, speaker, notify, openFork, attachments,
+  notebookId = () => undefined,
+  openAttachment }) {
   const threads = new Map();
   const running = new Map();
   api.onProgress(({ requestId, text }) => {
     const thread = running.get(requestId);
-    if (!thread) return;
+    if (!thread?.pending) return;
     thread.pending.text = text;
     if (thread.pending.frame) return;
     thread.pending.frame = requestAnimationFrame(() => {
@@ -51,7 +102,7 @@ export function setupCommentChats(api, { profile, notify, openFork }) {
     const thread = running.get(requestId);
     if (!thread?.pending) return;
     thread.pending.activity = text;
-    thread.paintActivity?.();
+    thread.paintProgress?.();
   });
   api.onTool(({ requestId, tool }) => {
     const thread = running.get(requestId);
@@ -59,104 +110,136 @@ export function setupCommentChats(api, { profile, notify, openFork }) {
     const previous = thread.pending.tools.find((item) => item.id === tool.id);
     if (previous) Object.assign(previous, tool);
     else thread.pending.tools.push(tool);
-    thread.paintTools?.();
+    thread.paintProgress?.(true);
   });
 
-  function mount(parent, { key, target, turns, receive, embedded = false }) {
+  // The question box of one conversation, made once and moved into each new rendering.
+  function composerFor(thread, options) {
+    if (thread.composer) return thread.composer;
+    thread.composer = createComposer({
+      label: options.label, placeholder: options.placeholder, members, defaultMember, describe, notify,
+      attachments: options.attachments === false ? null : attachments, compact: true,
+      draft: { get: () => thread.draft, set: (value) => { thread.draft = value; } },
+      submit: async ({ question, members: who, files }) => {
+        // Several @-mentioned members answer in turn; each one sees the earlier answers.
+        for (const [index, member] of who.entries()) {
+          const requestId = crypto.randomUUID();
+          thread.pending = { id: requestId, question, member, index, total: who.length, text: "", tools: [], frame: 0,
+            waiting: who.slice(index + 1).map((item) => item.name) };
+          running.set(requestId, thread);
+          thread.paint?.();
+          try {
+            // The members shown are this chat's, so the answer comes from this chat's roster too.
+            const result = await api.sendComment({ rosterNotebookId: notebookId(), ...thread.target(), question, requestId,
+              memberId: member.id,
+              attachmentIds: index ? [] : files.map((ref) => ref.id) });
+            thread.receive(result);
+          } catch (error) {
+            if (index) throw new Error(`${member.name}：${error.message}（前面成员的回答已保存）`);
+            throw error;
+          } finally {
+            cancelAnimationFrame(thread.pending?.frame);
+            running.delete(requestId);
+            thread.pending = undefined;
+            thread.paint?.();
+          }
+        }
+      }
+    });
+    return thread.composer;
+  }
+
+  /**
+   * key: identifies the conversation; target(): what the main process needs to answer;
+   * turns(): the finished exchanges; receive(result): store a new answer.
+   * embedded: always open, without the 追问 / 新开分支 controls (PDF selections, whole PDFs).
+   */
+  function mount(parent, { key, target, turns, receive, embedded = false, expanded, placeholder, label,
+    forkable = true, attachments: allowFiles = true, turnActions }) {
     let thread = threads.get(key);
     if (!thread) {
-      thread = { expanded: embedded, draft: "" };
+      thread = { expanded: embedded || Boolean(expanded), draft: "" };
       threads.set(key, thread);
     }
-    const section = create("section", "comment-thread");
+    if (expanded) thread.expanded = true;
+    Object.assign(thread, { target, receive });
+    const composer = composerFor(thread, { label, attachments: allowFiles,
+      placeholder: placeholder || (embedded ? "针对这里提问，@ 成员可让多位依次回答" : "追问这条批注，@ 成员可让多位依次回答") });
+    const section = create("section", embedded ? "comment-thread is-embedded" : "comment-thread");
     const controls = create("div", "comment-thread-controls");
     const chat = button("追问");
     chat.dataset.commentChat = "";
     const fork = button("新开分支");
     fork.dataset.commentFork = "";
-    controls.append(chat, fork);
+    fork.title = "把批注、原文和追问带到一个新会话里继续";
+    controls.append(chat);
+    if (forkable) controls.append(fork);
     const conversation = create("div", "comment-conversation");
     const history = create("div", "comment-history");
     const progress = create("div", "comment-progress");
-    const pendingQuestion = create("p", "question-bubble");
-    const pendingAnswer = create("div", "markdown-content");
-    const progressHeader = create("div", "comment-thread-controls");
-    const progressTools = create("div");
-    const progressLabel = create("span", "muted");
-    const stop = button("停止");
-    progressHeader.append(progressLabel, stop);
-    progress.append(pendingQuestion, progressHeader, progressTools, pendingAnswer);
-    const form = create("form", "comment-composer");
-    const input = create("textarea");
-    input.rows = 2;
-    input.maxLength = 10_000;
-    input.placeholder = embedded ? "针对这个 PDF 选区提问" : "针对这条批注提问";
-    input.setAttribute("aria-label", input.placeholder);
-    input.value = thread.draft;
-    const send = button("发送");
-    send.type = "submit";
-    send.className = "primary";
-    form.append(input, send);
-    conversation.append(history, progress, form);
+    conversation.append(history, progress, composer.element);
     if (!embedded) section.append(controls);
     section.append(conversation);
     parent.append(section);
 
-    function paintProgress() {
-      if (section.isConnected && !conversation.hidden && thread.pending) {
-        renderMarkdown(pendingAnswer, thread.pending.text);
+    function paintProgress(withTools = false) {
+      if (!section.isConnected || conversation.hidden || !thread.pending) return;
+      const pending = thread.pending;
+      const label = progress.querySelector(".comment-progress-label");
+      if (label) label.textContent = `${pending.member.name}${pending.total > 1 ? `（${pending.index + 1}/${pending.total}）` : ""} ${pending.activity || "正在回答"}`;
+      const avatar = progress.querySelector(".pixel-avatar");
+      if (avatar) avatar.dataset.state = pending.activity?.includes("搜索") ? "searching" : pending.text ? "typing" : "thinking";
+      if (withTools) {
+        const slot = progress.querySelector(".comment-progress-tools");
+        const details = toolDetails(pending.tools);
+        slot?.replaceChildren(...(details ? [details] : []));
+      }
+      const output = progress.querySelector(".comment-progress-output");
+      if (output) {
+        renderMarkdown(output, pending.text);
+        if (!pending.text) output.append(create("span", "typing-dots", "● ● ●"));
       }
     }
 
+    // Cards are usually built before they are put on the page, so this draws detached sections too.
     function paint() {
+      if (thread.paint !== paint) return;
       const previous = turns();
       chat.textContent = thread.expanded ? "收起追问" : previous.length ? `追问 · ${previous.length}` : "追问";
       chat.setAttribute("aria-expanded", String(thread.expanded));
       fork.disabled = Boolean(thread.pending || thread.forking);
       conversation.hidden = !thread.expanded;
       if (!thread.expanded) return;
-      if (input.value !== thread.draft) input.value = thread.draft;
-      history.replaceChildren(...previous.map((turn) => {
-        const item = create("article", "comment-turn");
-        const body = create("div", "markdown-content");
-        renderMarkdown(body, turn.answer);
-        item.append(create("p", "question-bubble", turn.question),
-          create("p", "reply-source", speakerLabel(turn.source)));
-        const tools = toolDetails(turn.tools);
-        if (tools) item.append(tools);
-        item.append(body);
-        return item;
-      }));
-      const busy = Boolean(thread.pending);
-      progress.hidden = !busy;
-      input.disabled = send.disabled = busy;
-      if (busy) {
-        pendingQuestion.textContent = thread.pending.question;
-        progressLabel.textContent = `${thread.pending.provider} ${thread.pending.activity || "正在回答"}`;
-        const tools = toolDetails(thread.pending.tools);
-        progressTools.replaceChildren(...(tools ? [tools] : []));
-        stop.disabled = false;
-        paintProgress();
+      if (composer.element.parentElement !== conversation) conversation.append(composer.element);
+      history.replaceChildren(...previous.map((turn) => chatTurn(turn, { speaker, openAttachment,
+        actions: turnActions?.(turn) || [] })));
+      const pending = thread.pending;
+      progress.hidden = !pending;
+      if (pending) {
+        const header = create("div", "comment-reply-meta");
+        const stop = button("停止");
+        stop.addEventListener("click", async () => {
+          stop.disabled = true;
+          try { await api.stop(pending.id); } catch (error) { notify(error.message); stop.disabled = false; }
+        });
+        header.append(pixelAvatar(pending.member.avatar, "thinking", ""), create("strong", "comment-progress-label"), stop);
+        const asked = create("div", "comment-ask");
+        asked.append(create("p", "question-bubble", pending.question));
+        const reply = create("div", "comment-reply is-pending");
+        reply.append(header, create("div", "comment-progress-tools"), create("div", "comment-progress-output markdown-content"));
+        if (pending.waiting.length) reply.append(create("p", "pending-queue", `接下来：${pending.waiting.join("、")}`));
+        progress.replaceChildren(...(pending.index ? [] : [asked]), reply);
+        paintProgress(true);
       }
+      composer.refresh();
     }
 
     thread.paint = paint;
     thread.paintProgress = paintProgress;
-    thread.paintTools = () => {
-      if (section.isConnected && thread.pending) {
-        const details = toolDetails(thread.pending.tools);
-        progressTools.replaceChildren(...(details ? [details] : []));
-      }
-    };
-    thread.paintActivity = () => {
-      if (section.isConnected && thread.pending) {
-        progressLabel.textContent = `${thread.pending.provider} ${thread.pending.activity || "正在回答"}`;
-      }
-    };
     chat.addEventListener("click", () => {
       thread.expanded = !thread.expanded;
       paint();
-      if (thread.expanded && !input.disabled) input.focus();
+      if (thread.expanded && !composer.busy) composer.focus();
     });
     fork.addEventListener("click", async () => {
       if (thread.forking) return;
@@ -171,51 +254,20 @@ export function setupCommentChats(api, { profile, notify, openFork }) {
         thread.paint?.();
       }
     });
-    stop.addEventListener("click", async () => {
-      if (!thread.pending) return;
-      stop.disabled = true;
-      try {
-        await api.stop(thread.pending.id);
-      } catch (error) {
-        notify(error.message);
-        stop.disabled = false;
-      }
-    });
-    input.addEventListener("input", () => { thread.draft = input.value; });
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const question = input.value.trim();
-      if (!question || thread.pending) return;
-      const selected = profile();
-      if (!selected) return;
-      const requestId = crypto.randomUUID();
-      thread.draft = input.value;
-      thread.pending = { id: requestId, question, provider: selected.name || providerLabel(selected.provider), text: "", tools: [], frame: 0 };
-      running.set(requestId, thread);
-      paint();
-      try {
-        const result = await api.sendComment({ ...target(), question, requestId, memberId: selected.id });
-        receive(result);
-        thread.draft = "";
-      } catch (error) {
-        notify(error.message);
-      } finally {
-        cancelAnimationFrame(thread.pending.frame);
-        running.delete(requestId);
-        thread.pending = undefined;
-        thread.paint?.();
-      }
-    });
     paint();
-    return () => input.focus();
+    return () => composer.focus();
   }
 
   return {
     mount,
+    refresh: () => { for (const thread of threads.values()) thread.composer?.refresh(); },
     pending: (prefix) => [...threads].some(([key, thread]) => key.startsWith(prefix) && thread.pending),
     forget: (prefix) => {
-      for (const key of threads.keys()) {
-        if (key.startsWith(prefix) && !threads.get(key).pending) threads.delete(key);
+      for (const [key, thread] of threads) {
+        if (key.startsWith(prefix) && !thread.pending) {
+          void thread.composer?.discard();
+          threads.delete(key);
+        }
       }
     }
   };

@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell } from "electron";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { basename, dirname, extname, join } from "node:path";
@@ -11,8 +12,11 @@ import { Claude } from "./claude.mjs";
 import { Profiles, providerAvatar } from "./profiles.mjs";
 import { appsInfo } from "./apps.mjs";
 import { Antigravity } from "./antigravity.mjs";
+import { FakeModel } from "./fake-model.mjs";
 import { allAttachmentRefs, AttachmentStore } from "./attachments.mjs";
-import { commentInput, mainHistory, noteOrigin, stripSpeaker, pdfCommentOrigin, sharedNoteBlocks, turnInput } from "./notebook.mjs";
+import {
+  commentInput, documentOrigin, mainHistory, noteOrigin, stripSpeaker, pdfCommentOrigin, sharedNoteBlocks, threadInput, turnInput
+} from "./notebook.mjs";
 import { NotebookStore, requireText } from "./store.mjs";
 import { readReviewFile, saveReviewFile, validateComments, validateTurns } from "./pdf-review.mjs";
 import {
@@ -28,7 +32,9 @@ const files = new Map([
   ["/index.html", "ui/index.html"], ["/style.css", "ui/style.css"],
   ["/app.mjs", "ui/app.mjs"], ["/notebook.mjs", "notebook.mjs"], ["/markdown-dom.mjs", "ui/markdown-dom.mjs"],
   ["/pdf-review-ui.mjs", "ui/pdf-review-ui.mjs"], ["/workspace.css", "ui/workspace.css"],
-  ["/comment-chat.mjs", "ui/comment-chat.mjs"], ["/pixel-avatars.mjs", "ui/pixel-avatars.mjs"]
+  ["/comment-chat.mjs", "ui/comment-chat.mjs"], ["/pixel-avatars.mjs", "ui/pixel-avatars.mjs"],
+  ["/chat-composer.mjs", "ui/chat-composer.mjs"], ["/threads-ui.mjs", "ui/threads-ui.mjs"],
+  ["/pdf-note.mjs", "ui/pdf-note.mjs"], ["/features.css", "ui/features.css"], ["/splitter.mjs", "ui/splitter.mjs"], ["/windows.css", "ui/windows.css"]
 ]);
 protocol.registerSchemesAsPrivileged([
   { scheme: "notebook", privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }
@@ -50,7 +56,9 @@ let local;
 let dataSource;
 let backups;
 let backupTimer;
-let activeTurn;
+// Answers being generated, by request id. Several can run at once (side conversations with
+// different members, the main chat, annotation follow-ups); each lane allows one at a time.
+const activeTurns = new Map();
 const autoBackupInterval = 6 * 60 * 60 * 1000;
 const reviews = new Map();
 const sessions = new Map();
@@ -63,7 +71,7 @@ function handle(name, operation) {
     }
     try {
       const data = await operation(payload, owner);
-      if (/^(?:notebook:change|note:add-images|members:change|turn:send|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
+      if (/^(?:notebook:change|note:add-images|members:change|turn:send|turn:detach|thread:send|review:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
         for (const other of windows) if (other !== owner && !other.isDestroyed()) {
           other.webContents.send("library:changed");
         }
@@ -113,9 +121,11 @@ function session(profile) {
   if (directory) mkdirSync(directory, { recursive: true });
   const work = join(local, "model-work");
   mkdirSync(work, { recursive: true });
-  const client = profile.provider === "gpt" ? new Codex(work, directory, approveCodex)
+  // AI_NOTEBOOK_FAKE_MODELS=1 answers with canned text, for trying the interface without a subscription.
+  const client = process.env.AI_NOTEBOOK_FAKE_MODELS === "1" ? new FakeModel(profile.provider)
+    : profile.provider === "gpt" ? new Codex(work, directory, approveCodex)
     : profile.provider === "gemini" ? new Antigravity(work) : new Claude(work, directory);
-  if (profile.provider === "gpt") {
+  if (profile.provider === "gpt" && client.on) {
     client.on("account/login/completed", ({ success }) => {
       notify("account:status", { id: profile.id, success });
     });
@@ -124,7 +134,20 @@ function session(profile) {
   return client;
 }
 
-const storedAttachments = () => store.readAll().flatMap(allAttachmentRefs);
+const storedAttachments = () => [...store.readAll().flatMap(allAttachmentRefs), ...store.pdfReviewAttachments()];
+
+function beginTurn(entry) {
+  requireText(entry.requestId, 100);
+  if (activeTurns.has(entry.requestId)) throw new Error("请求重复。");
+  for (const other of activeTurns.values()) {
+    if (other.lane === entry.lane) throw new Error(entry.busy || "这里已有回答正在生成。");
+  }
+  const turn = { files: [], ...entry, controller: new AbortController() };
+  activeTurns.set(entry.requestId, turn);
+  return turn;
+}
+
+const turnsWhere = (test) => [...activeTurns.values()].some(test);
 
 function openReview(id) {
   const review = reviews.get(id);
@@ -132,14 +155,103 @@ function openReview(id) {
   return review;
 }
 
-async function loadReview(sourcePath, page = 1) {
-  const opened = await readReviewFile(sourcePath).catch((error) => {
-    if (error.code === "ENOENT") throw new Error("找不到上次的 PDF 文件，请点「打开」重新选择。");
+// ---- PDF reviews: kept with the PDF (by its content), not with any chat ----------------------------
+// Every reviewed PDF is copied into the data folder, so a review can be reopened from the sidebar
+// whatever happens to the original file. Each open review gets a short-lived id for this session.
+
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const reviewFolder = () => join(local, "reviews");
+const attachmentHashes = new Map();
+
+async function attachmentHash(ref) {
+  if (!attachmentHashes.has(ref.id)) attachmentHashes.set(ref.id, sha256(await readFile(attachments.path(ref))));
+  return attachmentHashes.get(ref.id);
+}
+
+// Annotations or a conversation found elsewhere (an .aipdf, an older PDF note) join the review.
+function mergeReview(current, extra) {
+  const union = (mine = [], theirs = []) => [...mine, ...theirs.filter((item) => !mine.some((own) => own.id === item.id))];
+  return { comments: union(current?.comments, extra?.comments), chat: union(current?.chat, extra?.chat),
+    page: current?.page || extra?.page || 1 };
+}
+
+async function startReview({ bytes, name, extra }) {
+  const hash = sha256(bytes);
+  const copy = join(reviewFolder(), `${hash}.pdf`);
+  if (!existsSync(copy)) await writeFile(copy, bytes);
+  let saved = store.pdfReview(hash);
+  const added = extra && (extra.comments?.length || extra.chat?.length);
+  if (!saved || added) saved = store.savePdfReview(hash, saved?.name || name, mergeReview(saved, extra));
+  const id = randomUUID();
+  reviews.set(id, { hash, name: saved.name, pdf: bytes, page: saved.page || 1 });
+  return { id, hash, name: saved.name, pdf: bytes, comments: saved.comments, chat: saved.chat, page: saved.page || 1 };
+}
+
+// What to review: a file on disk, a chat attachment, a PDF note, or a PDF reviewed before.
+async function reviewSource({ path, attachmentId, notebookId, blockId, hash }) {
+  if (hash) {
+    if (!/^[\da-f]{64}$/.test(hash)) throw new Error("审阅记录无效。");
+    const saved = store.pdfReview(hash);
+    const bytes = await readFile(join(reviewFolder(), `${hash}.pdf`)).catch(() => {
+      throw new Error("找不到这份 PDF 的副本，请重新打开原文件。");
+    });
+    return { bytes, name: saved?.name || "PDF" };
+  }
+  if (blockId) {
+    const { block, ref } = pdfNote(notebookId, blockId);
+    return { bytes: await readFile(attachments.path(ref)), name: ref.name, extra: block.review };
+  }
+  if (attachmentId) {
+    const ref = storedAttachments().find((item) => item.id === attachmentId && item.extension === ".pdf") ||
+      attachments.pendingRef(attachmentId);
+    if (!ref || ref.extension !== ".pdf") throw new Error("找不到这份 PDF 附件。");
+    return { bytes: await readFile(attachments.path(ref)), name: ref.name };
+  }
+  const opened = await readReviewFile(path).catch((error) => {
+    if (error.code === "ENOENT") throw new Error("找不到这个 PDF 文件。");
     throw error;
   });
-  const id = randomUUID();
-  reviews.set(id, { ...opened, sourcePath, page });
-  return { id, name: opened.name, pdf: opened.pdf, comments: opened.comments, page };
+  return { bytes: Buffer.from(opened.pdf), name: opened.name, extra: { comments: opened.comments, chat: opened.chat } };
+}
+
+// PDF notes carry their review into the group chat's context (annotations as text, the file as a path).
+async function withReviews(notebook) {
+  for (const block of notebook.blocks) {
+    const ref = block.noteType === "pdf" && !block.removed && block.attachments?.[0];
+    if (!ref) continue;
+    try {
+      const saved = store.pdfReview(await attachmentHash(ref));
+      if (saved) block.review = { comments: saved.comments, chat: saved.chat };
+    } catch {}
+  }
+  return notebook;
+}
+
+// Reviews kept inside PDF notes by the previous version move to the PDF's own review.
+async function moveOldReviews() {
+  for (const notebook of store.readAll()) {
+    for (const block of notebook.blocks) {
+      const ref = block.noteType === "pdf" && block.attachments?.[0];
+      if (!ref || !(block.review?.comments?.length || block.review?.chat?.length)) continue;
+      try {
+        const bytes = await readFile(attachments.path(ref));
+        const hash = sha256(bytes);
+        const copy = join(reviewFolder(), `${hash}.pdf`);
+        if (!existsSync(copy)) await writeFile(copy, bytes);
+        const saved = store.pdfReview(hash);
+        store.savePdfReview(hash, saved?.name || ref.name, mergeReview(saved, block.review));
+      } catch (error) {
+        console.error("Could not move a PDF review:", error);
+      }
+    }
+  }
+}
+
+function pdfNote(notebookId, blockId) {
+  const notebook = store.read(notebookId);
+  const block = notebook.blocks.find((item) => item.id === blockId && !item.removed);
+  if (block?.noteType !== "pdf" || !block.attachments?.[0]) throw new Error("这个 PDF 笔记已不存在。");
+  return { notebook, block, ref: block.attachments[0] };
 }
 
 function reviewSelectionTarget({ reviewId, selection, history }) {
@@ -153,7 +265,8 @@ function reviewSelectionTarget({ reviewId, selection, history }) {
     origin: { kind: "selection", reference, quote: image ? "" : requireText(quote, 20_000).trim(),
       text: image ? "框选内容见随附截图。" : "" },
     turns: validateTurns(history),
-    screenshot: image ? { bytes: image, name: `${reference} · 框选截图` } : undefined
+    screenshot: image ? { bytes: image, name: `${reference} · 框选截图` } : undefined,
+    pdf: { bytes: review.pdf, name: review.name }
   };
 }
 
@@ -230,48 +343,60 @@ const publicMember = ({ member, profile }) => ({
 });
 
 // Members named in the question answer one after another; without a mention the default member does.
-function speakers(notebook, memberIds, single) {
+function speakers(notebook, memberIds) {
   const ids = Array.isArray(memberIds) ? [...new Set(memberIds.filter((id) => typeof id === "string"))] : [];
   if (ids.length > 8) throw new Error("一次最多 @ 8 位成员。");
   const group = roster(notebook);
-  const chosen = ids.length ? ids.map((id) => lookup(group, id)) : [lookup(group)];
-  return single ? chosen.slice(0, 1) : chosen;
+  return ids.length ? ids.map((id) => lookup(group, id)) : [lookup(group)];
 }
 
 async function generate({ requestId, branchId, question, memberIds, attachmentIds, notebookId }) {
-  if (activeTurn) throw new Error("已有回答正在生成。");
   requireText(requestId, 100);
   const files = attachments.pending(attachmentIds);
   const text = requireText(question || (files.length ? "请概述附件的主要内容。" : ""), 10_000).trim();
   const first = store.read(notebookId);
   const branch = branchId ? first.branches.find((item) => item.id === branchId) : null;
   if (branchId && !branch) throw new Error("这条分支已被删除。");
-  const queue = speakers(first, memberIds, Boolean(branchId));
+  const queue = speakers(first, memberIds);
   const cwd = workingFolder(first);
-  const controller = new AbortController();
-  activeTurn = { requestId, branchId, controller, files, notebookId: first.id };
+  const turn = beginTurn({ requestId, branchId, files, notebookId: first.id, question: text,
+    lane: branchId ? `branch:${branchId}` : `main:${first.id}`, busy: "这个聊天已有回答正在生成。" });
+  const { controller } = turn;
   let saved = first;
   try {
     for (const [index, speaker] of queue.entries()) {
       controller.signal.throwIfAborted();
+      Object.assign(turn, { speaker, index });
       notify("turn:member", { requestId, index, total: queue.length, member: publicMember(speaker) });
-      const notebook = store.read(first.id);
-      const input = turnInput(notebook, branch, text);
+      const notebook = await withReviews(store.read(first.id));
+      const current = branch && notebook.branches.find((item) => item.id === branchId);
+      if (branch && !current) throw new Error("这条分支已被删除。");
+      // In a side branch each member's answer is its own turn, so later members see earlier ones there.
+      const input = turnInput(notebook, current, text);
       // Later speakers see the question once, plus what the earlier members just said.
       // The last history entry is this question with their labelled answers, e.g. 【gpt1】….
-      if (index > 0) {
+      if (index > 0 && !branch) {
         const history = mainHistory(notebook);
         input.history = history.slice(0, -1).map(({ question: asked, answer }) => ({ question: asked, answer }));
         input.peers = history.at(-1)?.answer || "";
       }
-      const earlier = branch ? branch.turns.flatMap((turn) => turn.attachments || [])
+      const earlier = current ? current.turns.flatMap((turn) => turn.attachments || [])
         : mainHistory(notebook).flatMap((turn) => turn.attachments);
       const sharedImages = sharedNoteBlocks(notebook).flatMap((block) => block.attachments || []);
-      const prepared = await attachments.prepare([...sharedImages, ...earlier, ...(index ? [] : files)], controller.signal);
+      const prepared = await attachments.provide([...sharedImages, ...earlier, ...files], controller.signal,
+        { inline: index ? [] : files });
       try {
         const { answer, source, tools } = await modelReply(speaker,
-          { ...input, documents: prepared.documents, images: prepared.images }, controller, requestId, cwd,
+          { ...input, files: prepared.files, images: prepared.images, dirs: prepared.dirs }, controller, requestId, cwd,
           queue.map(({ member }) => member.name));
+        // Moved to a private window while it was answering: the reply goes there, and members still
+        // queued behind it are not asked (the user can ask them separately).
+        if (turn.detached) {
+          saved = store.saveThreadReply(first.id, turn.detached, { id: randomUUID(), question: text, answer, source,
+            ...(tools.length ? { tools } : {}), ...(!index && files.length ? { attachments: files } : {}) });
+          if (!index) attachments.commit(files);
+          break;
+        }
         saved = store.saveReply(branchId, text, answer, source, index ? [] : files, first.id, tools,
           { continueTurn: index > 0 });
         if (!index) attachments.commit(files);
@@ -287,7 +412,39 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
     }
     return saved;
   } finally {
-    activeTurn = undefined;
+    activeTurns.delete(requestId);
+  }
+}
+
+// One member's side conversation: the chat's context plus this window's turns.
+async function generateThread({ requestId, notebookId, threadId, question, attachmentIds }) {
+  requireText(requestId, 100);
+  const files = attachments.pending(attachmentIds);
+  const text = requireText(question || (files.length ? "请概述附件的主要内容。" : ""), 10_000).trim();
+  const notebook = await withReviews(store.read(notebookId));
+  const thread = (notebook.threads || []).find((item) => item.id === threadId);
+  if (!thread) throw new Error("这个分头讨论窗口已关闭。");
+  if (thread.turns.length >= 200) throw new Error("这个窗口的对话已达到上限，请发布后另开一个窗口。");
+  const speaker = lookup(roster(notebook), thread.memberId);
+  const cwd = workingFolder(notebook);
+  const { controller } = beginTurn({ requestId, threadId, files, notebookId: notebook.id, lane: `thread:${threadId}`,
+    busy: "这个窗口已有回答正在生成。" });
+  let prepared;
+  try {
+    const earlier = [...mainHistory(notebook).flatMap((turn) => turn.attachments),
+      ...thread.turns.flatMap((turn) => turn.attachments || [])];
+    const sharedFiles = sharedNoteBlocks(notebook).flatMap((block) => block.attachments || []);
+    prepared = await attachments.provide([...sharedFiles, ...earlier, ...files], controller.signal, { inline: files });
+    const input = threadInput(notebook, thread, text);
+    const reply = await modelReply(speaker, { ...input, files: prepared.files, images: prepared.images, dirs: prepared.dirs },
+      controller, requestId, cwd);
+    const turn = { id: randomUUID(), question: text, ...reply, ...(files.length ? { attachments: files } : {}) };
+    const saved = store.saveThreadReply(notebook.id, threadId, turn);
+    attachments.commit(files);
+    return saved;
+  } finally {
+    await prepared?.dispose();
+    activeTurns.delete(requestId);
   }
 }
 
@@ -295,40 +452,61 @@ function commentTarget({ reviewId, comment, notebookId, noteId }) {
   if (reviewId) {
     const review = openReview(reviewId);
     const [checked] = validateComments([comment]);
-    return { origin: pdfCommentOrigin(review.name, checked), turns: checked.turns || [] };
+    return { origin: pdfCommentOrigin(review.name, checked), turns: checked.turns || [],
+      pdf: { bytes: review.pdf, name: review.name } };
   }
   const notebook = store.read(notebookId);
   const note = notebook.notes.find((item) => item.id === noteId);
   if (!note) throw new Error("这条批注已不存在。");
-  return { origin: noteOrigin(notebook, note), turns: note.turns || [], notebookId: notebook.id, noteId };
+  return { origin: noteOrigin(notebook, note), turns: note.turns || [], notebookId: notebook.id, noteId,
+    refs: note.attachments || [] };
+}
+
+// A conversation about a whole PDF under review: its annotations as context, its text attached.
+function reviewDocumentTarget({ reviewId, comments, history }) {
+  const review = openReview(reviewId);
+  return {
+    origin: documentOrigin(review.name, validateComments(comments || [])),
+    turns: validateTurns(history),
+    pdf: { bytes: review.pdf, name: review.name }
+  };
 }
 
 async function generateComment(payload) {
-  if (activeTurn) throw new Error("已有回答正在生成。");
   const { requestId, memberId } = payload;
   requireText(requestId, 100);
-  const question = requireText(payload.question, 10_000).trim();
-  const target = payload.selection ? reviewSelectionTarget(payload) : commentTarget(payload);
+  const files = attachments.pending(payload.attachmentIds);
+  const question = requireText(payload.question || (files.length ? "请看附件。" : ""), 10_000).trim();
+  const target = payload.document ? reviewDocumentTarget(payload)
+    : payload.selection ? reviewSelectionTarget(payload) : commentTarget(payload);
   if (payload.reviewId && target.turns.length >= 200) {
-    throw new Error(payload.selection ? "选区问答已达到上限，请重新选择内容开始提问。" : "请新开分支继续这条对话。");
+    throw new Error(payload.selection ? "选区问答已达到上限，请重新选择内容开始提问。" : "这段对话已达到上限，请新开分支继续。");
   }
-  const owner = target.notebookId ? store.read(target.notebookId) : null;
+  // A standalone PDF review belongs to no chat; its members are those of the chat it was opened from.
+  const ownerId = target.notebookId || target.owner ||
+    (typeof payload.rosterNotebookId === "string" ? payload.rosterNotebookId : undefined);
+  const owner = ownerId ? store.read(ownerId) : null;
   const speaker = lookup(roster(owner), memberId);
   const cwd = owner ? workingFolder(owner) : undefined;
-  const controller = new AbortController();
-  activeTurn = { requestId, controller, files: [], notebookId: target.notebookId, noteId: target.noteId };
+  const lane = target.noteId ? `note:${target.noteId}` : payload.document ? `review-chat:${payload.reviewId}`
+    : `comment:${requestId}`;
+  const { controller } = beginTurn({ requestId, files, notebookId: target.notebookId, noteId: target.noteId, lane,
+    busy: "这里已有回答正在生成。" });
   let prepared;
   try {
-    if (target.screenshot) prepared = await attachments.prepare([], controller.signal, target.screenshot);
+    const earlier = [...(target.refs || []), ...target.turns.flatMap((turn) => turn.attachments || [])];
+    prepared = await attachments.provide([...earlier, ...files], controller.signal,
+      { inline: files, screenshot: target.screenshot, pdf: target.pdf });
     const input = commentInput(target.origin, target.turns, question);
-    if (prepared) input.images = prepared.images;
+    Object.assign(input, { files: prepared.files, images: prepared.images, dirs: prepared.dirs });
     const reply = await modelReply(speaker, input, controller, requestId, cwd);
-    const turn = { id: randomUUID(), question, ...reply };
+    const turn = { id: randomUUID(), question, ...reply, ...(files.length ? { attachments: files } : {}) };
     const notebook = target.noteId ? store.saveNoteReply(target.notebookId, target.noteId, turn) : undefined;
+    attachments.commit(files);
     return { turn, notebook };
   } finally {
     await prepared?.dispose();
-    activeTurn = undefined;
+    activeTurns.delete(requestId);
   }
 }
 
@@ -342,7 +520,7 @@ function autoBackup() {
 
 function shutDown() {
   clearInterval(backupTimer);
-  activeTurn?.controller.abort(new Error("应用已关闭。"));
+  for (const turn of activeTurns.values()) turn.controller.abort(new Error("应用已关闭。"));
   for (const client of sessions.values()) client.close?.();
   sessions.clear();
   store?.close();
@@ -361,7 +539,7 @@ function restartWith(task) {
 }
 
 function requireIdle() {
-  if (activeTurn) throw new Error("请先等待或停止正在生成的回答。");
+  if (activeTurns.size) throw new Error("请先等待或停止正在生成的回答。");
 }
 
 async function confirm(message, detail, action) {
@@ -463,15 +641,17 @@ function setupDataHandlers() {
   });
 }
 
-function createWindow(notebookId) {
+// review: the hash of the PDF this window reviews on its own (a PDF moved to another screen).
+function createWindow(notebookId, review) {
   const target = new BrowserWindow({
     title: "AI 笔记本",
-    width: 1360, height: 930, minWidth: 730, minHeight: 540, show: false,
+    width: review ? 1100 : 1360, height: 930, minWidth: review ? 520 : 730, minHeight: 540, show: false,
     icon: join(base, "notebook.ico"),
     autoHideMenuBar: true,
     webPreferences: { preload: join(base, "preload.cjs"), sandbox: true, contextIsolation: true, nodeIntegration: false }
   });
   target.notebookId = notebookId || store.activeId();
+  target.reviewHash = review;
   windows.add(target);
   window ||= target;
   target.setMenu(null);
@@ -525,6 +705,14 @@ if (!app.requestSingleInstanceLock()) {
           (storedAttachments().find(image) || [attachments.pendingRef(id)].find(image));
         return ref ? net.fetch(pathToFileURL(attachments.path(ref)).href) : new Response(null, { status: 404 });
       }
+      // PDF notes are previewed in the chat; only stored attachments can be read this way.
+      if (hostname === "app" && pathname.startsWith("/note-file/")) {
+        const id = pathname.slice("/note-file/".length);
+        const ref = /^[\da-f-]{36}$/i.test(id) &&
+          (storedAttachments().find((item) => item.id === id && item.extension === ".pdf") ||
+            [attachments.pendingRef(id)].find((item) => item?.extension === ".pdf"));
+        return ref ? net.fetch(pathToFileURL(attachments.path(ref)).href) : new Response(null, { status: 404 });
+      }
       const file = hostname === "app" && files.get(pathname);
       return file ? net.fetch(pathToFileURL(join(base, file)).href) : new Response(null, { status: 404 });
     });
@@ -549,6 +737,8 @@ if (!app.requestSingleInstanceLock()) {
     profiles = new Profiles(store.db);
     attachments = new AttachmentStore(join(local, "attachments"), join(local, "attachment-work"));
     await attachments.initialize(storedAttachments());
+    mkdirSync(reviewFolder(), { recursive: true });
+    await moveOldReviews();
     handle("notebook:read", (_payload, owner) => store.read(owner.notebookId));
     handle("library:read", () => store.library());
     handle("library:open", (id, owner) => {
@@ -562,6 +752,46 @@ if (!app.requestSingleInstanceLock()) {
       target.once("ready-to-show", () => target.focus());
       return true;
     });
+    handle("window:mode", (_payload, owner) => ({ review: owner.reviewHash ? { hash: owner.reviewHash } : null }));
+    // A PDF in a window of its own, e.g. on a second screen; asking again brings that window forward.
+    const reviewWindow = (hash) => [...windows].find((item) => !item.isDestroyed() && item.reviewHash === hash);
+    const reviewHashOf = async (spec) => spec.hash || (await startReview(await reviewSource(spec))).hash;
+    handle("window:open-review", async (spec, owner) => {
+      const hash = await reviewHashOf(spec);
+      const existing = reviewWindow(hash);
+      if (existing) {
+        if (existing.isMinimized()) existing.restore();
+        existing.focus();
+        return true;
+      }
+      const target = createWindow(owner.notebookId, hash);
+      target.once("ready-to-show", () => target.focus());
+      return true;
+    });
+    handle("window:focus-review", async (spec, owner) => {
+      const hash = spec.hash || (spec.attachmentId || spec.blockId) &&
+        await attachmentHash(spec.blockId ? pdfNote(spec.notebookId, spec.blockId).ref
+          : storedAttachments().find((item) => item.id === spec.attachmentId) || attachments.pendingRef(spec.attachmentId));
+      const existing = hash && reviewWindow(hash);
+      if (!existing || existing === owner) return false;
+      if (existing.isMinimized()) existing.restore();
+      existing.focus();
+      return true;
+    });
+    // While a member is still answering in the main chat, its answer can move into a private window,
+    // so the chat is free for the next question (whose context leaves the moved answer out).
+    handle("turn:detach", (requestId) => {
+      const turn = activeTurns.get(requestId);
+      if (!turn || turn.branchId || !turn.lane?.startsWith("main:") || !turn.speaker) {
+        throw new Error("这条回答已经完成，不能再转到小窗。");
+      }
+      // Its question stays in the chat as a folded card, unless it is there already (a later member).
+      const notebook = store.change({ type: "add-thread", memberId: turn.speaker.member.id,
+        ...(turn.index ? {} : { stub: turn.question }) }, turn.notebookId);
+      const threadId = notebook.threads.at(-1).id;
+      Object.assign(turn, { detached: threadId, threadId, lane: `thread:${threadId}` });
+      return { notebook, threadId, member: publicMember(turn.speaker), index: turn.index };
+    });
     handle("library:create", ({ title, folderId }, owner) => {
       const result = store.create(title, { folderId });
       owner.notebookId = result.state.id;
@@ -570,7 +800,7 @@ if (!app.requestSingleInstanceLock()) {
     handle("library:rename", ({ id, title }) => store.renameNotebook(id, title));
     handle("library:move", ({ id, folderId }) => store.moveNotebook(id, folderId));
     handle("library:delete", async (id, owner) => {
-      if (activeTurn?.notebookId === id) throw new Error("请先停止生成，再删除会话。");
+      if (turnsWhere((turn) => turn.notebookId === id)) throw new Error("请先停止生成，再删除会话。");
       const before = allAttachmentRefs(store.read(id));
       const result = store.deleteNotebook(id);
       for (const target of windows) if (target.notebookId === id) target.notebookId = result.state.id;
@@ -593,14 +823,19 @@ if (!app.requestSingleInstanceLock()) {
       return result;
     });
     handle("comment:send", generateComment);
+    handle("thread:send", generateThread);
     handle("notebook:change", async (action) => {
-      if (action?.type === "delete-branch" && activeTurn?.branchId === action.id) {
+      if (action?.type === "delete-branch" && turnsWhere((turn) => turn.branchId === action.id)) {
         throw new Error("请先停止生成，再删除对话。");
       }
-      if (action?.type === "delete-note" && activeTurn?.noteId === action.id) {
+      if (action?.type === "delete-note" && turnsWhere((turn) => turn.noteId === action.id)) {
         throw new Error("请先停止这条批注的追问。");
       }
-      if (!["delete-branch", "edit-document", "delete-note"].includes(action?.type)) return store.change(action, action.notebookId);
+      if (["delete-thread", "delete-thread-turn"].includes(action?.type) && turnsWhere((turn) => turn.threadId === action.id)) {
+        throw new Error("请先停止这个窗口正在生成的回答。");
+      }
+      if (!["delete-branch", "edit-document", "delete-note", "delete-thread", "delete-thread-turn"]
+        .includes(action?.type)) return store.change(action, action.notebookId);
       const before = allAttachmentRefs(store.read(action.notebookId));
       const next = store.change(action, action.notebookId);
       await attachments.deleteSaved(before, storedAttachments());
@@ -611,8 +846,8 @@ if (!app.requestSingleInstanceLock()) {
       const entryName = (entry) => typeof entry === "string" ? entry : entry?.name;
       if (!Array.isArray(paths) || !paths.length || paths.length > 6 ||
           paths.some((entry) => typeof entryName(entry) !== "string" ||
-            ![".png", ".jpg", ".jpeg", ".webp"].includes(extname(entryName(entry)).toLowerCase()))) {
-        throw new Error("请选择最多 6 张 PNG、JPG 或 WebP 图片。");
+            ![".png", ".jpg", ".jpeg", ".webp", ".pdf"].includes(extname(entryName(entry)).toLowerCase()))) {
+        throw new Error("请选择最多 6 个 PNG、JPG、WebP 图片或 PDF。");
       }
       const { items, errors } = await attachments.stage(paths, paths.length);
       if (!items.length) return { state: store.read(notebookId), errors };
@@ -626,7 +861,7 @@ if (!app.requestSingleInstanceLock()) {
       }
     });
     handle("attachments:remove", (id) => {
-      if (activeTurn?.files.some((ref) => ref.id === id)) throw new Error("附件正在发送，请先停止生成。");
+      if (turnsWhere((turn) => turn.files.some((ref) => ref.id === id))) throw new Error("附件正在发送，请先停止生成。");
       return attachments.remove(id);
     });
     handle("attachments:open", async (id) => {
@@ -635,49 +870,46 @@ if (!app.requestSingleInstanceLock()) {
       const error = await shell.openPath(attachments.path(ref));
       if (error) throw new Error(`无法打开「${ref.name}」。`);
     });
-    handle("review:open-attachment", async (id) => {
-      const ref = storedAttachments().find((item) => item.id === id && item.extension === ".pdf") ||
-        attachments.pendingRef(id);
-      if (!ref) throw new Error("找不到这份 PDF 附件。");
-      if (ref.extension !== ".pdf") throw new Error("这份附件不是 PDF。");
-      const opened = await loadReview(attachments.path(ref));
-      opened.name = ref.name;
-      reviews.get(opened.id).name = ref.name;
-      return opened;
-    });
-    handle("review:open", (path) => loadReview(path));
-    handle("review:recent", () => {
-      const recent = store.recentReview();
-      return recent && { name: recent.name, page: recent.page };
-    });
-    handle("review:restore", () => {
-      const recent = store.recentReview();
-      return recent && loadReview(recent.path, recent.page);
+    handle("review:open", async (spec) => startReview(await reviewSource(spec)));
+    handle("review:list", () => store.pdfReviews());
+    // How far a PDF note's review has come, for its card in the chat.
+    handle("review:summary", async (attachmentId) => {
+      const ref = storedAttachments().find((item) => item.id === attachmentId && item.extension === ".pdf");
+      if (!ref) return null;
+      const saved = store.pdfReview(await attachmentHash(ref));
+      if (!saved) return { comments: [], chat: 0 };
+      return { comments: [...saved.comments].sort((a, b) => a.page - b.page).slice(0, 4)
+        .map(({ id, page, title, text }) => ({ id, page, title, text: text.slice(0, 200) })),
+      commentCount: saved.comments.length, chat: saved.chat.length, page: saved.page };
     });
     handle("review:visit", ({ id, page }) => {
       const review = openReview(id);
       if (!Number.isInteger(page) || page < 1) throw new Error("页码无效。");
       review.page = page;
-      store.rememberReview(review.sourcePath, review.name, page);
+      store.pdfReviewPage(review.hash, page);
     });
     handle("review:release", (id) => { reviews.delete(id); });
-    handle("review:save", async ({ id, comments, saveAs }) => {
-      const current = reviews.get(id);
-      if (!current) throw new Error("当前审阅文件已经切换。");
-      let path = current.path;
-      if (!path || saveAs) {
-        const choice = await dialog.showSaveDialog(dialogWindow(), {
-          title: "保存 PDF 审阅文件",
-          defaultPath: path || `${basename(current.name, extname(current.name))}.aipdf`,
-          filters: [{ name: "AI 笔记 PDF 审阅", extensions: ["aipdf"] }]
-        });
-        if (choice.canceled || !choice.filePath) return false;
-        path = extname(choice.filePath) ? choice.filePath : choice.filePath + ".aipdf";
+    // Reviews save themselves as they change; "save as" exports an .aipdf to share elsewhere.
+    handle("review:save", async ({ id, comments, chat = [], saveAs }) => {
+      const current = openReview(id);
+      if (!saveAs) {
+        const saved = store.savePdfReview(current.hash, current.name, { comments, chat, page: current.page });
+        return { hash: saved.hash, comments: saved.comments.length, chat: saved.chat.length };
       }
-      await saveReviewFile(path, current.pdf, current.name, comments);
-      current.path = current.sourcePath = path;
-      store.rememberReview(path, current.name, current.page);
-      return true;
+      const choice = await dialog.showSaveDialog(dialogWindow(), {
+        title: "导出 PDF 审阅文件", defaultPath: `${basename(current.name, extname(current.name))}.aipdf`,
+        filters: [{ name: "AI 笔记 PDF 审阅", extensions: ["aipdf"] }]
+      });
+      if (choice.canceled || !choice.filePath) return false;
+      const path = extname(choice.filePath) ? choice.filePath : `${choice.filePath}.aipdf`;
+      await saveReviewFile(path, current.pdf, current.name, comments, chat);
+      return { exported: path };
+    });
+    handle("review:remove", async (hash) => {
+      if ([...reviews.values()].some((item) => item.hash === hash)) throw new Error("这份 PDF 正在审阅中，请先关闭审阅。");
+      store.removePdfReview(hash);
+      rmSync(join(reviewFolder(), `${hash}.pdf`), { force: true });
+      return store.pdfReviews();
     });
     handle("notebook:open-link", async (address) => {
       const url = new URL(address);
@@ -740,7 +972,7 @@ if (!app.requestSingleInstanceLock()) {
     setupDataHandlers();
     handle("turn:send", generate);
     handle("turn:stop", (id) => {
-      if (activeTurn?.requestId === id) activeTurn.controller.abort(new Error("已停止生成。"));
+      activeTurns.get(id)?.controller.abort(new Error("已停止生成。"));
     });
     createWindow();
   });

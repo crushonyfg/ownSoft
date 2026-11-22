@@ -93,9 +93,26 @@ export function sharedNoteBlocks(notebook) {
     (!allowed || allowed.has(block.id)));
 }
 
+// A PDF review's annotations as plain text: page, quoted passage and the note on it.
+export function reviewCommentsText(comments = []) {
+  return comments.map((item) => `- 第 ${item.page} 页${item.quote ? `「${item.quote.replace(/\s+/g, " ").slice(0, 160)}」` : ""}` +
+    `${item.title ? `（${item.title}）` : ""}：${item.text}`).join("\n");
+}
+
+function sharedNoteText(block) {
+  const file = block.attachments?.[0]?.name;
+  if (block.noteType === "image") return `图片「${file || "图片"}」：${block.text}`;
+  if (block.noteType === "pdf") {
+    const comments = reviewCommentsText(block.review?.comments);
+    return [`PDF「${file || block.text}」（文件在下面的附件文件里，需要时打开）`, comments && `这份 PDF 的审阅批注：\n${comments}`]
+      .filter(Boolean).join("\n");
+  }
+  if (block.noteType === "thread") return `分头讨论记录（用户与 ${block.source?.memberName || "成员"} 单独对话后发布）：\n${block.text}`;
+  return block.text;
+}
+
 export function sharedNoteContext(notebook) {
-  const content = sharedNoteBlocks(notebook).map((block) => block.noteType === "image"
-    ? `图片「${block.attachments?.[0]?.name || "图片"}」：${block.text}` : block.text).filter(Boolean).join("\n\n");
+  const content = sharedNoteBlocks(notebook).map(sharedNoteText).filter(Boolean).join("\n\n");
   return [commentContext(notebook.origin), content && `公共笔记：\n${content}`].filter(Boolean).join("\n\n");
 }
 
@@ -161,6 +178,27 @@ export function turnInput(notebook, branch, question) {
       .map((note) => note.text),
     history: branch.turns.map(({ question, answer }) => ({ question, answer })),
     question
+  };
+}
+
+// A side conversation with one member: the main chat's context, then this window's own turns.
+// Other members do not see it until the user publishes it into the chat.
+export function threadInput(notebook, thread, question) {
+  const input = turnInput(notebook, null, question);
+  input.history = [...input.history, ...thread.turns.map(({ question: asked, answer }) => ({ question: asked, answer }))];
+  const origin = thread.origin;
+  input.context = ["这是用户和你的单独对话（私聊小窗）。它基于群聊的笔记和对话，但群里其他成员看不到，除非用户把它发布到群聊。",
+    origin && `用户是从群聊里的这条消息开始和你单独聊的${origin.speaker ? `（${origin.speaker} 说的）` : ""}：\n${origin.text}`,
+    input.context].filter(Boolean).join("\n\n");
+  return input;
+}
+
+// A conversation about a whole PDF: its annotations are context; the PDF text is attached separately.
+export function documentOrigin(name, comments = []) {
+  const notes = reviewCommentsText(comments);
+  return {
+    kind: "selection", reference: name,
+    text: ["这是关于整份 PDF 的对话，PDF 文件和抽取好的文字在附件文件里，需要时打开阅读。", notes && `已有的审阅批注：\n${notes}`].filter(Boolean).join("\n\n")
   };
 }
 

@@ -1,4 +1,5 @@
 import { renderMarkdown } from "./markdown-dom.mjs";
+import { splitter } from "./splitter.mjs";
 
 const get = (id) => document.getElementById(id);
 const byPage = (left, right) => left.page - right.page ||
@@ -11,7 +12,11 @@ const make = (tag, className, text) => {
   return node;
 };
 
-export function setupPdfReview(api, { edit, notify, commentChats }) {
+// A PDF's review belongs to the PDF, not to a chat: opened from a note, an attachment, the sidebar or
+// a file on disk, the same PDF shows the same annotations and conversation, saved as they change.
+// onSaved(): a review was saved (the sidebar list and PDF note cards can update);
+// onPick(): a PDF was chosen with the 打开 button (the app shows the review).
+export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () => {}, onPick = () => {} }) {
   const view = get("pdf-view");
   const sheet = get("review-page-sheet");
   const scroll = get("review-scroll");
@@ -24,16 +29,20 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   let pdfjs;
   let state;
   let pdf;
+  // pdf.js closes a document through the task that loaded it.
+  let pdfTask;
   let pageNumber = 1;
   let activeId;
   let selection;
   let selectionKey;
   let boxDrag;
   let renderedPage;
-  let recent;
-  let restoreAttempted = false;
   let dirty = false;
   let saving = false;
+  let saveTimer = 0;
+  let tab = "comments";
+  // A PDF is being opened; the view must not lay out the previous one meanwhile.
+  let opening = 0;
   let rendering;
   let textTask;
   let sequence = 0;
@@ -50,21 +59,56 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   const remember = async () => {
     await api.visitReview({ id: state.id, page: pageNumber });
   };
-
-  function showRecent(name) {
-    recent = name;
-    const item = get("recent-review");
-    item.textContent = item.title = name || "";
-    get("recent-review-section").hidden = !name;
+  // A change to the annotations or the conversation; it is saved shortly afterwards.
+  function markDirty() {
+    dirty = true;
+    refreshToolbar();
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => attempt(save), 500);
   }
 
-  const recentReady = api.recentReview().then((entry) => {
-    if (!state) showRecent(entry?.name);
-  }).catch((error) => notify(error.message));
+  // Annotations (top) and the whole-document conversation (bottom) are both on screen; this only
+  // brings one of them into view.
+  function showTab(name) {
+    tab = name;
+    const pane = get(name === "chat" ? "review-chat-pane" : "review-comments-pane");
+    if (name === "chat") mountDocumentChat();
+    pane.classList.remove("is-flash");
+    void pane.offsetWidth;
+    pane.classList.add("is-flash");
+  }
+
+  // The conversation about the whole PDF, in the second tab of the side panel.
+  function mountDocumentChat(focus = false) {
+    const pane = get("review-document-conversation");
+    if (!state) return pane.replaceChildren();
+    const reviewId = state.id;
+    const review = state;
+    get("review-chat-count").textContent = review.chat.length ? `${review.chat.length} 轮` : "";
+    const scrolled = pane.closest(".review-pane");
+    const bottom = scrolled && scrolled.scrollTop + scrolled.clientHeight >= scrolled.scrollHeight - 30;
+    pane.replaceChildren();
+    const focusComposer = commentChats.mount(pane, {
+      key: `pdf:${reviewId}:document`, embedded: true, forkable: false,
+      placeholder: "就整份 PDF 提问，例如「总结主要贡献」「第 3 节的方法有什么漏洞」；@ 成员可让多位依次回答",
+      label: "全文对话 · PDF 正文和已有批注会一起发给成员",
+      target: () => ({ reviewId, document: true, comments: review.comments, history: review.chat }),
+      turns: () => review.chat,
+      receive: ({ turn }) => {
+        review.chat.push(turn);
+        get("review-chat-count").textContent = `${review.chat.length} 轮`;
+        if (review === state) markDirty();
+      }
+    });
+    if (focus) focusComposer();
+    if (scrolled && (bottom || focus)) scrolled.scrollTop = scrolled.scrollHeight;
+  }
 
   function refreshToolbar() {
-    get("review-dirty").hidden = !dirty;
-    get("review-save").disabled = saving || !dirty;
+    get("review-dirty").hidden = true;
+    get("review-save").textContent = saving || dirty ? "正在保存…" : "已自动保存";
+    get("review-save").disabled = true;
+    get("review-export").hidden = get("review-popout").hidden = !state;
     get("review-page").value = pageNumber;
     get("review-prev").disabled = pageNumber <= 1;
     get("review-next").disabled = !pdf || pageNumber >= pdf.numPages;
@@ -109,8 +153,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
         save: (value) => {
           if (!value.trim()) throw new Error("请输入批注。");
           item.text = value.trim();
-          dirty = true;
-          refreshToolbar();
+          markDirty();
           refreshComments();
         }
       }));
@@ -122,8 +165,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
         state.comments = state.comments.filter((comment) => comment.id !== item.id);
         commentChats.forget(key);
         if (active) activeId = undefined;
-        dirty = true;
-        refreshToolbar();
+        markDirty();
         refreshComments();
       });
       actions.append(revise, remove);
@@ -134,8 +176,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
         turns: () => item.turns || [],
         receive: ({ turn }) => {
           (item.turns ??= []).push(turn);
-          dirty = true;
-          refreshToolbar();
+          markDirty();
         }
       });
       list.append(card);
@@ -401,15 +442,36 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     if (!canReplaceSelectionChat()) return;
     closeSelectionChat();
     const reviewId = state.id;
+    const review = state;
     selectionKey = `pdf:${reviewId}:selection:${crypto.randomUUID()}`;
     const turns = [];
     get("review-selection-title").textContent = `第 ${source.page} 页 · ${screenshot ? "框选截图" : "所选文字"}`;
     get("review-selection-preview").append(screenshot || make("blockquote", "review-quote", source.quote));
+    // A useful answer about selected text can stay on the page as an annotation, with its conversation.
+    const keep = (turn) => {
+      if (!source.rects?.length) return [];
+      const control = make("button", "comment-turn-action", "存为批注");
+      control.type = "button";
+      control.title = "把这条回答作为批注挂在所选文字上，追问记录一起保留";
+      control.addEventListener("click", () => {
+        if (review !== state) return;
+        const item = { id: crypto.randomUUID(), page: source.page, rects: source.rects.slice(0, 70),
+          quote: source.quote.slice(0, 8000), title: `${turn.source?.memberName || "成员"} 的回答`.slice(0, 160),
+          text: turn.answer.slice(0, 9000), priority: "", turns: turns.slice(0, turns.indexOf(turn) + 1) };
+        state.comments.push(item);
+        markDirty();
+        showTab("comments");
+        attempt(() => selectComment(item, false));
+        notify("已存为本页批注，追问记录也一起保留。");
+      });
+      return [control];
+    };
     const focus = commentChats.mount(get("review-selection-conversation"), {
-      key: selectionKey, embedded: true,
-      target: () => ({ reviewId, selection: source, history: turns }),
+      key: selectionKey, embedded: true, forkable: false,
+      target: () => ({ reviewId, selection: { page: source.page, quote: source.quote, image: source.image }, history: turns }),
       turns: () => turns,
-      receive: ({ turn }) => { turns.push(turn); }
+      receive: ({ turn }) => { turns.push(turn); },
+      turnActions: keep
     });
     selectionChat.hidden = false;
     selectionChat.scrollIntoView({ block: "nearest" });
@@ -419,11 +481,12 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   function askText() {
     captureSelection();
     if (!selection || selection.quote.length > 20_000 || !canReplaceSelectionChat()) return;
-    const { page, quote } = selection;
+    const { page, quote, rects } = selection;
     selection = undefined;
     window.getSelection()?.removeAllRanges();
     refreshToolbar();
-    openSelectionChat({ page, quote });
+    showTab("comments");
+    openSelectionChat({ page, quote, rects });
   }
 
   function setBoxMode(enabled) {
@@ -466,6 +529,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     screenshot.getContext("2d").drawImage(canvas, x, y, w, h, 0, 0, screenshot.width, screenshot.height);
     const image = Uint8Array.from(atob(screenshot.toDataURL().split(",")[1]), (character) => character.charCodeAt(0));
     setBoxMode(false);
+    showTab("comments");
     openSelectionChat({ page: pageNumber, image }, screenshot);
   }
 
@@ -481,15 +545,17 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
         state.comments.push(item);
         activeId = item.id;
         selection = undefined;
-        dirty = true;
         window.getSelection()?.removeAllRanges();
-        refreshToolbar();
+        markDirty();
+        showTab("comments");
         refreshComments();
       }
     });
   }
 
-  async function load(file, attachmentId) {
+  // source: { file } picked on disk (PDF or .aipdf), { attachmentId }, { notebookId, blockId } of a PDF
+  // note, or { hash } of a PDF reviewed before.
+  async function load(source) {
     const checkPending = () => {
       if (state && commentChats.pending(`pdf:${state.id}:`)) {
         throw new Error("请先完成或停止当前审阅的批注追问。");
@@ -502,8 +568,13 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
     let task;
     let opened;
     try {
-      opened = attachmentId ? await api.openAttachmentReview(attachmentId) :
-        file ? await api.openReview(file) : await api.restoreReview();
+      if (state && dirty) {
+        clearTimeout(saveTimer);
+        await save();
+      }
+      opened = source.blockId ? await api.openBlockReview(source.notebookId, source.blockId)
+        : source.attachmentId ? await api.openAttachmentReview(source.attachmentId)
+        : source.hash ? await api.openSavedReview(source.hash) : await api.openReview(source.file);
       if (!opened) return;
       pdfjs ||= await import("./pdf-runtime/build/pdf.min.mjs");
       const asset = (path) => new URL(`./pdf-runtime/${path}`, location.href).href;
@@ -519,13 +590,15 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
       renderedPage = undefined;
       rendering?.cancel();
       textTask?.cancel();
-      await pdf?.destroy();
+      const previous = pdfTask;
+      pdfTask = task;
+      await previous?.destroy().catch(() => {});
       if (state) {
         await api.releaseReview(state.id);
         commentChats.forget(`pdf:${state.id}:`);
       }
       pdf = loaded;
-      state = { id: opened.id, comments: opened.comments };
+      state = { id: opened.id, hash: opened.hash, comments: opened.comments, chat: opened.chat || [], name: opened.name };
       pageNumber = Math.max(1, Math.min(pdf.numPages, opened.page || 1));
       const firstPage = await pdf.getPage(1);
       const firstSize = firstPage.getViewport({ scale: 1 });
@@ -537,7 +610,7 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
       closeSelectionChat();
       setBoxMode(false);
       dirty = false;
-      showRecent(opened.name);
+      mountDocumentChat();
       get("review-name").textContent = opened.name;
       get("review-name").title = opened.name;
       get("review-total").textContent = `/ ${pdf.numPages}`;
@@ -562,29 +635,40 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   }
 
   async function save() {
-    if (!dirty || saving) return;
+    if (!dirty || saving || !state) return;
     saving = true;
     refreshToolbar();
-    const snapshot = JSON.stringify(state.comments);
+    const review = state;
+    const snapshot = JSON.stringify({ comments: review.comments, chat: review.chat });
     try {
-      if (await api.saveReview({ id: state.id, comments: JSON.parse(snapshot) })) {
-        dirty = snapshot !== JSON.stringify(state.comments);
-        notify("审阅文件已保存。");
+      const result = await api.saveReview({ id: review.id, ...JSON.parse(snapshot) });
+      if (result) {
+        if (review === state) dirty = snapshot !== JSON.stringify({ comments: review.comments, chat: review.chat });
+        onSaved(result);
       }
     } finally {
       saving = false;
       refreshToolbar();
+      if (dirty) {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => attempt(save), 500);
+      }
     }
   }
 
-  get("review-open").addEventListener("click", () => {
-    if (saving) return;
-    if (!dirty || window.confirm("当前批注未保存。要放弃这些改动并打开其他文件吗？")) get("review-file").click();
-  });
+  async function exportReview() {
+    if (!state) return;
+    const result = await api.saveReview({ id: state.id, comments: state.comments, chat: state.chat, saveAs: true });
+    if (result?.exported) notify(`已导出为「${result.exported}」。`);
+  }
+
+  get("review-open").addEventListener("click", () => get("review-file").click());
   get("review-file").addEventListener("change", (event) => {
     const file = event.target.files[0];
     event.target.value = "";
-    if (file) attempt(() => load(file));
+    if (!file) return;
+    onPick();
+    attempt(() => whileOpening(() => load({ file })));
   });
   get("review-prev").addEventListener("click", () => attempt(() => changePage(pageNumber - 1)));
   get("review-next").addEventListener("click", () => attempt(() => changePage(pageNumber + 1)));
@@ -627,7 +711,11 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !view.hidden && !boxLayer.hidden) setBoxMode(false);
   });
-  get("review-save").addEventListener("click", () => attempt(save));
+  get("review-export").addEventListener("click", () => attempt(exportReview));
+  splitter(get("review-split"), { target: get("review-layout"), property: "--review-side", fromEnd: true,
+    min: 260, keep: 320, key: "review-side" });
+  splitter(get("review-side-split"), { target: get("review-side"), property: "--review-top", axis: "y",
+    min: 90, keep: 150, key: "review-top" });
   document.addEventListener("selectionchange", captureSelection);
   textLayer.addEventListener("pointerdown", () => {
     selection = undefined;
@@ -635,26 +723,55 @@ export function setupPdfReview(api, { edit, notify, commentChats }) {
   });
   scroll.addEventListener("scroll", scheduleVisible, { passive: true });
   new ResizeObserver(reflowPages).observe(scroll);
-  window.addEventListener("beforeunload", (event) => {
-    if (dirty) {
-      event.preventDefault();
-      event.returnValue = false;
+  // While a PDF is being opened the view must not lay out pages for the previous one.
+  async function whileOpening(task) {
+    opening += 1;
+    try {
+      await Promise.resolve();
+      await task();
+      return true;
+    } finally {
+      opening -= 1;
     }
-  });
+  }
+
+  // After opening: show the whole-document conversation, or jump to one annotation.
+  function arrive({ chat = false, commentId } = {}) {
+    if (chat) mountDocumentChat(true);
+    const comment = commentId && state.comments.find((item) => item.id === commentId);
+    if (comment) requestAnimationFrame(() => attempt(() => selectComment(comment, false)));
+  }
+
+  // Call these before showing the review view, then await: pages are laid out once it is visible.
   return {
-    openAttachment: (id) => {
-      if (dirty && !window.confirm("当前 PDF 批注未保存。要放弃改动并打开附件吗？")) return false;
-      return load(null, id).then(() => true);
+    openAttachment: async (attachmentId, options) => {
+      await whileOpening(() => load({ attachmentId }));
+      arrive(options);
+      return true;
     },
+    openBlock: async (notebookId, blockId, options) => {
+      await whileOpening(() => load({ notebookId, blockId }));
+      arrive(options);
+      return true;
+    },
+    openSaved: async (hash, options) => {
+      if (state?.hash === hash) scheduleRender();
+      else await whileOpening(() => load({ hash }));
+      arrive(options);
+      return true;
+    },
+    pickFile: () => get("review-file").click(),
+    // Before closing the review, its last changes are saved.
+    flush: async () => {
+      if (!dirty) return;
+      clearTimeout(saveTimer);
+      await save();
+    },
+    current: () => state && { hash: state.hash, name: state.name },
     activate: () => {
-      if (state) return scheduleRender();
-      attempt(async () => {
-        await recentReady;
-        if (!state && recent && !restoreAttempted) {
-          restoreAttempted = true;
-          await load();
-        }
-      });
+      if (opening || !state) return;
+      mountDocumentChat();
+      scheduleRender();
     }
   };
 }

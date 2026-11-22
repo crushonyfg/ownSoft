@@ -3,6 +3,21 @@ import { isAbsolute } from "node:path";
 import { applyMemberChange } from "./members.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { findAnchor, initialNotebook, messageGroups, sameMessage, splitReply } from "./notebook.mjs";
+import { validateComments, validateTurns } from "./pdf-review.mjs";
+
+const imageExtensions = [".png", ".jpg", ".jpeg", ".webp"];
+
+// A note block for a picture or a PDF. (A PDF's review is kept with the PDF itself, see pdfReview.)
+export function fileNoteBlock(ref) {
+  return { id: randomUUID(), kind: "paragraph", noteType: ref.extension === ".pdf" ? "pdf" : "image", text: ref.name,
+    attachments: [ref], marks: [], included: true };
+}
+
+const reviewHash = /^[\da-f]{64}$/;
+
+function findThread(state, id) {
+  return find(state.threads || [], id);
+}
 
 export function requireText(value, limit = 60_000) {
   if (typeof value !== "string" || value.length > limit || !value.trim()) {
@@ -152,14 +167,92 @@ export function applyChange(state, action) {
       break;
     case "add-note-images":
       if (!Array.isArray(action.refs) || !action.refs.length || action.refs.length > 6 ||
-          action.refs.some((ref) => ![".png", ".jpg", ".jpeg", ".webp"].includes(ref.extension))) {
-        throw new Error("请选择最多 6 张图片。");
+          action.refs.some((ref) => ![...imageExtensions, ".pdf"].includes(ref.extension))) {
+        throw new Error("请选择最多 6 个图片或 PDF 文件。");
       }
-      state.blocks.splice(insertionIndex(state, action.afterId), 0, ...action.refs.map((ref) => ({
-        id: randomUUID(), kind: "paragraph", noteType: "image", text: ref.name,
-        attachments: [ref], marks: [], included: true
-      })));
+      state.blocks.splice(insertionIndex(state, action.afterId), 0, ...action.refs.map(fileNoteBlock));
       break;
+    // Side conversations with single members ("分头讨论"). They start private; publishing puts an
+    // edited transcript into the chat as a note block, which then goes into everyone's context.
+    case "add-thread": {
+      if (typeof action.memberId !== "string" || !action.memberId || action.memberId.length > 80) {
+        throw new Error("请选择一位成员。");
+      }
+      state.threads ??= [];
+      if (state.threads.length >= 24) throw new Error("最多保留 24 个私聊小窗，请先关掉一些。");
+      // origin: the chat message the private conversation started from (its ↗ button).
+      const from = action.origin;
+      const origin = from && typeof from === "object" && typeof from.text === "string" && from.text.trim() ? {
+        messageId: String(from.messageId || "").slice(0, 80), speaker: String(from.speaker || "").slice(0, 24),
+        text: from.text.slice(0, 6000)
+      } : undefined;
+      const thread = { id: randomUUID(), memberId: action.memberId, turns: [], visibility: "private",
+        created: Date.now(), ...(origin ? { origin } : {}) };
+      state.threads.push(thread);
+      // stub: the question of a chat answer moved into this window while it was being written. A
+      // folded card stays in the chat where it was asked; it is not part of anyone's context.
+      if (typeof action.stub === "string" && action.stub.trim()) {
+        state.blocks.push({ id: randomUUID(), kind: "paragraph", noteType: "thread-stub", threadId: thread.id,
+          text: action.stub.trim().slice(0, 10_000), marks: [], included: false });
+      }
+      break;
+    }
+    case "delete-thread":
+      findThread(state, action.id);
+      state.threads = state.threads.filter((thread) => thread.id !== action.id);
+      for (const block of state.blocks) {
+        if (block.noteType === "thread-stub" && block.threadId === action.id) {
+          Object.assign(block, { removed: true, text: "", marks: [] });
+        }
+      }
+      break;
+    case "edit-thread-turn": {
+      const turn = find(findThread(state, action.id).turns, action.turnId);
+      if (action.question !== undefined) turn.question = requireText(action.question, 10_000).trim();
+      if (action.answer !== undefined) turn.answer = requireText(action.answer, 160_000).trim();
+      break;
+    }
+    case "delete-thread-turn": {
+      const thread = findThread(state, action.id);
+      find(thread.turns, action.turnId);
+      thread.turns = thread.turns.filter((turn) => turn.id !== action.turnId);
+      break;
+    }
+    case "publish-thread": {
+      const thread = findThread(state, action.id);
+      const text = requireText(action.text, 160_000).trim();
+      const source = action.source && typeof action.source === "object" ? {
+        memberId: String(action.source.memberId || "").slice(0, 80), memberName: String(action.source.memberName || "").slice(0, 24),
+        avatar: String(action.source.avatar || "").slice(0, 30),
+        provider: ["gpt", "claude", "gemini"].includes(action.source.provider) ? action.source.provider : "gpt"
+      } : undefined;
+      const published = thread.publishedBlockId && state.blocks.find((block) => block.id === thread.publishedBlockId && !block.removed);
+      if (published) {
+        editBlock(state, published.id, text);
+        published.included = true;
+      } else {
+        const block = { id: randomUUID(), kind: "paragraph", noteType: "thread", threadId: thread.id, text, marks: [],
+          included: true, ...(source ? { source } : {}) };
+        state.blocks.splice(insertionIndex(state, action.afterId), 0, block);
+        thread.publishedBlockId = block.id;
+      }
+      thread.visibility = "public";
+      thread.published = Date.now();
+      break;
+    }
+    case "unpublish-thread": {
+      const thread = findThread(state, action.id);
+      const block = thread.publishedBlockId && state.blocks.find((item) => item.id === thread.publishedBlockId);
+      if (block) {
+        block.removed = true;
+        block.included = false;
+        block.text = "";
+        block.marks = [];
+      }
+      delete thread.publishedBlockId;
+      thread.visibility = "private";
+      break;
+    }
     case "move-shared-block": {
       const from = state.blocks.findIndex((block) => block.id === action.id);
       if (from < 0 || state.blocks[from].kind !== "paragraph" || action.beforeId === action.id) {
@@ -421,6 +514,12 @@ export class NotebookStore {
         name TEXT NOT NULL,
         created INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS pdf_reviews (
+        hash TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        data TEXT NOT NULL,
+        updated INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS recent_pdf_review (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         path TEXT NOT NULL,
@@ -553,13 +652,52 @@ export class NotebookStore {
     return { state: this.read(), ...this.library() };
   }
 
-  recentReview() {
-    return this.db.prepare("SELECT path, name, page FROM recent_pdf_review WHERE id = 1").get();
+  // A PDF's review, kept by the PDF's content (SHA-256) and shared by every chat that shows it:
+  // annotations with their follow-ups, the whole-document conversation, and the page last read.
+  pdfReview(hash) {
+    if (!reviewHash.test(hash || "")) throw new Error("审阅记录无效。");
+    const row = this.db.prepare("SELECT name, data, updated FROM pdf_reviews WHERE hash = ?").get(hash);
+    return row ? { hash, name: row.name, updated: row.updated, ...JSON.parse(row.data) } : null;
   }
 
-  rememberReview(path, name, page) {
-    this.db.prepare(`INSERT INTO recent_pdf_review VALUES (1, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET path = excluded.path, name = excluded.name, page = excluded.page`).run(path, name, page);
+  savePdfReview(hash, name, { comments = [], chat = [], page = 1 } = {}) {
+    if (!reviewHash.test(hash || "")) throw new Error("审阅记录无效。");
+    const label = requireText(name, 250).trim();
+    const data = { comments: validateComments(comments), chat: validateTurns(chat),
+      page: Number.isInteger(page) && page > 0 ? page : 1 };
+    this.db.prepare(`INSERT INTO pdf_reviews VALUES (?, ?, ?, ?)
+      ON CONFLICT(hash) DO UPDATE SET name = excluded.name, data = excluded.data, updated = excluded.updated`)
+      .run(hash, label, JSON.stringify(data), Date.now());
+    return this.pdfReview(hash);
+  }
+
+  // Where the reader is; does not move the review up the list.
+  pdfReviewPage(hash, page) {
+    const review = this.pdfReview(hash);
+    if (!review || !Number.isInteger(page) || page < 1) return;
+    this.db.prepare("UPDATE pdf_reviews SET data = ? WHERE hash = ?")
+      .run(JSON.stringify({ comments: review.comments, chat: review.chat, page }), hash);
+  }
+
+  pdfReviews() {
+    return this.db.prepare("SELECT hash, name, data, updated FROM pdf_reviews ORDER BY updated DESC").all()
+      .map(({ hash, name, data, updated }) => {
+        const { comments = [], chat = [], page = 1 } = JSON.parse(data);
+        return { hash, name, updated, page, comments: comments.length, chat: chat.length };
+      });
+  }
+
+  // Files attached to questions inside reviews (they must not be cleaned up as unused).
+  pdfReviewAttachments() {
+    return this.db.prepare("SELECT data FROM pdf_reviews").all().flatMap(({ data }) => {
+      const { comments = [], chat = [] } = JSON.parse(data);
+      return [...chat, ...comments.flatMap((item) => item.turns || [])].flatMap((turn) => turn.attachments || []);
+    });
+  }
+
+  removePdfReview(hash) {
+    if (!reviewHash.test(hash || "")) throw new Error("审阅记录无效。");
+    this.db.prepare("DELETE FROM pdf_reviews WHERE hash = ?").run(hash);
   }
 
   open(id) {
@@ -568,8 +706,8 @@ export class NotebookStore {
     return { state, ...this.library() };
   }
 
-  create(title, { origin, turns = [], folderId } = {}) {
-    const state = { id: randomUUID(), title: requireText(title, 160).trim(), blocks: [], notes: [], branches: [] };
+  create(title, { origin, turns = [], folderId, blocks = [] } = {}) {
+    const state = { id: randomUUID(), title: requireText(title, 160).trim(), blocks: [...blocks], notes: [], branches: [] };
     const folder = this.checkedFolder(folderId);
     if (folder) state.folderId = folder;
     if (origin) state.origin = origin;
@@ -665,6 +803,12 @@ export class NotebookStore {
     } else {
       appendMainTurn(state, turn);
     }
+    return this.write(state);
+  }
+
+  saveThreadReply(id, threadId, turn) {
+    const state = this.read(id);
+    findThread(state, threadId).turns.push(turn);
     return this.write(state);
   }
 

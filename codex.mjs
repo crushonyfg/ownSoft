@@ -62,19 +62,34 @@ function personaSection({ name, provider, others = [], round = [], role = "" }) 
     "直接回答，不要在开头写自己的名字。"].filter(Boolean).join("");
 }
 
-export function buildPrompt({ context, memories, history, question, documents = [], images = [], persona, peers = "" }) {
+// Attached files are listed with their paths; the model opens what it needs with its own tools.
+function filesSection(files) {
+  const lines = files.map((file, index) => {
+    if (file.kind === "missing") return `${index + 1}. 「${file.name}」：本地文件已不存在`;
+    if (file.kind === "image") {
+      return `${index + 1}. 图片「${file.name}」：${file.path}${file.current ? "（本次提问随附，已直接发给你看）" : ""}`;
+    }
+    return [`${index + 1}. PDF「${file.name}」，${file.pages} 页${file.subject ? "（这次对话讨论的就是这份 PDF）" : ""}` +
+      `${file.current ? "（本次提问随附）" : ""}`,
+      `   原文件：${file.path}`,
+      `   抽取好的文字（按页标注「===== 第 N 页 =====」，约 ${file.chars} 字）：${file.textPath}`].join("\n");
+  });
+  return "附件文件（在本机。需要时用你的读文件工具打开，可以只读相关的页；能直接读 PDF 的可以读原文件看图表，" +
+    "否则读抽取好的文字。回答时说明依据的是第几页。）\n" + lines.join("\n");
+}
+
+export function buildPrompt({ context, memories, history, question, files = [], images = [], persona, peers = "" }) {
   const sections = [];
   if (persona) sections.push("你的身份\n" + personaSection(persona));
   if (history.length) sections.push("已有对话\n" + JSON.stringify(history));
   if (peers) sections.push("本轮其他成员已经回答了同一个问题\n" + peers);
   if (context) sections.push("笔记上下文\n" + context);
   if (memories.length) sections.push("我选入的记忆\n" + memories.map((text, index) => `${index + 1}. ${text}`).join("\n"));
-  if (documents.length) sections.push("PDF 正文\n" + documents.map(({ file, page, text }) =>
-    `「${file}」第 ${page} 页\n${text}`).join("\n\n"));
+  if (files.length) sections.push(filesSection(files));
   if (images.length) sections.push("随附图片的顺序\n" + images.map(({ name }, index) => `${index + 1}. ${name}`).join("\n"));
   const text = sections.length ? [...sections, "本次提问\n" + question].join("\n\n") : question;
-  if (text.length > 160_000) {
-    throw new Error("本次上下文太长。请开启新分支，或减少引用的内容。");
+  if (text.length > 600_000) {
+    throw new Error("这次的对话历史太长。请开启新分支，或在「主对话上下文」里只选需要的消息。");
   }
   return text;
 }

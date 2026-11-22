@@ -3,7 +3,7 @@ import { parseMarkdown, textOffsets } from "./markdown.mjs";
 const sourceOffsets = new WeakMap();
 const inlineTags = { emphasis: "em", strong: "strong", delete: "del" };
 const blockTags = { paragraph: "p", blockquote: "blockquote", listItem: "li" };
-const markClasses = { highlight: "highlighted", underline: "underlined", note: "has-note" };
+const markClasses = { highlight: "highlighted", underline: "underlined", note: "has-note", focus: "has-note focus-mark" };
 
 function element(parent, tag) {
   const child = document.createElement(tag);
