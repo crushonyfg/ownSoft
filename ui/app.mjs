@@ -1,14 +1,21 @@
 import { contextBlockIds, findAnchor, mainHistory, messageGroups, sharedNoteBlocks, sharedNoteIncluded } from "./notebook.mjs";
 import { renderMarkdown, selectionSource, sourceRange } from "./markdown-dom.mjs";
 import { setupPdfReview } from "./pdf-review-ui.mjs";
-import { setupCommentChats } from "./comment-chat.mjs";
+import { setupMdReview } from "./md-review-ui.mjs";
+import { embedChat } from "./embedded-chat.mjs";
+import { setupCommentChats, toolDetails as renderToolDetails } from "./comment-chat.mjs";
 import { createComposer } from "./chat-composer.mjs";
 import { keepFocus, setupThreads } from "./threads-ui.mjs";
 import { renderPdfPage } from "./pdf-note.mjs";
 import { splitter } from "./splitter.mjs";
+import { setupRelationView } from "./relation-view.mjs";
 import { avatarChoices, pixelAvatar } from "./pixel-avatars.mjs";
 
 const api = window.notebook;
+// Embedded: this page shows one chat inside another view (a review's side panel, an enlarged
+// annotation or branch, a private window), with everything the main chat can do.
+const embedId = new URLSearchParams(location.search).get("embed") || undefined;
+if (embedId) document.body.dataset.embed = "1";
 const get = (id) => document.getElementById(id);
 const actionButton = (name) => document.querySelector(`[data-action="${name}"]`);
 const node = (tag, className = "", text = "") => {
@@ -57,7 +64,7 @@ let activeBlock;
 let selectedText = null;
 let selectedAnswer = null;
 let currentBranchId;
-let canvasSelection;
+let relationView = null;
 let notesVisible = true;
 let editingMessage = null;
 let editingNote = null;
@@ -96,12 +103,16 @@ let windowMode = "";
 const currentBranch = () => state.branches.find((branch) => branch.id === currentBranchId);
 const anchorLabel = (reference) => reference.label || reference.quote;
 const branchTitle = (branch) => branch.turns[0]?.question || anchorLabel(branch.anchor) || "新分支";
-// This chat's members: its own roster once set up, else the app's default roster.
+// This chat's members: its own roster once set up, else that of the chat it grew from (filled in by
+// the store), else the app's default roster.
 const roster = () => state?.members?.length ? { members: state.members, defaultMember: state.defaultMember }
+  : state?.inherited?.members?.length ? state.inherited
   : { members: settings?.members || [], defaultMember: settings?.defaultMember };
 const members = () => roster().members;
 const memberById = (id) => members().find((item) => item.id === id) ?? settings?.members?.find((item) => item.id === id);
-const defaultMember = () => members().find((item) => item.id === roster().defaultMember) ?? members()[0];
+// Who answers when nobody is mentioned: whoever the last question asked for, else the default member.
+const defaultMember = () => members().find((item) => item.id === state?.recentMember) ??
+  members().find((item) => item.id === roster().defaultMember) ?? members()[0];
 const profileOf = (member) => settings?.profiles.find((item) => item.id === member?.profileId);
 // The account check, login button and model pickers follow the default member's account.
 const currentProfile = () => profileOf(defaultMember());
@@ -192,6 +203,7 @@ function renderLibrary() {
 }
 
 async function switchNotebook(open) {
+  if (embedId) throw new Error("这里嵌着的是一段对话；切换或新建会话请在主窗口里操作，或点「完整会话 ↗」在新窗口打开。");
   if (editingMessage || editingNote) throw new Error("请先保存或取消当前编辑。");
   if (libraryBusy) return;
   libraryBusy = true;
@@ -204,7 +216,8 @@ async function switchNotebook(open) {
     libraryItems = result.items;
     libraryFolders = result.folders || [];
     activeBlock = state.blocks.find((item) => !item.removed)?.id;
-    selectedText = selectedAnswer = currentBranchId = canvasSelection = undefined;
+    selectedText = selectedAnswer = currentBranchId = undefined;
+    relationView?.reset();
     selectingMessages = false;
     stopAnnotationPick();
     activeMessage = undefined;
@@ -421,11 +434,14 @@ function annotation(note, { focused = false } = {}) {
     if (note.attachments?.length) card.append(sentAttachments(note.attachments));
   }
   const notebookId = state.id;
+  // Enlarged, the follow-up is a full chat next to the annotation (see renderNoteFocus).
+  if (focused) return card;
   commentChats.mount(card, {
     key: `note:${notebookId}:${note.id}`, expanded: focused,
     target: () => ({ notebookId, noteId: note.id }),
     turns: () => (state.id === notebookId ? state.notes.find((item) => item.id === note.id)?.turns : note.turns) || [],
-    receive: ({ notebook }) => accept(notebook)
+    receive: ({ notebook }) => accept(notebook),
+    open: () => api.openChildChat({ kind: "note", notebookId, itemId: note.id })
   });
   if (editingThis) card.querySelector(".comment-thread")?.setAttribute("hidden", "");
   return card;
@@ -613,7 +629,7 @@ const rolePresets = {
   "耐心导师": "你是一位耐心的导师。用直观例子一步步解释，先讲直觉再讲细节，最后给一个小练习检验理解。"
 };
 
-// Member edits apply to this chat; the first one copies the app's default roster into the chat.
+// Member edits apply to this chat; the first one copies the roster it was using into the chat.
 async function changeMembers(action) {
   const notebookId = state.id;
   const oldProfileId = currentProfile()?.id;
@@ -845,6 +861,8 @@ function renderMainContext() {
   const chosen = Boolean(state.context);
   get("main-context-count").textContent = `${picked !== null ? "已选消息 · " : ""}${history.length} 轮 · ${sharedNoteBlocks(state).length} 个笔记块${notes ? ` · ${notes} 条批注` : ""} · ${memoryIds.length} 条记忆`;
   get("main-context").classList.toggle("is-chosen", chosen);
+  get("session-continue").checked = state.modelSessionMode !== "manual";
+  actionButton("reset-model-session").disabled = state.modelSessionMode === "manual";
   const scope = get("context-scope");
   const pick = button(chosen ? "重新选择…" : "选择消息和批注作为上下文…", "choose-context");
   const messages = picked === null ? "之前的全部消息" : picked === 0 ? "不带之前的消息，只带选择之后的新消息（变灰的不会发给模型）"
@@ -853,23 +871,6 @@ function renderMainContext() {
   if (chosen) parts.push(button("改回全部", "clear-context"));
   scope.replaceChildren(...parts);
   renderMemories("main-memory-list", "main-memory-choices", memoryIds);
-}
-
-function renderToolDetails(tools = []) {
-  if (!tools.length) return null;
-  const details = node("details", "tool-details");
-  const summary = node("summary", "", `工具调用 · ${tools.length} 项`);
-  const list = node("div", "tool-list");
-  for (const item of tools) {
-    const row = node("div", "tool-item");
-    row.append(node("span", `tool-status is-${item.status || "done"}`,
-      item.status === "running" ? "◌" : item.status === "failed" ? "!" : "✓"),
-    node("strong", "", item.title || "工具调用"));
-    if (item.detail) row.append(node("span", "tool-detail", item.detail));
-    list.append(row);
-  }
-  details.append(summary, list);
-  return details;
 }
 
 function renderSelectionBar() {
@@ -963,6 +964,16 @@ function renderDocument() {
   mountMainComposer();
   const title = get("document-title");
   title.textContent = state.title;
+  // A child chat says what it grew from (an annotation, a branch, a PDF or document review …).
+  const from = get("chat-parent");
+  from.hidden = !state.parent;
+  if (state.parent) {
+    const kinds = { note: "批注追问", branch: "分支", thread: "私聊", "pdf-chat": "PDF 全文对话", "pdf-comment": "PDF 批注追问",
+      "md-chat": "文档全文对话", "md-comment": "文档批注追问" };
+    const parts = [node("span", "", `${kinds[state.parent.kind] || "对话"} · 完整会话。在这里的问答也会显示在原来的地方。`)];
+    if (state.parent.notebookId) parts.push(button("打开来源会话", "open-parent-chat"));
+    from.replaceChildren(...parts);
+  }
   const origin = state.origin;
   get("notebook-origin").hidden = !origin;
   if (origin) {
@@ -1204,6 +1215,11 @@ function renderNoteFocus() {
   view.hidden = !note;
   if (!note) {
     noteFocusScrolled = null;
+    const chatBox = get("note-focus-chat");
+    if (chatBox.dataset.noteId) {
+      delete chatBox.dataset.noteId;
+      chatBox.replaceChildren();
+    }
     return;
   }
   const source = get("note-focus-source");
@@ -1218,7 +1234,16 @@ function renderNoteFocus() {
     ? `${speakerName(anchorGroup.blocks[0].source)} 的回答` : "笔记块";
   get("note-focus-reference").textContent = `${state.title} · 批注在${where}里`;
   source.replaceChildren(...rows);
-  get("note-focus-card").replaceChildren(annotation(note, { focused: true }));
+  get("note-focus-note").replaceChildren(annotation(note, { focused: true }));
+  // The follow-up as a full chat; its frame stays put while the annotation above re-renders.
+  const chatBox = get("note-focus-chat");
+  if (chatBox.dataset.noteId !== note.id) {
+    chatBox.dataset.noteId = note.id;
+    const notebookId = state.id;
+    api.childChatId({ kind: "note", notebookId, itemId: note.id }).then((id) => {
+      if (chatBox.dataset.noteId === note.id) embedChat(chatBox, id, { label: "批注追问" });
+    }).catch((error) => say(error.message));
+  }
   if (noteFocusScrolled !== note.id) {
     noteFocusScrolled = note.id;
     requestAnimationFrame(() => (source.querySelector(".focus-mark") || source.querySelector(".is-anchor"))
@@ -1371,10 +1396,38 @@ function pdfNoteCard(block) {
   return card;
 }
 
+// Markdown documents open over the chat like PDF reviews; closing returns to the chat.
+async function showMd(open) {
+  if (editingMessage || editingNote) throw new Error("请先保存或取消当前编辑。");
+  const opened = await open();
+  if (!opened) return;
+  activeView = "md";
+  updateView();
+  setFocus("md");
+  get("focus-title").textContent = `Markdown 文档 · ${mdReview.current()?.name || ""}`;
+}
+
+async function renderMdList() {
+  const list = await api.mdList().catch(() => []);
+  get("md-list").replaceChildren(...(list.length ? list.slice(0, 40).map((item) => {
+    const entry = button("", "open-md", "review-list-item md-list-item");
+    entry.dataset.mdId = item.id;
+    entry.title = `${item.path || "（应用内文档，还没有保存为文件）"}\n右键：在文件夹中显示、从列表移除`;
+    entry.append(node("span", "review-list-name", item.name),
+      node("span", "review-list-meta", `${item.comments} 条批注 · ${item.chat} 轮对话${item.unsynced ? " · 未写回文件" : ""}`));
+    return entry;
+  }) : [node("p", "review-list-empty", "还没有打开过 .md 文档")]));
+}
+
 // Shows the review over the chat while `open()` loads the PDF; closing it returns to the chat.
 // spec says which PDF, to bring its own window forward if it is already open in one.
 async function showReview(spec, open) {
   if (editingMessage || editingNote) throw new Error("请先保存或取消当前编辑。");
+  // An embedded chat is too small to show a review over it: the PDF opens in its own window.
+  if (embedId) {
+    await api.openReviewWindow(spec);
+    return;
+  }
   if (windowMode !== "review" && await api.focusReviewWindow(spec)) return;
   const opening = open();
   activeView = "pdf";
@@ -1438,8 +1491,23 @@ document.addEventListener("contextmenu", (event) => {
   if (!state || event.target.closest("input, textarea")) return;
   const card = event.target.closest(".pdf-note");
   const chip = event.target.closest('[data-action="open-attachment"][data-extension=".pdf"]');
-  const saved = event.target.closest(".review-list-item");
-  if (card) {
+  const mdItem = event.target.closest(".md-list-item");
+  const saved = !mdItem && event.target.closest(".review-list-item");
+  if (mdItem) {
+    const id = mdItem.dataset.mdId;
+    const name = mdItem.querySelector(".review-list-name")?.textContent || "文档";
+    showContextMenu(event, name, [
+      ["打开", () => showMd(() => mdReview.open(id))],
+      ["在文件夹中显示", () => api.mdReveal(id)],
+      ["从列表移除（不删除文件）", async () => {
+        if (mdReview.current()?.id === id && activeView === "md") throw new Error("请先关闭这份文档。");
+        if (!window.confirm(`从列表移除「${name}」？它的批注和对话会一起删除，电脑上的 .md 文件不受影响。`)) return;
+        await api.mdRemove(id);
+        mdReview.forget(id);
+        await renderMdList();
+      }, "danger"]
+    ]);
+  } else if (card) {
     const blockId = card.dataset.blockId;
     const ref = state.blocks.find((block) => block.id === blockId)?.attachments?.[0];
     showContextMenu(event, ref?.name || "PDF", [
@@ -1487,11 +1555,12 @@ function showNotes(visible) {
 
 function updateView() {
   document.body.dataset.view = activeView;
-  document.title = `${activeView === "pdf" ? "PDF 审阅" : activeView === "canvas" ? "分支画布" :
-    activeView === "apps" ? "应用与账户" : state?.title || "AI 笔记本"} · AI 笔记本`;
+  document.title = `${activeView === "pdf" ? "PDF 审阅" : activeView === "md" ? mdReview.current()?.name || "Markdown 文档" :
+    activeView === "canvas" ? "关系图" : activeView === "apps" ? "应用与账户" : state?.title || "AI 笔记本"} · AI 笔记本`;
   get("document-view").hidden = activeView !== "document";
   get("canvas-view").hidden = activeView !== "canvas";
   get("pdf-view").hidden = activeView !== "pdf";
+  get("md-view").hidden = activeView !== "md";
   get("apps-view").hidden = activeView !== "apps";
   for (const tab of document.querySelectorAll("[data-view]")) {
     if (tab.dataset.view === activeView) tab.setAttribute("aria-current", "page");
@@ -1506,19 +1575,37 @@ function updateView() {
 function setFocus(mode, noteId = null) {
   focusMode = mode;
   focusedNoteId = noteId;
+  // An enlarged branch is shown as its full chat.
+  const branchBox = get("side-embedded");
+  if (mode === "branch" && currentBranchId) {
+    const notebookId = state.id;
+    const branchId = currentBranchId;
+    branchBox.dataset.branchId = branchId;
+    api.childChatId({ kind: "branch", notebookId, itemId: branchId }).then((id) => {
+      if (branchBox.dataset.branchId === branchId && focusMode === "branch") embedChat(branchBox, id, { label: "分支" });
+    }).catch((error) => say(error.message));
+  } else if (branchBox.dataset.branchId) {
+    delete branchBox.dataset.branchId;
+    branchBox.replaceChildren();
+  }
   document.body.dataset.focus = mode || "";
   get("focus-shade").hidden = !mode;
   get("focus-bar").hidden = !mode;
   if (mode) {
     get("focus-parent").textContent = state?.title || "主聊天";
-    get("focus-title").textContent = mode === "pdf" ? "PDF 审阅" : mode === "branch" ?
+    get("focus-title").textContent = mode === "pdf" ? "PDF 审阅" : mode === "md" ? "Markdown 文档" : mode === "branch" ?
       branchTitle(currentBranch()) : "批注与追问";
   }
   if (mode !== "note") renderNoteFocus();
 }
 
 function closeFocus() {
-  if (focusMode === "pdf") {
+  if (focusMode === "md") {
+    // Save, and offer to write unsaved edits back to the .md file, before returning to the chat.
+    mdReview.leave().then(renderMdList).catch((error) => say(error.message));
+    activeView = "document";
+    updateView();
+  } else if (focusMode === "pdf") {
     pdfReview.flush().then(() => { reviewSummaries.clear(); if (activeView === "document") renderDocument(); })
       .catch((error) => say(error.message));
     activeView = "document";
@@ -1589,7 +1676,7 @@ async function openFromSelection(forceNew) {
     branch = state.branches.at(-1);
   }
   if (forceNew) {
-    canvasSelection = branch.id;
+    relationView.select({ kind: "branch", itemId: branch.id });
     activeView = "canvas";
     updateView();
   } else {
@@ -1597,95 +1684,9 @@ async function openFromSelection(forceNew) {
   }
 }
 
+// The relation view (ui/relation-view.mjs): this chat and everything that grew out of it.
 function renderCanvas() {
-  const layer = get("canvas-nodes");
-  const board = get("canvas-board");
-  const root = button("", "document-from-canvas", "canvas-node root-node");
-  root.append(node("strong", "", state.title), node("small", "", "返回正文"));
-  root.style.left = "26px";
-  root.style.top = "145px";
-  layer.replaceChildren(root);
-  get("branch-count").textContent = `${state.branches.length} 条分支`;
-  const bounds = [];
-  for (const [index, branch] of state.branches.entries()) {
-    const point = branch.position ?? { x: 302 + Math.floor(index / 4) * 246, y: 22 + index % 4 * 101 };
-    const element = button("", "", "canvas-node");
-    element.dataset.branchId = branch.id;
-    element.setAttribute("aria-pressed", String(branch.id === canvasSelection));
-    element.append(node("strong", "", branchTitle(branch)), node("small", "",
-      `${branch.turns.length ? `${speakerName(branch.turns.at(-1).source)} · ` : ""}${branch.turns.length} 轮`));
-    let moved = false;
-    element.addEventListener("click", (event) => {
-      if (moved && event.detail > 0) return;
-      canvasSelection = branch.id;
-      for (const item of layer.querySelectorAll("[data-branch-id]")) {
-        item.setAttribute("aria-pressed", String(item === element));
-      }
-      showCanvasDetail();
-    });
-    const move = (position) => {
-      element.style.left = `${position.x}px`;
-      element.style.top = `${position.y}px`;
-    };
-    move(point);
-    let drag;
-    element.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
-      moved = false;
-      drag = { x: event.clientX, y: event.clientY, left: element.offsetLeft, top: element.offsetTop };
-      element.setPointerCapture(event.pointerId);
-    });
-    element.addEventListener("pointermove", (event) => {
-      if (!drag) return;
-      const dx = event.clientX - drag.x;
-      const dy = event.clientY - drag.y;
-      if (!moved && Math.hypot(dx, dy) < 5) return;
-      moved = true;
-      move({
-        x: Math.max(0, Math.min(board.clientWidth - element.offsetWidth, drag.left + dx)),
-        y: Math.max(0, Math.min(board.clientHeight - element.offsetHeight, drag.top + dy))
-      });
-      drawCanvasLinks();
-    });
-    element.addEventListener("lostpointercapture", () => {
-      if (drag && moved) {
-        change({ type: "move-branch", id: branch.id, position: { x: element.offsetLeft, y: element.offsetTop } })
-          .catch((error) => { say(error.message); renderCanvas(); });
-      }
-      drag = null;
-    });
-    layer.append(element);
-    bounds.push(point);
-  }
-  board.style.width = `${Math.max(560, ...bounds.map(({ x }) => x + 250))}px`;
-  board.style.height = `${Math.max(435, ...bounds.map(({ y }) => y + 105))}px`;
-  drawCanvasLinks();
-  showCanvasDetail();
-}
-
-function drawCanvasLinks() {
-  const layer = get("canvas-nodes");
-  const root = layer.querySelector(".root-node");
-  const x = root.offsetLeft + root.offsetWidth;
-  const y = root.offsetTop + root.offsetHeight / 2;
-  const edges = Array.from(layer.querySelectorAll("[data-branch-id]"), (target) => {
-    const endX = target.offsetLeft;
-    const endY = target.offsetTop + target.offsetHeight / 2;
-    const middle = (x + endX) / 2;
-    const edge = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    edge.setAttribute("d", `M${x},${y} C${middle},${y} ${middle},${endY} ${endX},${endY}`);
-    return edge;
-  });
-  get("canvas-links").replaceChildren(...edges);
-}
-
-function showCanvasDetail() {
-  const branch = state.branches.find((item) => item.id === canvasSelection);
-  get("canvas-detail").hidden = !branch;
-  if (branch) {
-    get("branch-title").textContent = branchTitle(branch);
-    get("branch-quote").textContent = anchorLabel(branch.anchor);
-  }
+  relationView?.render();
 }
 
 function showEditor({ heading, reference, text = "", limit = 60_000, rows = 7, folderId, folderOnly = false, wide = false, save }) {
@@ -2237,6 +2238,11 @@ async function handleAction(control) {
       renderDocument();
       say("上下文已改回全部之前的消息。");
       break;
+    case "reset-model-session":
+      await change({ type: "reset-model-sessions" });
+      renderMainContext();
+      say("下次提问会按当前选定的上下文开启新的底层模型会话，之后继续续接。");
+      break;
     case "new-chat-from-selection":
       if (!selectedMessages.size) throw new Error("请先选择至少一条消息。");
       await switchNotebook(() => api.createFromMessages(state.id, [...selectedMessages]));
@@ -2437,6 +2443,15 @@ async function handleAction(control) {
     }
     case "open-review":
       await openSavedReview(control.dataset.hash);
+      break;
+    case "md-open-file":
+      await showMd(() => mdReview.openFile());
+      break;
+    case "md-new":
+      await showMd(() => mdReview.create());
+      break;
+    case "open-md":
+      await showMd(() => mdReview.open(control.dataset.mdId));
       break;
     case "open-pdf-file":
       if (editingMessage || editingNote) throw new Error("请先保存或取消当前编辑。");
@@ -2668,9 +2683,6 @@ async function handleAction(control) {
     case "branch":
       await openFromSelection(action === "branch");
       break;
-    case "open-branch":
-      openChat(canvasSelection);
-      break;
     case "document-from-canvas":
       activeView = "document";
       updateView();
@@ -2690,7 +2702,6 @@ async function handleAction(control) {
       sideDrafts.delete(id);
       await sideComposers.get(id)?.discard();
       sideComposers.delete(id);
-      if (canvasSelection === id) canvasSelection = undefined;
       if (currentBranchId !== id) break;
       currentBranchId = undefined;
       selectedAnswer = null;
@@ -2739,6 +2750,16 @@ async function handleAction(control) {
       break;
     case "focus-branch":
       if (currentBranch()) setFocus("branch");
+      break;
+    case "note-focus-full":
+      if (focusedNoteId) await api.openChildChat({ kind: "note", notebookId: state.id, itemId: focusedNoteId });
+      break;
+    case "branch-full":
+      if (!currentBranchId) throw new Error("请先打开一条分支。");
+      await api.openChildChat({ kind: "branch", notebookId: state.id, itemId: currentBranchId });
+      break;
+    case "open-parent-chat":
+      if (state.parent?.notebookId) await api.openNotebookWindow(state.parent.notebookId);
       break;
   }
 }
@@ -2879,6 +2900,8 @@ get("document-grid").addEventListener("dragover", (event) => {
 get("document-grid").addEventListener("drop", (event) => {
   if (!event.dataTransfer.files.length || event.target.closest("#blocks, form, #side-chat, .chat-composer")) return;
   event.preventDefault();
+  // .md files open as documents (handled on the window).
+  if ([...event.dataTransfer.files].some((file) => isMarkdownFile(file))) return;
   const images = noteImageFiles(event.dataTransfer.files);
   if (!images.length) return say("笔记块支持 PNG、JPG、WebP 图片和 PDF。");
   addNoteImages(images, insertionPoint()).catch((error) => say(error.message));
@@ -2985,6 +3008,17 @@ get("main-memory-list").addEventListener("change", async (event) => {
   }
   renderMainContext();
 });
+get("session-continue").addEventListener("change", async (event) => {
+  try {
+    await change({ type: "set-model-session-mode", mode: event.target.checked ? "continue" : "manual" });
+    renderMainContext();
+    say(event.target.checked ? "下次提问会按当前上下文开始并续接模型会话。" :
+      "已切换为每轮按当前上下文新开底层模型会话。");
+  } catch (error) {
+    say(error.message);
+    renderMainContext();
+  }
+});
 get("editor-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = event.submitter;
@@ -2998,8 +3032,17 @@ get("editor-form").addEventListener("submit", async (event) => {
     if (submit) submit.disabled = false;
   }
 });
+// A .md file dropped anywhere outside a question box opens as a Markdown document.
+const isMarkdownFile = (file) => /\.(md|markdown|mdown|mkd)$/i.test(file.name);
+window.addEventListener("dragover", (event) => {
+  if ([...(event.dataTransfer?.items || [])].some((item) => item.kind === "file")) event.preventDefault();
+});
 window.addEventListener("drop", (event) => {
   if (event.dataTransfer?.files.length) event.preventDefault();
+  const file = [...(event.dataTransfer?.files || [])].find(isMarkdownFile);
+  if (file && !event.target.closest?.("form, .chat-composer")) {
+    showMd(() => mdReview.openDropped(file)).catch((error) => say(error.message));
+  }
 });
 
 api.onProgress(({ requestId, text }) => {
@@ -3070,7 +3113,7 @@ async function refreshFromStore() {
   if (!state || editingMessage || editingNote || syncingLibrary) return;
   syncingLibrary = true;
   try {
-    const [next, library] = await Promise.all([api.read(), api.library()]);
+    const [next, library] = await Promise.all([api.read(embedId), api.library()]);
     const libraryChanged = JSON.stringify(library.items) !== JSON.stringify(libraryItems) ||
       JSON.stringify(library.folders || []) !== JSON.stringify(libraryFolders);
     libraryItems = library.items;
@@ -3133,6 +3176,29 @@ const threadsUi = setupThreads(api, {
 });
 splitter(get("note-focus-split"), { target: get("note-focus"), property: "--note-focus-side", fromEnd: true,
   min: 340, keep: 320, key: "note-focus" });
+relationView = setupRelationView(api, {
+  rootId: () => state.id, notify: say,
+  memberName: (id) => memberById(id)?.name,
+  backToDocument: () => { activeView = "document"; updateView(); },
+  openParent: () => state.parent?.notebookId ? api.openNotebookWindow(state.parent.notebookId) : say("找不到来源会话。"),
+  // "在原处打开": where the annotation, branch, window or review lives in this chat.
+  goTo: async (node) => {
+    const spec = node.open || {};
+    if (node.kind === "pdf" || spec.hash) return openSavedReview(node.hash || spec.hash);
+    if (node.kind === "md" || spec.mdId) return showMd(() => mdReview.open(node.mdId || spec.mdId));
+    if (spec.kind === "branch") return openChat(spec.itemId);
+    activeView = "document";
+    updateView();
+    if (spec.kind === "thread") return threadsUi.open(spec.itemId);
+    if (spec.kind === "note") {
+      collapsedNotes.delete(spec.itemId);
+      setFocus("note", spec.itemId);
+      renderDocument();
+    }
+  }
+});
+const mdReview = setupMdReview(api, { edit: showEditor, notify: say, commentChats, onSaved: () => void renderMdList() });
+void renderMdList();
 const pdfReview = setupPdfReview(api, { edit: showEditor, notify: say, commentChats,
   // A PDF picked with 打开 shows up over the chat; closing returns to it.
   onPick: () => {
@@ -3146,7 +3212,7 @@ const pdfReview = setupPdfReview(api, { edit: showEditor, notify: say, commentCh
   } });
 
 try {
-  const [notebook, savedSettings, library] = await Promise.all([api.read(), api.settings(), api.library()]);
+  const [notebook, savedSettings, library] = await Promise.all([api.read(embedId), api.settings(), api.library()]);
   accept(notebook);
   settings = savedSettings;
   applyAppearance();

@@ -29,6 +29,13 @@ export function toolDetails(items = []) {
       item.status === "running" ? "◌" : item.status === "failed" ? "!" : "✓"),
     create("strong", "", item.title || "工具调用"));
     if (item.detail) row.append(create("span", "tool-detail", item.detail));
+    if (item.result) {
+      const result = create("details", "tool-result");
+      const body = create("pre");
+      result.append(create("summary", "", "工具返回"), body);
+      result.addEventListener("toggle", () => { body.textContent = result.open ? item.result : ""; });
+      row.append(result);
+    }
     list.append(row);
   }
   details.append(list);
@@ -154,8 +161,10 @@ export function setupCommentChats(api, { members, defaultMember, describe, speak
    * turns(): the finished exchanges; receive(result): store a new answer.
    * embedded: always open, without the 追问 / 新开分支 controls (PDF selections, whole PDFs).
    */
+  // open(): shows this conversation as a full chat (its own window), where everything the main
+  // chat can do is available.
   function mount(parent, { key, target, turns, receive, embedded = false, expanded, placeholder, label,
-    forkable = true, attachments: allowFiles = true, turnActions }) {
+    forkable = true, attachments: allowFiles = true, turnActions, open }) {
     let thread = threads.get(key);
     if (!thread) {
       thread = { expanded: embedded || Boolean(expanded), draft: "" };
@@ -174,11 +183,23 @@ export function setupCommentChats(api, { members, defaultMember, describe, speak
     fork.title = "把批注、原文和追问带到一个新会话里继续";
     controls.append(chat);
     if (forkable) controls.append(fork);
+    const full = open && button("完整会话 ↗");
+    if (full) {
+      full.className = "comment-full";
+      full.title = "在新窗口以完整会话打开：编辑、收起、高亮、转笔记或批注、多选、选上下文都能用";
+      full.addEventListener("click", () => Promise.resolve().then(open).catch((error) => notify(error.message)));
+      if (!embedded) controls.append(full);
+    }
     const conversation = create("div", "comment-conversation");
     const history = create("div", "comment-history");
     const progress = create("div", "comment-progress");
     conversation.append(history, progress, composer.element);
     if (!embedded) section.append(controls);
+    else if (full) {
+      const bar = create("div", "comment-full-bar");
+      bar.append(full);
+      section.append(bar);
+    }
     section.append(conversation);
     parent.append(section);
 

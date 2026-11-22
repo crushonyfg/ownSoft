@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
+import { maxPromptChars } from "./context-budget.mjs";
 
 export function codexExecutable() {
   if (process.platform !== "win32") return "codex";
@@ -43,7 +44,7 @@ function desktopCodex() {
 
 const options = [
   'model_provider="openai"', 'forced_login_method="chatgpt"',
-  'web_search="live"', 'history.persistence="none"',
+  'web_search="live"',
   "features.apps=false", "features.plugins=false", "features.hooks=false",
   "features.memories=false", "skills.include_instructions=false", "mcp_servers={}"
 ].flatMap((option) => ["-c", option]);
@@ -88,7 +89,7 @@ export function buildPrompt({ context, memories, history, question, files = [], 
   if (files.length) sections.push(filesSection(files));
   if (images.length) sections.push("随附图片的顺序\n" + images.map(({ name }, index) => `${index + 1}. ${name}`).join("\n"));
   const text = sections.length ? [...sections, "本次提问\n" + question].join("\n\n") : question;
-  if (text.length > 600_000) {
+  if (text.length > maxPromptChars) {
     throw new Error("这次的对话历史太长。请开启新分支，或在「主对话上下文」里只选需要的消息。");
   }
   return text;
@@ -272,8 +273,7 @@ export class Codex extends EventEmitter {
   }
 
   async answer(payload, { signal, update, activity = () => {}, tool = () => {}, usage = () => {},
-    model: selectedModel, effort, cwd }) {
-    let text = buildPrompt(payload);
+    model: selectedModel, effort, cwd, resumeSession, persistSession = false }) {
     const account = await this.account();
     if (!account.signedIn) throw new Error("请先用 ChatGPT 订阅登录 Codex。");
     const models = await this.models();
@@ -285,13 +285,18 @@ export class Codex extends EventEmitter {
       throw new Error("所选模型不支持图片。请更换模型后再发送。");
     }
     signal.throwIfAborted();
-    const { thread } = await this.#request("thread/start", {
-      cwd: cwd || this.directory, ephemeral: true, sandbox: "workspace-write", approvalPolicy: "on-request",
-      model: model.id
-    });
+    const resumed = Boolean(resumeSession && persistSession);
+    const { thread } = resumed
+      ? await this.#request("thread/resume", { threadId: resumeSession, excludeTurns: true })
+      : await this.#request("thread/start", {
+        cwd: cwd || this.directory, ephemeral: !persistSession,
+        sandbox: "workspace-write", approvalPolicy: "on-request", model: model.id
+      });
     try {
       signal.throwIfAborted();
-      const items = nativeHistory(payload.history);
+      let text = buildPrompt(resumed ? { ...payload, history: [], context: "", memories: [],
+        files: payload.files.filter((file) => file.current) } : payload);
+      const items = resumed ? [] : nativeHistory(payload.history);
       if (items.length) {
         try {
           await this.#request("thread/inject_items", { threadId: thread.id, items });
@@ -303,8 +308,9 @@ export class Codex extends EventEmitter {
       signal.throwIfAborted();
       const input = [{ type: "text", text },
         ...(payload.images || []).map(({ path }) => ({ type: "localImage", path }))];
-      return await this.#turn(thread.id, input, { signal, update, activity, tool, usage,
+      const answer = await this.#turn(thread.id, input, { signal, update, activity, tool, usage,
         effort: effort || model.defaultEffort });
+      return { text: answer, sessionId: persistSession ? thread.id : undefined };
     } finally {
       if (this.#child) await this.#request("thread/unsubscribe", { threadId: thread.id }).catch(() => {});
     }
@@ -357,7 +363,8 @@ export class Codex extends EventEmitter {
         if (params.threadId !== threadId || !toolLabels[params.item?.type]) return;
         const item = params.item;
         const detail = item.query || item.command || item.tool || item.name || item.path || "";
-        tool({ id: item.id || `${item.type}:${detail}`, title: toolLabels[item.type], detail, status });
+        tool({ id: item.id || `${item.type}:${detail}`, title: toolLabels[item.type], detail, status,
+          ...(status === "done" ? { result: item } : {}) });
       };
       add("item/started", (params) => {
         if (params.threadId !== threadId) return;

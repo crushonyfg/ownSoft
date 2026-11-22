@@ -1,5 +1,6 @@
 import { renderMarkdown } from "./markdown-dom.mjs";
 import { splitter } from "./splitter.mjs";
+import { embedChat } from "./embedded-chat.mjs";
 
 const get = (id) => document.getElementById(id);
 const byPage = (left, right) => left.page - right.page ||
@@ -79,29 +80,39 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
   }
 
   // The conversation about the whole PDF, in the second tab of the side panel.
-  function mountDocumentChat(focus = false) {
+  // The lower pane is a full chat (the app's chat page embedded): the whole-PDF conversation, or an
+  // annotation's follow-up when one is picked. Everything the main chat can do works there.
+  let chatTarget = null;
+  get("review-chat-back").addEventListener("click", () => mountDocumentChat(true, null));
+  function mountDocumentChat(focus = false, commentId = chatTarget) {
+    showReviewChat(focus, commentId).catch((error) => notify(error.message));
+  }
+
+  async function showReviewChat(focus, commentId) {
     const pane = get("review-document-conversation");
-    if (!state) return pane.replaceChildren();
-    const reviewId = state.id;
+    if (!state) {
+      chatTarget = null;
+      return pane.replaceChildren();
+    }
     const review = state;
-    get("review-chat-count").textContent = review.chat.length ? `${review.chat.length} 轮` : "";
-    const scrolled = pane.closest(".review-pane");
-    const bottom = scrolled && scrolled.scrollTop + scrolled.clientHeight >= scrolled.scrollHeight - 30;
-    pane.replaceChildren();
-    const focusComposer = commentChats.mount(pane, {
-      key: `pdf:${reviewId}:document`, embedded: true, forkable: false,
-      placeholder: "就整份 PDF 提问，例如「总结主要贡献」「第 3 节的方法有什么漏洞」；@ 成员可让多位依次回答",
-      label: "全文对话 · PDF 正文和已有批注会一起发给成员",
-      target: () => ({ reviewId, document: true, comments: review.comments, history: review.chat }),
-      turns: () => review.chat,
-      receive: ({ turn }) => {
-        review.chat.push(turn);
-        get("review-chat-count").textContent = `${review.chat.length} 轮`;
-        if (review === state) markDirty();
-      }
-    });
-    if (focus) focusComposer();
-    if (scrolled && (bottom || focus)) scrolled.scrollTop = scrolled.scrollHeight;
+    const comment = commentId ? review.comments.find((item) => item.id === commentId) : null;
+    chatTarget = comment?.id || null;
+    get("review-chat-title").textContent = comment ? `批注追问 · ${comment.title || "批注"}` : "全文对话";
+    get("review-chat-back").hidden = !comment;
+    get("review-chat-count").textContent = "";
+    get("review-chat-hint").textContent = comment
+      ? "针对这条批注继续讨论：批注、它标注的原文和 PDF 会一起发给回答的成员。"
+      : "和群聊成员讨论整份 PDF：PDF 正文和已有批注会一起发给回答的成员。";
+    for (const card of document.querySelectorAll("[data-review-comment]")) {
+      card.classList.toggle("is-chatting", card.dataset.reviewComment === chatTarget);
+    }
+    if (comment && dirty) await save();
+    const spec = comment ? { kind: "pdf-comment", reviewId: review.id, commentId: comment.id } : { kind: "pdf-chat", reviewId: review.id };
+    const id = await api.childChatId(spec);
+    if (review !== state) return;
+    embedChat(pane, id, { label: get("review-chat-title").textContent });
+    get("review-chat-full").onclick = () => api.openChildChat(spec).catch((error) => notify(error.message));
+    if (focus) pane.scrollIntoView({ block: "nearest" });
   }
 
   function refreshToolbar() {
@@ -167,18 +178,17 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
         if (active) activeId = undefined;
         markDirty();
         refreshComments();
+        if (chatTarget === item.id) mountDocumentChat(false, null);
       });
       actions.append(revise, remove);
       card.append(actions);
-      commentChats.mount(card, {
-        key,
-        target: () => ({ reviewId, comment: item }),
-        turns: () => item.turns || [],
-        receive: ({ turn }) => {
-          (item.turns ??= []).push(turn);
-          markDirty();
-        }
-      });
+      // The follow-up is a full chat, shown in the lower pane.
+      const follow = make("button", "review-follow", item.turns?.length ? `追问 · ${item.turns.length} 轮` : "追问");
+      follow.type = "button";
+      follow.title = "在下方以完整会话继续讨论这条批注";
+      follow.addEventListener("click", () => mountDocumentChat(true, item.id));
+      actions.prepend(follow);
+      if (item.id === chatTarget) card.classList.add("is-chatting");
       list.append(card);
 
       item.rects.forEach(([left, , right, bottom], index) => {

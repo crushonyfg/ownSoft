@@ -4,6 +4,37 @@ import { applyMemberChange } from "./members.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { findAnchor, initialNotebook, messageGroups, sameMessage, splitReply } from "./notebook.mjs";
 import { validateComments, validateTurns } from "./pdf-review.mjs";
+import { mdTextLimit, reanchor } from "./md-document.mjs";
+import { appendTurn, chatTurns, childKey, childKinds, syncTurns } from "./child-chats.mjs";
+
+// The conversation lists a chat shows from its child chats (see child-chats.mjs), as filled in on
+// read: a write only syncs the lists that changed since.
+const filledLists = new WeakMap();
+const withoutTurns = (items) => items?.map(({ turns, ...rest }) => rest);
+const label = (text, size = 40) => String(text || "").replace(/\s+/g, " ").trim().slice(0, size);
+// A line of Markdown as plain text, for titles in lists and graphs.
+const plain = (text, size) => label(String(text || "").replace(/[*_`#>~]+/g, ""), size);
+
+const mdId = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i;
+
+// Annotations on a Markdown document: a passage of its source ({ start, quote }) and a note,
+// with the follow-up conversation; "lost" when an edit removed the passage.
+export function validateMdComments(comments, text) {
+  if (!Array.isArray(comments) || comments.length > 1500) throw new Error("文档批注列表无效。");
+  const ids = new Set();
+  return comments.map((comment) => {
+    const { id, start, quote, title = "", text: note, turns, lost } = comment || {};
+    if (!/^[a-zA-Z\d_-]{1,80}$/.test(id || "") || ids.has(id) || !Number.isInteger(start) || start < 0 ||
+        typeof quote !== "string" || !quote || quote.length > 8000 || typeof title !== "string" || title.length > 160 ||
+        typeof note !== "string" || !note.trim() || note.length > 20_000) {
+      throw new Error("一条文档批注的内容或位置无效。");
+    }
+    ids.add(id);
+    const item = { id, start, quote, title, text: note, ...(turns?.length ? { turns: validateTurns(turns) } : {}),
+      ...(lost ? { lost: true } : {}) };
+    return reanchor(text, item);
+  });
+}
 
 const imageExtensions = [".png", ".jpg", ".jpeg", ".webp"];
 
@@ -160,6 +191,16 @@ function messageStart(state, beforeId) {
 
 export function applyChange(state, action) {
   switch (action.type) {
+    case "set-model-session-mode":
+      if (!["continue", "manual"].includes(action.mode)) throw new Error("模型会话模式无效。");
+      state.modelSessionMode = action.mode;
+      state.modelSessions = {};
+      state.modelSessionEpoch = (state.modelSessionEpoch || 0) + 1;
+      break;
+    case "reset-model-sessions":
+      state.modelSessions = {};
+      state.modelSessionEpoch = (state.modelSessionEpoch || 0) + 1;
+      break;
     case "add-shared-block":
       state.blocks.splice(insertionIndex(state, action.afterId), 0, {
         id: randomUUID(), kind: "paragraph", text: requireText(action.text, 160_000).trim(),
@@ -520,6 +561,21 @@ export class NotebookStore {
         data TEXT NOT NULL,
         updated INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS child_chats (
+        key TEXT PRIMARY KEY,
+        notebook_id TEXT NOT NULL,
+        parent_notebook TEXT,
+        kind TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS child_chats_parent ON child_chats(parent_notebook);
+      CREATE TABLE IF NOT EXISTS md_documents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        path TEXT,
+        text TEXT NOT NULL,
+        data TEXT NOT NULL,
+        updated INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS recent_pdf_review (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         path TEXT NOT NULL,
@@ -553,17 +609,281 @@ export class NotebookStore {
   read(id = this.activeId()) {
     const row = this.select.get(id);
     if (!row) throw new Error("找不到这本笔记。");
-    return JSON.parse(row.snapshot);
+    return this.#fill(JSON.parse(row.snapshot));
+  }
+
+  // ---- child chats --------------------------------------------------------------------------
+
+  // The annotation follow-ups, branches and private windows of a chat, with their child chat keys.
+  #conversations(state) {
+    const notebookId = state.id;
+    return [
+      ...(state.notes || []).map((note) => [note, childKey.note(notebookId, note.id), { kind: "note", notebookId,
+        noteId: note.id, title: `批注追问 · ${label(note.anchor?.label || note.anchor?.quote || note.text)}` }]),
+      ...(state.branches || []).map((branch) => [branch, childKey.branch(notebookId, branch.id), { kind: "branch",
+        notebookId, branchId: branch.id, title: `分支 · ${label(branch.anchor?.label || branch.anchor?.quote)}` }]),
+      ...(state.threads || []).map((thread) => [thread, childKey.thread(notebookId, thread.id), { kind: "thread",
+        notebookId, threadId: thread.id, memberId: thread.memberId, title: "私聊" }])
+    ];
+  }
+
+  // Turns come from the child chat; a list still stored inline (older data) is kept and moved
+  // into a child chat by the next write.
+  #fill(state) {
+    const children = new Map(this.db.prepare(`SELECT c.key, d.snapshot FROM child_chats c
+      JOIN notebook_documents d ON d.id = c.notebook_id WHERE c.parent_notebook = ?`).all(state.id)
+      .map(({ key, snapshot }) => [key, JSON.parse(snapshot)]));
+    // Windows refresh a chat when its revision grows; a reply in one of its child chats counts.
+    for (const child of children.values()) state.revision = (state.revision || 0) + (child.revision || 0);
+    const signatures = new Map();
+    for (const [item, key, parent] of this.#conversations(state)) {
+      const child = children.get(key);
+      if (child) item.turns = chatTurns(child);
+      else if (parent.kind !== "note") item.turns ??= [];
+      signatures.set(key, !child && item.turns?.length ? "inline" : JSON.stringify(item.turns ?? []));
+    }
+    filledLists.set(state, signatures);
+    // A chat without members of its own talks with those of the chat it grew from (for a review's
+    // chats: the chat the review was last opened from). Not stored; see #stored.
+    const inherited = state.members?.length ? null : this.#inheritedRoster(state);
+    if (inherited) state.inherited = inherited;
+    else delete state.inherited;
+    return state;
+  }
+
+  #inheritedRoster(state) {
+    const seen = new Set([state.id]);
+    let parent = state.parent;
+    for (let step = 0; parent && step < 12; step += 1) {
+      const id = parent.notebookId || parent.rosterNotebookId;
+      if (!id || seen.has(id)) return null;
+      seen.add(id);
+      const row = this.select.get(id);
+      if (!row) return null;
+      const next = JSON.parse(row.snapshot);
+      if (next.members?.length) return { members: next.members, defaultMember: next.defaultMember };
+      parent = next.parent;
+    }
+    return null;
+  }
+
+  // Conversation lists that changed are written into their child chats; child chats whose
+  // annotation, branch or window is gone are removed.
+  #absorb(state) {
+    const signatures = filledLists.get(state) ?? new Map();
+    const kept = new Set();
+    for (const [item, key, parent] of this.#conversations(state)) {
+      kept.add(key);
+      if (!Array.isArray(item.turns)) continue;
+      const signature = JSON.stringify(item.turns);
+      if (signatures.get(key) === signature) continue;
+      this.syncChildTurns(key, parent, item.turns, { prune: true });
+      signatures.set(key, signature);
+    }
+    filledLists.set(state, signatures);
+    for (const { key } of this.db.prepare("SELECT key FROM child_chats WHERE parent_notebook = ?").all(state.id)) {
+      if (!kept.has(key)) this.deleteChildChat(key);
+    }
+  }
+
+  #stored(state) {
+    return JSON.stringify({ ...state, inherited: undefined, notes: withoutTurns(state.notes) ?? state.notes,
+      branches: withoutTurns(state.branches) ?? state.branches, ...(state.threads ? { threads: withoutTurns(state.threads) } : {}) });
+  }
+
+  #insertChat(state) {
+    this.insert.run(state.id, this.#stored(state), Date.now());
+    this.#absorb(state);
+  }
+
+  childChat(key) {
+    const row = this.db.prepare("SELECT notebook_id FROM child_chats WHERE key = ?").get(key);
+    if (!row) return null;
+    const found = this.select.get(row.notebook_id);
+    if (!found) {
+      this.db.prepare("DELETE FROM child_chats WHERE key = ?").run(key);
+      return null;
+    }
+    return this.#fill(JSON.parse(found.snapshot));
+  }
+
+  // parent: { kind, title, notebookId?, … } — where the conversation grew from.
+  ensureChildChat(key, parent) {
+    const existing = this.childChat(key);
+    if (existing) return existing;
+    if (!childKinds[parent?.kind]) throw new Error("对话来源无效。");
+    const state = { id: randomUUID(), title: requireText(parent.title || childKinds[parent.kind], 160).trim(),
+      blocks: [], notes: [], branches: [], parent: { ...parent, key } };
+    this.insert.run(state.id, JSON.stringify(state), Date.now());
+    this.db.prepare("INSERT INTO child_chats VALUES (?, ?, ?, ?)").run(key, state.id, parent.notebookId || null, parent.kind);
+    return this.#fill(state);
+  }
+
+  // The child chat of a conversation, made (empty) if it has none yet; returns its id.
+  // rosterId: the chat a review was opened from; its chats talk with that chat's members.
+  openChildChat({ kind, notebookId, itemId, hash, mdId, commentId, rosterId }) {
+    const id = this.#openChildChat({ kind, notebookId, itemId, hash, mdId, commentId });
+    if (!kind.startsWith("pdf-") && !kind.startsWith("md-")) return id;
+    const chat = this.read(id);
+    if (typeof rosterId === "string" && rosterId !== id && rosterId !== chat.parent.rosterNotebookId &&
+        this.select.get(rosterId)) {
+      chat.parent = { ...chat.parent, rosterNotebookId: rosterId };
+      this.write(chat);
+    }
+    return id;
+  }
+
+  #openChildChat({ kind, notebookId, itemId, hash, mdId, commentId }) {
+    if (kind === "note" || kind === "branch" || kind === "thread") {
+      const found = this.#conversations(this.read(notebookId)).find(([item, , parent]) => parent.kind === kind && item.id === itemId);
+      if (!found) throw new Error("这段对话已不存在。");
+      return this.ensureChildChat(found[1], found[2]).id;
+    }
+    const pdf = kind === "pdf-chat" || kind === "pdf-comment";
+    const review = pdf ? this.pdfReview(hash) : this.mdDocument(mdId);
+    if (!review) throw new Error("找不到这份审阅。");
+    const id = pdf ? hash : mdId;
+    const keys = this.#reviewKeys(pdf ? "pdf" : "md", id);
+    if (kind.endsWith("-chat")) {
+      return this.ensureChildChat(keys.chat, { kind, ...keys.parent, title: `全文对话 · ${label(review.name, 60)}` }).id;
+    }
+    const comment = review.comments.find((item) => item.id === commentId);
+    if (!comment) throw new Error("这条批注还没保存或已被删除。");
+    return this.ensureChildChat(keys.comment(comment.id), { kind, ...keys.parent, commentId: comment.id,
+      title: `${pdf ? "PDF" : "文档"}批注追问 · ${label(comment.title || comment.quote)}` }).id;
+  }
+
+  childTurns(key) {
+    const chat = this.childChat(key);
+    return chat ? chatTurns(chat) : null;
+  }
+
+  syncChildTurns(key, parent, turns, { prune = false } = {}) {
+    let chat = this.childChat(key);
+    if (!chat && !turns?.length) return null;
+    chat ??= this.ensureChildChat(key, parent);
+    if (syncTurns(chat, turns || [], { prune })) this.write(chat);
+    return chat;
+  }
+
+  appendChildTurn(key, parent, turn) {
+    const chat = this.ensureChildChat(key, parent);
+    appendTurn(chat, turn);
+    return this.write(chat);
+  }
+
+  // ---- relations: what grew out of a chat, as a tree (the graph / outline view) ------------------
+  // A node with a conversation says how to open it (`open`, what openChildChat takes) and its chat
+  // id once it has one; the annotations, branches and windows of that chat hang below it, and so
+  // on down. PDFs in a chat are listed by attachment (main.mjs adds their reviews with reviewTree).
+  chatTree(rootId, { depth = 8 } = {}) {
+    const state = this.read(rootId);
+    const seen = new Set([state.id]);
+    return { kind: "chat", title: state.title, chatId: state.id, turns: chatTurns(state).length,
+      updated: this.#updated(state.id), parent: state.parent || null, children: this.#treeOf(state, 1, depth, seen) };
+  }
+
+  reviewTree(kind, id, { depth = 8, seen = new Set() } = {}) {
+    const pdf = kind === "pdf";
+    const review = pdf ? this.pdfReview(id) : this.mdDocument(id);
+    if (!review) return null;
+    const keys = this.#reviewKeys(kind, id);
+    const where = pdf ? { hash: id } : { mdId: id };
+    return {
+      kind, title: review.name, updated: review.updated, ...where, comments: review.comments.length,
+      children: [
+        this.#chatNode(keys.chat, { kind: `${kind}-chat`, title: pdf ? "整份 PDF 的讨论" : "整篇文档的讨论", turns: review.chat.length,
+          open: { kind: `${kind}-chat`, ...where } }, 1, depth, seen),
+        ...review.comments.map((comment) => this.#chatNode(keys.comment(comment.id), {
+          kind: `${kind}-comment`, title: plain(comment.title || comment.text, 60) || "批注", quote: label(comment.quote, 120),
+          text: plain(comment.text, 200), page: comment.page, turns: comment.turns?.length || 0,
+          open: { kind: `${kind}-comment`, ...where, commentId: comment.id } }, 1, depth, seen))
+      ]
+    };
+  }
+
+  #updated(id) {
+    return this.db.prepare("SELECT updated FROM notebook_documents WHERE id = ?").get(id)?.updated || 0;
+  }
+
+  #treeOf(state, level, depth, seen) {
+    const nodes = this.#conversations(state).map(([item, key, parent]) => {
+      const quote = label(item.anchor?.label || item.anchor?.quote, 120);
+      const title = parent.kind === "note" ? plain(item.title || item.text, 60) || "批注"
+        : parent.kind === "branch" ? quote || "分支" : "私聊";
+      return this.#chatNode(key, { kind: parent.kind, title, quote, text: parent.kind === "note" ? plain(item.text, 200) : "",
+        memberId: item.memberId || "", turns: item.turns?.length || 0,
+        open: { kind: parent.kind, notebookId: state.id, itemId: item.id } }, level, depth, seen);
+    });
+    const pdfs = new Map();
+    for (const block of state.blocks || []) {
+      const ref = block.noteType === "pdf" ? block.attachments?.[0] : null;
+      if (ref?.id && !pdfs.has(ref.id)) {
+        pdfs.set(ref.id, { kind: "pdf", title: ref.name || block.text || "PDF", attachmentId: ref.id, blockId: block.id, attachment: ref, children: [] });
+      }
+    }
+    return [...nodes, ...pdfs.values()];
+  }
+
+  #chatNode(key, node, level, depth, seen) {
+    const chat = this.childChat(key);
+    const fresh = chat && !seen.has(chat.id);
+    if (fresh) seen.add(chat.id);
+    return { ...node, chatId: chat?.id || null, updated: chat ? this.#updated(chat.id) : 0,
+      children: fresh && level < depth ? this.#treeOf(chat, level + 1, depth, seen) : [] };
+  }
+
+  // A child chat goes with whatever it grew from, together with its own child chats.
+  deleteChildChat(key) {
+    const row = this.db.prepare("SELECT notebook_id FROM child_chats WHERE key = ?").get(key);
+    this.db.prepare("DELETE FROM child_chats WHERE key = ?").run(key);
+    if (row) this.#deleteChildrenOf(row.notebook_id, true);
+  }
+
+  #deleteChildrenOf(notebookId, itself = false) {
+    for (const { key } of this.db.prepare("SELECT key FROM child_chats WHERE parent_notebook = ?").all(notebookId)) {
+      this.deleteChildChat(key);
+    }
+    if (itself) this.db.prepare("DELETE FROM notebook_documents WHERE id = ?").run(notebookId);
+  }
+
+  #deleteChildrenByPrefix(prefix, keep = new Set()) {
+    for (const { key } of this.db.prepare("SELECT key FROM child_chats WHERE substr(key, 1, ?) = ?").all(prefix.length, prefix)) {
+      if (!keep.has(key)) this.deleteChildChat(key);
+    }
+  }
+
+  // Every chat that still keeps a conversation inline moves it into child chats (older data).
+  needsConversationMove() {
+    return this.db.prepare(`SELECT 1 FROM notebook_documents WHERE snapshot LIKE '%"turns":[{%' LIMIT 1`).get() ||
+      this.db.prepare(`SELECT 1 FROM pdf_reviews WHERE data LIKE '%"turns":[{%' OR data LIKE '%"chat":[{%' LIMIT 1`).get() ||
+      this.db.prepare(`SELECT 1 FROM md_documents WHERE data LIKE '%"turns":[{%' OR data LIKE '%"chat":[{%' LIMIT 1`).get();
+  }
+
+  moveConversations() {
+    for (const { id } of this.db.prepare("SELECT id FROM notebook_documents").all()) {
+      const state = this.read(id);
+      if (this.#conversations(state).some(([item]) => item.turns?.length)) this.write(state);
+    }
+    for (const { hash, name } of this.db.prepare("SELECT hash, name FROM pdf_reviews").all()) {
+      const review = this.pdfReview(hash);
+      this.savePdfReview(hash, name, review);
+    }
+    for (const { id } of this.db.prepare("SELECT id FROM md_documents").all()) {
+      const doc = this.mdDocument(id);
+      this.saveMdDocument(id, doc);
+    }
   }
 
   readAll() {
     return this.db.prepare("SELECT snapshot FROM notebook_documents").all().map(({ snapshot }) => JSON.parse(snapshot));
   }
 
+  // Child chats are reached from where they grew, not listed among the sessions.
   library() {
     const items = this.db.prepare(`SELECT id, json_extract(snapshot, '$.title') AS title,
       json_extract(snapshot, '$.folderId') AS folderId
-      FROM notebook_documents ORDER BY updated DESC, rowid DESC`).all();
+      FROM notebook_documents WHERE json_extract(snapshot, '$.parent') IS NULL ORDER BY updated DESC, rowid DESC`).all();
     const folders = this.db.prepare("SELECT id, name FROM notebook_folders ORDER BY created, rowid").all();
     return { active: this.activeId(), items, folders };
   }
@@ -640,8 +960,10 @@ export class NotebookStore {
         this.insert.run(fresh.id, JSON.stringify(fresh), Date.now());
       }
       this.db.prepare("DELETE FROM notebook_documents WHERE id = ?").run(id);
+      this.#deleteChildrenOf(id);
       if (this.activeId() === id) {
-        const replacement = this.db.prepare("SELECT id FROM notebook_documents ORDER BY updated DESC, rowid DESC LIMIT 1").get();
+        const replacement = this.db.prepare(`SELECT id FROM notebook_documents WHERE json_extract(snapshot, '$.parent') IS NULL
+          ORDER BY updated DESC, rowid DESC LIMIT 1`).get();
         this.db.prepare("UPDATE notebook_library SET active = ? WHERE id = 1").run(replacement.id);
       }
       this.db.exec("COMMIT");
@@ -654,43 +976,81 @@ export class NotebookStore {
 
   // A PDF's review, kept by the PDF's content (SHA-256) and shared by every chat that shows it:
   // annotations with their follow-ups, the whole-document conversation, and the page last read.
+  // ---- conversations of reviews (PDF and Markdown) -------------------------------------------
+  // A review's whole-document chat and each annotation's follow-up are child chats too. Reading
+  // fills them in; saving only adds turns (the page showing a review may hold an older copy, so
+  // nothing is removed from a chat that way) and drops the child chat of a deleted annotation.
+  #reviewKeys(kind, id) {
+    return kind === "pdf"
+      ? { chat: childKey.pdfChat(id), comment: (commentId) => childKey.pdfComment(id, commentId), prefix: `pdf-comment:${id}:`,
+        parent: { hash: id } }
+      : { chat: childKey.mdChat(id), comment: (commentId) => childKey.mdComment(id, commentId), prefix: `md-comment:${id}:`,
+        parent: { mdId: id } };
+  }
+
+  #reviewChats(kind, id, { comments = [], chat = [] }) {
+    const keys = this.#reviewKeys(kind, id);
+    return {
+      comments: comments.map((comment) => {
+        const turns = this.childTurns(keys.comment(comment.id));
+        return turns ? { ...comment, turns } : comment;
+      }),
+      chat: this.childTurns(keys.chat) ?? chat
+    };
+  }
+
+  #absorbReview(kind, id, name, comments, chat) {
+    const keys = this.#reviewKeys(kind, id);
+    const word = kind === "pdf" ? "PDF" : "文档";
+    for (const comment of comments) {
+      if (!comment.turns?.length) continue;
+      this.syncChildTurns(keys.comment(comment.id), { kind: `${kind}-comment`, ...keys.parent, commentId: comment.id,
+        title: `${word}批注追问 · ${label(comment.title || comment.quote)}` }, comment.turns);
+    }
+    if (chat?.length) this.syncChildTurns(keys.chat, { kind: `${kind}-chat`, ...keys.parent, title: `全文对话 · ${label(name, 60)}` }, chat);
+    this.#deleteChildrenByPrefix(keys.prefix, new Set(comments.map((comment) => keys.comment(comment.id))));
+    return { comments: withoutTurns(comments), chat: [] };
+  }
+
   pdfReview(hash) {
     if (!reviewHash.test(hash || "")) throw new Error("审阅记录无效。");
     const row = this.db.prepare("SELECT name, data, updated FROM pdf_reviews WHERE hash = ?").get(hash);
-    return row ? { hash, name: row.name, updated: row.updated, ...JSON.parse(row.data) } : null;
+    if (!row) return null;
+    const data = JSON.parse(row.data);
+    return { hash, name: row.name, updated: row.updated, ...data, ...this.#reviewChats("pdf", hash, data) };
   }
 
   savePdfReview(hash, name, { comments = [], chat = [], page = 1 } = {}) {
     if (!reviewHash.test(hash || "")) throw new Error("审阅记录无效。");
-    const label = requireText(name, 250).trim();
-    const data = { comments: validateComments(comments), chat: validateTurns(chat),
-      page: Number.isInteger(page) && page > 0 ? page : 1 };
+    const title = requireText(name, 250).trim();
+    const kept = this.#absorbReview("pdf", hash, title, validateComments(comments), validateTurns(chat));
+    const data = { ...kept, page: Number.isInteger(page) && page > 0 ? page : 1 };
     this.db.prepare(`INSERT INTO pdf_reviews VALUES (?, ?, ?, ?)
       ON CONFLICT(hash) DO UPDATE SET name = excluded.name, data = excluded.data, updated = excluded.updated`)
-      .run(hash, label, JSON.stringify(data), Date.now());
+      .run(hash, title, JSON.stringify(data), Date.now());
     return this.pdfReview(hash);
   }
 
   // Where the reader is; does not move the review up the list.
   pdfReviewPage(hash, page) {
-    const review = this.pdfReview(hash);
-    if (!review || !Number.isInteger(page) || page < 1) return;
-    this.db.prepare("UPDATE pdf_reviews SET data = ? WHERE hash = ?")
-      .run(JSON.stringify({ comments: review.comments, chat: review.chat, page }), hash);
+    const row = this.db.prepare("SELECT data FROM pdf_reviews WHERE hash = ?").get(hash);
+    if (!row || !Number.isInteger(page) || page < 1) return;
+    this.db.prepare("UPDATE pdf_reviews SET data = ? WHERE hash = ?").run(JSON.stringify({ ...JSON.parse(row.data), page }), hash);
   }
 
   pdfReviews() {
     return this.db.prepare("SELECT hash, name, data, updated FROM pdf_reviews ORDER BY updated DESC").all()
       .map(({ hash, name, data, updated }) => {
         const { comments = [], chat = [], page = 1 } = JSON.parse(data);
-        return { hash, name, updated, page, comments: comments.length, chat: chat.length };
+        return { hash, name, updated, page, comments: comments.length,
+          chat: (this.childTurns(childKey.pdfChat(hash)) ?? chat).length };
       });
   }
 
   // Files attached to questions inside reviews (they must not be cleaned up as unused).
   pdfReviewAttachments() {
-    return this.db.prepare("SELECT data FROM pdf_reviews").all().flatMap(({ data }) => {
-      const { comments = [], chat = [] } = JSON.parse(data);
+    return this.db.prepare("SELECT hash FROM pdf_reviews").all().flatMap(({ hash }) => {
+      const { comments = [], chat = [] } = this.pdfReview(hash);
       return [...chat, ...comments.flatMap((item) => item.turns || [])].flatMap((turn) => turn.attachments || []);
     });
   }
@@ -698,6 +1058,66 @@ export class NotebookStore {
   removePdfReview(hash) {
     if (!reviewHash.test(hash || "")) throw new Error("审阅记录无效。");
     this.db.prepare("DELETE FROM pdf_reviews WHERE hash = ?").run(hash);
+    this.deleteChildChat(childKey.pdfChat(hash));
+    this.#deleteChildrenByPrefix(`pdf-comment:${hash}:`);
+  }
+
+  // ---- Markdown documents --------------------------------------------------------------------
+  // The text lives here (saved as you type); path is the .md file it came from, written back on
+  // request. data: { comments, chat, fileHash (the file as last read or written), unsynced, mode }.
+  mdDocument(id) {
+    if (!mdId.test(id || "")) throw new Error("文档记录无效。");
+    const row = this.db.prepare("SELECT name, path, text, data, updated FROM md_documents WHERE id = ?").get(id);
+    if (!row) return null;
+    const data = JSON.parse(row.data);
+    const { fileHash = "", unsynced = false, mode = "preview" } = data;
+    const { comments, chat } = this.#reviewChats("md", id, data);
+    return { id, name: row.name, path: row.path || "", text: row.text, comments, chat, fileHash, unsynced, mode,
+      updated: row.updated };
+  }
+
+  mdDocumentByPath(path) {
+    const row = this.db.prepare("SELECT id FROM md_documents WHERE lower(path) = lower(?)").get(path);
+    return row ? this.mdDocument(row.id) : null;
+  }
+
+  saveMdDocument(id, { name, path = "", text, comments = [], chat = [], fileHash = "", unsynced = false, mode = "preview" }) {
+    if (!mdId.test(id || "")) throw new Error("文档记录无效。");
+    if (typeof text !== "string" || text.length > mdTextLimit) throw new Error("文档太大（上限 5 MB）。");
+    if (typeof path !== "string" || path.length > 2000 || (path && !isAbsolute(path))) throw new Error("文件路径无效。");
+    const title = requireText(name, 250).trim();
+    const kept = this.#absorbReview("md", id, title, validateMdComments(comments, text), validateTurns(chat));
+    const data = { ...kept, fileHash: String(fileHash).slice(0, 64),
+      unsynced: Boolean(unsynced), mode: ["preview", "split", "source"].includes(mode) ? mode : "preview" };
+    this.db.prepare(`INSERT INTO md_documents VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name = excluded.name, path = excluded.path, text = excluded.text,
+        data = excluded.data, updated = excluded.updated`)
+      .run(id, requireText(name, 250).trim(), path || null, text, JSON.stringify(data), Date.now());
+    return this.mdDocument(id);
+  }
+
+  mdDocuments() {
+    return this.db.prepare("SELECT id, name, path, data, updated FROM md_documents ORDER BY updated DESC").all()
+      .map(({ id, name, path, data, updated }) => {
+        const { comments = [], chat = [], unsynced = false } = JSON.parse(data);
+        return { id, name, path: path || "", updated, unsynced, comments: comments.length,
+          chat: (this.childTurns(childKey.mdChat(id)) ?? chat).length };
+      });
+  }
+
+  // Files attached to questions about documents (they must not be cleaned up as unused).
+  mdDocumentAttachments() {
+    return this.db.prepare("SELECT id FROM md_documents").all().flatMap(({ id }) => {
+      const { comments = [], chat = [] } = this.mdDocument(id);
+      return [...chat, ...comments.flatMap((item) => item.turns || [])].flatMap((turn) => turn.attachments || []);
+    });
+  }
+
+  removeMdDocument(id) {
+    if (!mdId.test(id || "")) throw new Error("文档记录无效。");
+    this.db.prepare("DELETE FROM md_documents WHERE id = ?").run(id);
+    this.deleteChildChat(childKey.mdChat(id));
+    this.#deleteChildrenByPrefix(`md-comment:${id}:`);
   }
 
   open(id) {
@@ -714,7 +1134,7 @@ export class NotebookStore {
     for (const turn of turns) appendMainTurn(state, { ...turn, id: randomUUID() });
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.insert.run(state.id, JSON.stringify(state), Date.now());
+      this.#insertChat(state);
       const result = this.open(state.id);
       this.db.exec("COMMIT");
       return result;
@@ -758,7 +1178,7 @@ export class NotebookStore {
     };
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.insert.run(state.id, JSON.stringify(state), Date.now());
+      this.#insertChat(state);
       const result = this.open(state.id);
       this.db.exec("COMMIT");
       return result;
@@ -773,13 +1193,38 @@ export class NotebookStore {
     return this.write(state);
   }
 
+  saveModelSession(id, memberId, record) {
+    const state = this.read(id);
+    state.modelSessions ??= {};
+    if (record) state.modelSessions[memberId] = record;
+    else delete state.modelSessions[memberId];
+    return this.write(state);
+  }
+
+  clearProfileModelSessions(profileId) {
+    for (const { id } of this.db.prepare("SELECT id FROM notebook_documents").all()) {
+      const state = this.read(id);
+      let changed = false;
+      for (const [key, record] of Object.entries(state.modelSessions || {})) {
+        if (record.profileId !== profileId) continue;
+        delete state.modelSessions[key];
+        changed = true;
+      }
+      if (changed) this.write(state);
+    }
+  }
+
   // A chat's members start as a copy of the app's default roster the first time they are changed.
   changeMembers(id, action, settings, avatarFor) {
     const state = this.read(id);
+    // The first edit gives the chat its own copy of the roster it was using.
     const roster = state.members?.length ? { members: state.members, defaultMember: state.defaultMember }
+      : state.inherited ? structuredClone(state.inherited)
       : { members: structuredClone(settings.members || []), defaultMember: settings.defaultMember };
     const result = applyMemberChange(roster, action, settings.profiles, avatarFor);
     Object.assign(state, { members: roster.members, defaultMember: roster.defaultMember });
+    // Choosing the default member by hand takes over from whoever was asked for last.
+    if (action.type === "member-default") delete state.recentMember;
     return { state: this.write(state), result };
   }
 
@@ -792,7 +1237,8 @@ export class NotebookStore {
   }
 
   // continueTurn: another group member answering the question that was just asked.
-  saveReply(branchId, question, answer, source, attachments = [], id, tools = [], { continueTurn = false } = {}) {
+  // recentMember: the member the question asked for (with @); later questions go to them by default.
+  saveReply(branchId, question, answer, source, attachments = [], id, tools = [], { continueTurn = false, recentMember } = {}) {
     const state = this.read(id);
     const turn = { id: randomUUID(), question, answer, source, ...(tools.length ? { tools } : {}) };
     if (attachments.length) turn.attachments = attachments;
@@ -803,6 +1249,7 @@ export class NotebookStore {
     } else {
       appendMainTurn(state, turn);
     }
+    if (typeof recentMember === "string" && recentMember) state.recentMember = recentMember;
     return this.write(state);
   }
 
@@ -821,7 +1268,8 @@ export class NotebookStore {
 
   write(state) {
     state.revision = (state.revision || 0) + 1;
-    this.update.run(JSON.stringify(state), Date.now(), state.id);
+    this.#absorb(state);
+    this.update.run(this.#stored(state), Date.now(), state.id);
     return state;
   }
 

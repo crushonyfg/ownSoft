@@ -3,8 +3,22 @@ import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { cjkFriendlyExtension } from "micromark-extension-cjk-friendly";
 import { decodeString } from "micromark-util-decode-string";
+import katex from "katex";
+import { mathFromMarkdown, mathSyntax } from "./math.mjs";
 
-const options = { extensions: [gfm(), cjkFriendlyExtension()], mdastExtensions: [gfmFromMarkdown()] };
+const options = { extensions: [gfm(), cjkFriendlyExtension(), mathSyntax],
+  mdastExtensions: [gfmFromMarkdown(), mathFromMarkdown] };
+
+// Typesets one formula; a formula KaTeX cannot read shows its source instead of breaking the page.
+export function renderMath(target, value, display) {
+  try {
+    katex.render(value, target, { displayMode: display, throwOnError: false, strict: "ignore", trust: false,
+      output: "htmlAndMathml" });
+  } catch {
+    target.textContent = value;
+    target.classList.add("math-error");
+  }
+}
 
 export function parseMarkdown(source) {
   return fromMarkdown(source, options);

@@ -8,6 +8,7 @@ import { createComposer } from "./chat-composer.mjs";
 import { chatTurn, toolDetails } from "./comment-chat.mjs";
 import { renderMarkdown } from "./markdown-dom.mjs";
 import { pixelAvatar } from "./pixel-avatars.mjs";
+import { embedChat } from "./embedded-chat.mjs";
 
 const get = (id) => document.getElementById(id);
 const create = (tag, className, text) => {
@@ -375,7 +376,9 @@ export function setupThreads(api, ctx) {
     body.addEventListener("scroll", () => {
       entry.stick = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
     }, { passive: true });
-    win.append(head, body, entry.composer.element);
+    // The same conversation as a full chat (edit, collapse, highlight, annotate …), switched with ⤢.
+    const full = create("div", "thread-full-chat");
+    win.append(head, body, full, entry.composer.element);
     for (const sides of ["w", "e", "s", "n", "sw", "se", "nw", "ne"]) {
       const grip = create("span", `thread-grip is-${sides}`);
       resizable(entry, grip, sides);
@@ -383,8 +386,16 @@ export function setupThreads(api, ctx) {
     }
     win.addEventListener("pointerdown", () => raise(entry), { capture: true });
     draggable(entry, head);
-    Object.assign(entry, { win, head, body });
+    Object.assign(entry, { win, head, body, full });
     raise(entry);
+  }
+
+  function showFull(entry, thread) {
+    entry.win.classList.toggle("is-full-chat", Boolean(entry.fullView));
+    if (!entry.fullView) return;
+    api.childChatId({ kind: "thread", notebookId: entry.notebookId, itemId: thread.id })
+      .then((id) => { if (entry.fullView) embedChat(entry.full, id, { label: "私聊" }); })
+      .catch((error) => ctx.notify(error.message));
   }
 
   function paintWindow(entry, thread) {
@@ -441,7 +452,18 @@ export function setupThreads(api, ctx) {
         render();
       } catch (error) { ctx.notify(error.message); }
     });
-    tools.append(layout, minimize, close);
+    const expand = button(entry.fullView ? "⤡" : "⤢", "thread-full", entry.fullView
+      ? "回到简洁视图" : "在这个窗口里切换为完整会话：编辑、收起、高亮、转批注等都能用");
+    expand.setAttribute("aria-pressed", String(Boolean(entry.fullView)));
+    expand.addEventListener("click", () => {
+      entry.fullView = !entry.fullView;
+      showFull(entry, thread);
+      render();
+    });
+    const full = button("↗", "thread-full", "在新窗口以完整会话打开");
+    full.addEventListener("click", () => api.openChildChat({ kind: "thread", notebookId: entry.notebookId, itemId: thread.id })
+      .catch((error) => ctx.notify(error.message)));
+    tools.append(expand, full, layout, minimize, close);
     entry.head.replaceChildren(who, badge, tools);
 
     const previous = entry.body.scrollTop;

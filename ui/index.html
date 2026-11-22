@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; font-src 'self' blob: data:; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>AI 笔记本</title>
+  <link rel="stylesheet" href="katex/katex.min.css">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="workspace.css">
   <link rel="stylesheet" href="features.css">
@@ -17,7 +18,7 @@
       <div class="brand"><span class="brand-icon" aria-hidden="true">▤</span>AI 笔记本</div>
       <nav aria-label="工作区视图">
         <button type="button" data-view="document" aria-current="page">正文</button>
-        <button type="button" data-view="canvas">分支画布</button>
+        <button type="button" data-view="canvas">关系图</button>
       </nav>
       <div class="account">
         <label class="account-caption" for="member-picker">默认成员</label>
@@ -81,6 +82,14 @@
         </div>
         <div id="review-list" class="review-list"></div>
       </section>
+      <section class="review-library md-library" aria-label="Markdown 文档">
+        <div class="review-library-head">
+          <h2 title="Markdown 文档">MD 文档</h2>
+          <button type="button" data-action="md-open-file" title="打开电脑上的 .md 文件，也可以把文件拖进窗口">＋ 打开</button>
+          <button type="button" data-action="md-new" title="新建一份空白文档">＋ 新建</button>
+        </div>
+        <div id="md-list" class="review-list"></div>
+      </section>
       <button type="button" class="apps-entry" data-view="apps">应用与账户</button>
       <button type="button" class="data-manage" data-action="open-data">数据管理与备份</button>
     </aside>
@@ -90,6 +99,7 @@
       <section class="document-grid" id="document-grid" aria-label="正文和批注">
         <header class="paper-title">
           <p class="eyebrow">AI NOTEBOOK · 对话与灵感</p>
+          <p id="chat-parent" class="chat-parent" hidden></p>
           <h1 id="document-title"></h1>
           <details id="notebook-origin" class="notebook-origin" hidden>
             <summary>来源批注</summary>
@@ -107,6 +117,11 @@
             <summary>主对话上下文 <span id="main-context-count"></span></summary>
             <div class="context-content">
               <div id="context-scope" class="context-scope"></div>
+              <div class="model-session-controls">
+                <label><input id="session-continue" type="checkbox" checked> 续接模型会话</label>
+                <button type="button" data-action="reset-model-session">按当前上下文重开底层会话</button>
+                <small>默认续接。修改已选消息后会自动重开；关闭开关则每轮按当前上下文新开。适用于 GPT 和 Claude。</small>
+              </div>
               <p>点消息旁的铅笔可单独编辑；公共笔记块会进入 AI 上下文。</p>
               <fieldset id="main-memory-choices" hidden><legend>带入的记忆</legend><div id="main-memory-list"></div></fieldset>
             </div>
@@ -123,7 +138,7 @@
       <aside id="side-chat" class="side-chat" aria-label="侧边对话" hidden>
         <header class="side-header">
           <div><p class="eyebrow" id="chat-provider">GPT</p><h2>侧边对话</h2></div>
-          <div class="side-header-actions"><button type="button" data-action="focus-branch" title="放大分支">放大</button><button type="button" data-action="close-chat">收起</button></div>
+          <div class="side-header-actions"><button type="button" data-action="branch-full" title="在新窗口以完整会话打开这条分支：编辑、收起、高亮、转批注等都能用">完整会话 ↗</button><button type="button" data-action="focus-branch" title="放大分支">放大</button><button type="button" data-action="close-chat">收起</button></div>
         </header>
         <div class="side-actions">
           <button type="button" data-action="locate-branch">定位原文</button>
@@ -141,6 +156,7 @@
         <div id="side-turns" class="side-turns"></div>
         <div id="side-pending" class="pending" hidden></div>
         <div id="side-composer"></div>
+        <div id="side-embedded" class="side-embedded"></div>
       </aside>
     </div>
   </main>
@@ -154,6 +170,56 @@
     <button type="button" data-action="new-chat-from-selection" class="primary">新建聊天</button>
     <button type="button" data-action="cancel-message-selection">取消</button>
   </div>
+
+  <main id="md-view" class="pdf-review-view md-view" aria-label="Markdown 文档" data-mode="preview" hidden>
+    <div class="review-toolbar md-toolbar">
+      <button type="button" data-action="close-focus" class="review-back">← 关闭文档</button>
+      <div class="review-file-info md-file-info">
+        <strong id="md-name">Markdown 文档</strong>
+        <span id="md-path" class="md-path"></span>
+        <span id="md-status" class="md-status"></span>
+      </div>
+      <div class="md-modes" role="group" aria-label="显示方式">
+        <button type="button" data-md-mode="preview" aria-pressed="true">预览</button>
+        <button type="button" data-md-mode="split" aria-pressed="false">分栏</button>
+        <button type="button" data-md-mode="source" aria-pressed="false">源码</button>
+      </div>
+      <button type="button" id="md-ask" disabled title="就选中的文字提问">问所选</button>
+      <button type="button" id="md-annotate" disabled title="给选中的文字写批注">批注所选</button>
+      <button type="button" id="md-save" class="primary" title="写回 .md 文件（Ctrl+S）">保存到文件</button>
+      <button type="button" id="md-save-as" title="保存为另一个 .md 文件（Ctrl+Shift+S）">另存为…</button>
+      <button type="button" id="md-reveal" title="在资源管理器中显示文件">打开所在文件夹</button>
+    </div>
+    <div class="md-layout">
+      <div class="md-main">
+        <textarea id="md-source" class="md-source" spellcheck="false" aria-label="Markdown 源码"></textarea>
+        <article id="md-preview" class="md-preview markdown-content" aria-label="预览"></article>
+      </div>
+      <aside class="md-side" aria-label="批注和对话">
+        <div class="md-side-top">
+        <section id="md-selection-chat" class="review-card review-selection-chat" aria-label="选区对话" hidden>
+          <header><h2>所选文字</h2><button type="button" id="md-selection-close" aria-label="关闭选区对话">×</button></header>
+          <div id="md-selection-preview"></div>
+          <div id="md-selection-conversation"></div>
+        </section>
+        <div class="md-side-head"><h2>批注</h2><span id="md-count"></span></div>
+        <div id="md-comment-list"></div>
+        </div>
+        <div class="md-side-chat">
+          <div class="md-side-head md-chat-head">
+            <button type="button" id="md-chat-back" class="review-chat-back" hidden title="回到整篇文档的对话">← 全文对话</button>
+            <h2 id="md-chat-title">全文对话</h2><span id="md-chat-count"></span>
+            <button type="button" id="md-chat-full" class="review-chat-full" title="在新窗口以完整会话打开">完整会话 ↗</button>
+          </div>
+          <div id="md-document-conversation" class="md-embedded-chat"></div>
+        </div>
+      </aside>
+    </div>
+    <div id="md-tools" class="selection-tools" role="group" aria-label="对选中文字操作" hidden>
+      <button type="button" class="primary" id="md-tools-ask">问 AI</button>
+      <button type="button" id="md-tools-note">批注</button>
+    </div>
+  </main>
 
   <main id="pdf-view" class="pdf-review-view" aria-label="PDF 审阅" hidden>
     <div class="review-toolbar">
@@ -216,9 +282,13 @@
         </div>
         <div class="splitter is-rows" id="review-side-split" aria-label="调整批注和全文对话的高度"></div>
         <div id="review-chat-pane" class="review-pane review-chat-pane">
-          <header class="review-chat-head"><h2>全文对话</h2><span id="review-chat-count"></span></header>
-          <p class="muted">和群聊成员讨论整份 PDF，PDF 正文和已有批注会一起发给回答的成员。</p>
-          <div id="review-document-conversation"></div>
+          <header class="review-chat-head">
+            <button type="button" id="review-chat-back" class="review-chat-back" hidden title="回到整份 PDF 的对话">← 全文对话</button>
+            <h2 id="review-chat-title">全文对话</h2><span id="review-chat-count"></span>
+            <button type="button" id="review-chat-full" class="review-chat-full" title="在新窗口以完整会话打开">完整会话 ↗</button>
+          </header>
+          <p class="muted" id="review-chat-hint">和群聊成员讨论整份 PDF：PDF 正文和已有批注会一起发给回答的成员。</p>
+          <div id="review-document-conversation" class="review-embedded-chat"></div>
         </div>
       </aside>
     </div>
@@ -234,20 +304,33 @@
     <p class="muted apps-footnote">GPT 显示 ChatGPT 订阅的 5 小时和每周额度。Claude Code 不提供剩余百分比，只在回答时附带限额状态和重置时间。用量是这个应用里统计的回答次数和 token（由各 CLI 报告）。</p>
   </main>
 
-  <main id="canvas-view" class="canvas-view" hidden>
-    <header class="canvas-header">
-      <div><p class="eyebrow">工作笔记</p><h1>分支画布</h1></div>
-      <p id="branch-count" class="muted"></p>
-    </header>
-    <div class="canvas-scroll">
-      <div id="canvas-board" class="canvas-board">
-        <svg id="canvas-links" aria-hidden="true"></svg>
-        <div id="canvas-nodes"></div>
+  <main id="canvas-view" class="canvas-view relation-view" hidden>
+    <header class="canvas-header relation-header">
+      <div><p class="eyebrow">这段会话派生出的对话</p><h1>关系图</h1><p id="relation-count" class="muted"></p></div>
+      <div class="relation-tools">
+        <button type="button" id="relation-expand">全部收起</button>
+        <div class="md-modes" role="group" aria-label="显示方式">
+          <button type="button" data-relation-mode="graph" aria-pressed="true">图</button>
+          <button type="button" data-relation-mode="tree" aria-pressed="false">树</button>
+        </div>
       </div>
-    </div>
-    <div class="canvas-detail" id="canvas-detail" hidden>
-      <div><strong id="branch-title"></strong><p class="muted" id="branch-quote"></p></div>
-      <button type="button" class="primary" data-action="open-branch">打开侧边对话</button>
+    </header>
+    <div class="relation-body">
+      <div class="canvas-scroll relation-scroll">
+        <div id="relation-board" class="canvas-board relation-board">
+          <svg id="relation-links" class="relation-links" aria-hidden="true"></svg>
+          <div id="relation-nodes"></div>
+        </div>
+        <div id="relation-outline" class="relation-outline" hidden></div>
+      </div>
+      <aside id="relation-detail" class="relation-detail" hidden>
+        <header class="relation-detail-head">
+          <div><p class="eyebrow" id="relation-kind"></p><h2 id="relation-title"></h2><p id="relation-quote" class="muted"></p></div>
+          <button type="button" id="relation-close" title="关闭">×</button>
+        </header>
+        <div id="relation-actions" class="relation-actions"></div>
+        <div id="relation-chat" class="relation-chat"></div>
+      </aside>
     </div>
   </main>
     </div>
@@ -262,7 +345,11 @@
       <div id="note-focus-source" class="note-focus-message"></div>
     </div>
     <div class="splitter is-columns" id="note-focus-split" aria-label="调整原文和批注的宽度"></div>
-    <div id="note-focus-card" class="note-focus-card"></div>
+    <div id="note-focus-card" class="note-focus-card">
+      <div id="note-focus-note" class="note-focus-note"></div>
+      <div class="note-focus-chat-head"><h2>追问 · 完整会话</h2><button type="button" data-action="note-focus-full" title="在新窗口打开这段追问">完整会话 ↗</button></div>
+      <div id="note-focus-chat" class="note-focus-chat"></div>
+    </div>
   </section>
 
   <div id="thread-windows" class="thread-windows" aria-label="私聊小窗"></div>

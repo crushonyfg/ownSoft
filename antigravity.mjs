@@ -157,6 +157,7 @@ export class Antigravity {
           const parameters = step.tool_info?.parameters;
           tool({ id: `agy:${step.step_index}`, title: name,
             detail: parameters ? Object.values(parameters).filter((value) => typeof value === "string").join(" ").slice(0, 300) : "",
+            ...(step.state === "DONE" ? { result: step.tool_info } : {}),
             status: step.tool_info?.error ? "failed" : step.state === "DONE" ? "done" : "running" });
         }
       });

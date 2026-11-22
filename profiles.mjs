@@ -25,6 +25,22 @@ function migrate(state) {
   return true;
 }
 
+// The default roster has a member for every account (gpt1, claude1, gemini1 …). Done once for
+// settings saved before that, so a member removed on purpose later is not brought back.
+function fillAccountMembers(state) {
+  if (state.accountMembers) return false;
+  for (const profile of state.profiles) {
+    if (state.members.some((item) => item.profileId === profile.id)) continue;
+    try {
+      addMember(state, profile, {}, providerAvatar(state.appearance, profile.provider));
+    } catch {
+      break;
+    }
+  }
+  state.accountMembers = true;
+  return true;
+}
+
 export class Profiles {
   constructor(db) {
     db.exec("CREATE TABLE IF NOT EXISTS model_settings (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL)");
@@ -41,11 +57,11 @@ export class Profiles {
     this.update = db.prepare("UPDATE model_settings SET data = ? WHERE id = 1");
     const state = JSON.parse(this.select.get().data);
     const migrated = migrate(state);
-    // Gemini (through Antigravity) arrived later: its local login appears as an account; members
-    // for it come from 导入全部账户.
+    // Gemini (through Antigravity) arrived later: its local login appears as an account.
     const addedGemini = !state.profiles.some((item) => item.provider === "gemini");
     if (addedGemini) state.profiles.push({ id: "gemini-native", name: "本机账户", provider: "gemini", native: true, model: "", efforts: {} });
-    if (migrated || addedGemini) this.update.run(JSON.stringify(state));
+    const filled = fillAccountMembers(state);
+    if (migrated || addedGemini || filled) this.update.run(JSON.stringify(state));
   }
 
   read() {

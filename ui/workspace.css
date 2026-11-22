@@ -34,7 +34,7 @@
 .notebook-library button:hover { background: var(--surface); }
 .notebook-library button[aria-current] { background: var(--tint); color: var(--accent); }
 .new-notebook { font-weight: 650; }
-body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon { display: none; }
+body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon, body[data-view="md"] .ribbon { display: none; }
 
 .pdf-review-view {
   height: calc(100vh - var(--ribbon-height)); min-height: 300px; display: flex; flex-direction: column;
@@ -159,7 +159,7 @@ body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon { display: none; }
 .focus-bar button { background: var(--paper); color: var(--text); }
 body[data-focus="note"] .document-layout, body[data-focus="branch"] .document-layout { z-index: auto; }
 .focus-bar span, .focus-bar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-body[data-focus="branch"] .side-chat { position: fixed; z-index: 60; inset: 56px max(20px, 7vw) 22px max(20px, 7vw); max-height: none; width: auto; padding: clamp(18px, 3vw, 36px); border-radius: 14px; box-shadow: 0 18px 70px #0005; }
+body[data-focus="branch"] .side-chat { position: fixed; z-index: 60; inset: 56px max(20px, 7vw) 22px max(20px, 7vw); max-height: none; width: auto; align-self: stretch; justify-self: stretch; padding: clamp(18px, 3vw, 36px); border-radius: 14px; box-shadow: 0 18px 70px #0005; }
 body[data-focus="branch"] .side-chat > * { width: min(100%, 1050px); margin-inline: auto; }
 body[data-focus="branch"] .side-chat .side-turns { width: min(100%, 1050px); }
 body[data-focus="pdf"] .pdf-review-view { position: fixed; z-index: 60; inset: 56px 18px 16px 44px; height: auto; min-height: 0; background: var(--paper); border-radius: 13px; overflow: hidden; box-shadow: 0 18px 70px #0005; }
@@ -261,6 +261,10 @@ body[data-focus="pdf"] .review-back { display: inline-flex; }
 .member-presets button { min-height: 24px; padding: 1px 9px; border-radius: 12px; font-size: 12px; }
 .context-scope { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; font-size: 12.5px; }
 .context-scope button { min-height: 26px; padding: 2px 10px; font-size: 12px; }
+.model-session-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.model-session-controls label { font-weight: 600; cursor: pointer; }
+.model-session-controls button { min-height: 26px; padding: 2px 8px; font-size: 12px; }
+.model-session-controls small { flex-basis: 100%; color: var(--muted); }
 #main-context.is-chosen > summary { color: var(--accent); }
 .chat-row.out-of-context .paper-block { opacity: .45; filter: grayscale(.4); }
 .chat-row.out-of-context:hover .paper-block { opacity: .8; }

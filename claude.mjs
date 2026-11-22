@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -13,6 +14,13 @@ export function executable() {
   const found = paths.map((path) => join(path, "claude.exe")).find(existsSync);
   if (!found) throw new Error("找不到官方 Claude Code CLI。");
   return found;
+}
+
+// A tool call's arguments in a line, e.g. "C:\…\paper.txt 120 80" for Read(file_path, offset, limit).
+export function toolDetail(input) {
+  if (!input || typeof input !== "object") return "";
+  return Object.values(input).filter((value) => typeof value === "string" || typeof value === "number")
+    .map(String).join(" ").replace(/\s+/g, " ").slice(0, 300);
 }
 
 const effortLevels = ["low", "medium", "high", "xhigh", "max"];
@@ -105,18 +113,23 @@ export class Claude {
   }
 
   async answer(input, { signal, update, activity = () => {}, tool = () => {}, usage = () => {}, limits = () => {},
-    model, effort, cwd }) {
-    const prompt = buildPrompt(input);
+    model, effort, cwd, resumeSession, persistSession = false }) {
+    const resumed = Boolean(resumeSession && persistSession);
+    const prompt = buildPrompt(resumed ? { ...input, history: [], context: "", memories: [],
+      files: input.files.filter((file) => file.current) } : input);
     if (!(await this.account()).signedIn) throw new Error("请先用 Claude 订阅登录 Claude Code。");
     signal.throwIfAborted();
     if (!modelCatalog.some((item) => item.id === (model || ""))) throw new Error("未知的 Claude 模型。");
     if (effort && !effortLevels.includes(effort)) throw new Error("此 Claude Effort 不可用。");
     const args = [
       "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-      "--no-session-persistence", "--strict-mcp-config", "--tools", "default",
+      "--strict-mcp-config", "--tools", "default",
       "--setting-sources", "", "--permission-mode", "auto",
       "--settings", '{"disableAllHooks":true}'
     ];
+    const sessionId = resumed ? resumeSession : randomUUID();
+    if (persistSession) args.push(resumed ? "--resume" : "--session-id", sessionId);
+    else args.push("--no-session-persistence");
     if (model) args.push("--model", model);
     if (effort) args.push("--effort", effort);
     // Attached files are read from the app's attachment folders.
@@ -177,10 +190,16 @@ export class Claude {
           tool({ id: block.id || `claude:${event.event.index}`, title: block.name,
             detail: "", status: "running" });
         }
+        // The finished tool call carries its arguments (which file, which pages, what was searched).
+        if (event.type === "assistant") {
+          for (const item of event.message?.content || []) {
+            if (item.type === "tool_use" && item.id) tool({ id: item.id, title: item.name, detail: toolDetail(item.input) });
+          }
+        }
         if (event.type === "user") {
           for (const item of event.message?.content || []) {
             if (item.type === "tool_result" && item.tool_use_id) {
-              tool({ id: item.tool_use_id, status: item.is_error ? "failed" : "done" });
+              tool({ id: item.tool_use_id, status: item.is_error ? "failed" : "done", result: item.content });
             }
           }
         }
@@ -200,7 +219,8 @@ export class Claude {
         else if (code !== 0 || result?.is_error) {
           reject(new Error(result?.result || result?.errors?.join(" ") || stderr.trim() || "Claude 生成失败。"));
         } else if ((result?.result || output).trim()) {
-          resolve((result?.result || output).trim());
+          resolve({ text: (result?.result || output).trim(),
+            sessionId: persistSession ? result?.session_id || sessionId : undefined });
         } else {
           reject(new Error("Claude 没有返回文本。"));
         }
