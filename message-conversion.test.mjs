@@ -90,5 +90,14 @@ test("messages can become annotations in ancestor and descendant chats by messag
     assert.equal(store.read(childId).notes.find((item) => item.id === down.noteId).sourceNotebookId, root.id);
     store.undoChatAnnotation(childId, down.noteId);
     assert.equal(store.read(root.id).blocks.find((block) => block.id === rootReply.id).text, "root answer");
+    const withPdf = store.change({ type: "add-note-images", refs: [{
+      id: "9a17c65e-0c77-4bc2-a852-1f091906aefa", name: "guided bo.pdf", extension: ".pdf"
+    }] }, root.id);
+    const pdfBlock = withPdf.blocks.find((block) => block.noteType === "pdf");
+    assert.equal(store.annotationMessage(root.id, pdfBlock.id).blocks[0].noteType, "pdf");
+    const onPdfCard = store.moveMessageToChatAnnotation(childId, [childReply.id], root.id,
+      { blockId: pdfBlock.id, start: 0, quote: "guided bo.pdf" });
+    assert.equal(store.read(root.id).notes.find((item) => item.id === onPdfCard.noteId).anchor.blockId, pdfBlock.id);
+    store.undoChatAnnotation(root.id, onPdfCard.noteId);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

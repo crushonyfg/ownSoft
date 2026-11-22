@@ -1276,6 +1276,7 @@ export class NotebookStore {
     return messageGroups(state.blocks).flatMap((group) => {
       const live = group.blocks.filter((block) => !block.removed && block.text?.trim());
       return live.length ? [{ id: group.blocks[0].id, kind: group.kind,
+        ...(live[0].noteType ? { noteType: live[0].noteType } : {}),
         preview: live.map((block) => block.text).join(" ").replace(/\s+/g, " ").slice(0, 180) }] : [];
     });
   }
@@ -1285,7 +1286,7 @@ export class NotebookStore {
     const group = messageGroups(state.blocks).find((item) => item.blocks.some((block) => block.id === messageId));
     if (!group) throw new Error("找不到这个消息 ID。");
     const blocks = group.blocks.filter((block) => !block.removed && block.text?.trim())
-      .map(({ id, text }) => ({ id, text }));
+      .map(({ id, text, noteType }) => ({ id, text, ...(noteType ? { noteType } : {}) }));
     if (!blocks.length) throw new Error("这条消息已移除，不能作为批注锚点。");
     return { notebookId, messageId: group.blocks[0].id, kind: group.kind, blocks };
   }

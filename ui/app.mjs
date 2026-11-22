@@ -1143,7 +1143,7 @@ function renderDocument() {
     } else if (editingThis) {
       contentBody.append(inlineEditor(author));
     } else {
-      if (pdfNote) contentBody.append(pdfNoteCard(pdfNote));
+      if (pdfNote) contentBody.append(pdfNoteCard(pdfNote, attached.filter((note) => note.anchor.blockId === pdfNote.id)));
       if (mdNote) contentBody.append(mdNoteCard(mdNote));
       if (image) {
         const picture = node("img", "shared-image");
@@ -1154,8 +1154,8 @@ function renderDocument() {
       }
       for (const block of visible) {
         // A PDF note's card already names the file; a caption of its own still shows (and can be annotated).
-        const bareName = (block === pdfNote && block.text === block.attachments?.[0]?.name ||
-          block === mdNote && block.text === mdNote.text) && !attached.some((note) => note.anchor.blockId === block.id);
+        const bareName = block === pdfNote && block.text === block.attachments?.[0]?.name ||
+          block === mdNote && block.text === mdNote.text && !attached.some((note) => note.anchor.blockId === block.id);
         const element = kind === "user" ? node("div", "body-text") :
           node("div", "body-text markdown-content");
         element.dataset.blockId = block.id;
@@ -1401,7 +1401,7 @@ function mdNoteCard(block) {
   return card;
 }
 
-function pdfNoteCard(block) {
+function pdfNoteCard(block, notes = []) {
   const ref = block.attachments?.[0];
   const card = node("div", "pdf-note");
   card.dataset.blockId = block.id;
@@ -1425,6 +1425,12 @@ function pdfNoteCard(block) {
   const title = node("strong", "pdf-note-name", ref?.name || block.text);
   title.title = ref?.name || "";
   side.append(title, node("p", "pdf-note-stats"), node("div", "pdf-note-summary"));
+  if (notes.length) {
+    const badge = button(`批注 ${notes.length}`, "focus-note", "pdf-note-annotation-count");
+    badge.dataset.noteId = notes[0].id;
+    badge.title = "打开这份 PDF 卡片上的批注";
+    side.append(badge);
+  }
   const cached = ref && reviewSummaries.get(ref.id);
   fillPdfSummary(side, block, cached);
   if (ref && !cached) {

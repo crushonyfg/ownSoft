@@ -108,7 +108,9 @@ body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon, body[data-view="m
 .annotation-target-browser { display: grid; grid-template-columns: minmax(200px, 33%) minmax(0, 1fr); gap: 12px; min-height: min(56vh, 500px); }
 #annotation-target-tree, #annotation-target-messages { min-height: 100px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--chrome); }
 #annotation-target-tree { max-height: 56vh; }
-.annotation-target-content { display: grid; grid-template-rows: auto minmax(100px, 1fr) auto minmax(100px, 1fr) auto; gap: 7px; min-width: 0; }
+.annotation-target-content { display: grid; grid-template-rows: auto minmax(100px, 1fr) auto minmax(100px, 1fr); grid-auto-rows: auto; gap: 7px; min-width: 0; }
+.annotation-target-error { color: var(--danger); font-size: 12px; }
+.annotation-target-hint { color: var(--muted); font-size: 12px; }
 .annotation-target-content h3 { margin: 0; }
 .annotation-target-content label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
 .annotation-target-content select, .annotation-target-content textarea { width: 100%; }

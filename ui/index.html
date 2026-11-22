@@ -388,6 +388,8 @@
         <div id="annotation-target-messages" aria-label="可作为批注位置的消息"></div>
         <label>消息段落 <select id="annotation-target-block" disabled></select></label>
         <textarea id="annotation-target-text" readonly rows="6" aria-label="选择要挂靠的原文"></textarea>
+        <p id="annotation-target-hint" class="annotation-target-hint" hidden>这是一份 PDF 笔记。批注会挂在这张 PDF 卡片上，无需选中文件名。</p>
+        <p id="annotation-target-error" class="annotation-target-error" role="alert" hidden></p>
         <div class="annotation-target-actions">
           <button type="button" id="annotation-target-start" disabled>挂到消息开头</button>
           <button type="button" id="annotation-target-selection" class="primary" disabled>挂到选中文字</button>

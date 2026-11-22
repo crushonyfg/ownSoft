@@ -19,7 +19,15 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
     item.textContent = label;
     return item;
   };
-  const attempt = (task) => Promise.resolve().then(task).catch((error) => notify(error.message));
+  const showError = (message) => {
+    const error = get("annotation-target-error");
+    error.textContent = message;
+    error.hidden = !message;
+  };
+  const attempt = (task) => Promise.resolve().then(task).catch((error) => {
+    if (dialog.open) showError(error.message);
+    else notify(error.message);
+  });
   const kindLabel = (kind) => ({ chat: "会话", note: "批注追问", branch: "分支", thread: "私聊",
     "pdf-chat": "PDF 全文", "pdf-comment": "PDF 批注", "md-chat": "文档全文", "md-comment": "文档批注" })[kind] || "会话";
 
@@ -63,7 +71,7 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
     tree.replaceChildren(...rows);
   }
 
-  function renderBlocks() {
+  function renderBlocks(preferredId) {
     blockPicker.replaceChildren(...(message?.blocks || []).map((block, index) => {
       const option = document.createElement("option");
       option.value = block.id;
@@ -71,9 +79,18 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
       return option;
     }));
     blockPicker.disabled = !message;
-    text.value = message?.blocks[0]?.text || "";
+    if (message) blockPicker.value = message.blocks.some((item) => item.id === preferredId)
+      ? preferredId : message.blocks[0].id;
+    const block = message?.blocks.find((item) => item.id === blockPicker.value);
+    const pdf = block?.noteType === "pdf";
+    text.value = block?.text || "";
+    get("annotation-target-start").hidden = pdf;
     get("annotation-target-start").disabled = !message;
-    get("annotation-target-selection").disabled = !message;
+    const selected = get("annotation-target-selection");
+    selected.textContent = pdf ? "挂到 PDF 本身" : "挂到选中文字";
+    selected.disabled = !message;
+    get("annotation-target-hint").hidden = !pdf;
+    showError("");
   }
 
   async function selectChat(id) {
@@ -92,7 +109,7 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
     if (!dialog.open || targetId !== id) return;
     const choices = messages.filter((entry) => !(id === source.notebookId && entry.id === source.messageId));
     list.replaceChildren(...choices.map((entry) => {
-      const row = button(`${entry.kind === "question" ? "你" : entry.kind === "reply" ? "成员" : "笔记"} · ${entry.preview}`,
+      const row = button(`${entry.noteType === "pdf" ? "PDF 笔记" : entry.kind === "question" ? "你" : entry.kind === "reply" ? "成员" : "笔记"} · ${entry.preview}`,
         "annotation-message-item");
       row.dataset.messageId = entry.id;
       row.title = `消息 ID：${entry.id}`;
@@ -107,11 +124,7 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
     if (!dialog.open || targetId !== chatId) return;
     if (chatId === source.notebookId && found.messageId === source.messageId) throw new Error("批注不能挂在它自己这条消息上。");
     message = found;
-    renderBlocks();
-    if (blockId && found.blocks.some((block) => block.id === blockId)) {
-      blockPicker.value = blockId;
-      text.value = found.blocks.find((block) => block.id === blockId).text;
-    }
+    renderBlocks(blockId);
     for (const item of list.querySelectorAll(".annotation-message-item")) {
       item.setAttribute("aria-current", String(item.dataset.messageId === found.messageId));
     }
@@ -166,10 +179,17 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
   });
   get("annotation-target-search").addEventListener("input", renderTree);
   blockPicker.addEventListener("change", () => {
-    text.value = message?.blocks.find((block) => block.id === blockPicker.value)?.text || "";
+    const block = message?.blocks.find((item) => item.id === blockPicker.value);
+    const pdf = block?.noteType === "pdf";
+    text.value = block?.text || "";
+    get("annotation-target-start").hidden = pdf;
+    get("annotation-target-selection").textContent = pdf ? "挂到 PDF 本身" : "挂到选中文字";
+    get("annotation-target-hint").hidden = !pdf;
+    showError("");
   });
   get("annotation-target-start").addEventListener("click", () => attempt(() => commit(false)));
-  get("annotation-target-selection").addEventListener("click", () => attempt(() => commit(true)));
+  get("annotation-target-selection").addEventListener("click", () => attempt(() =>
+    commit(message?.blocks.find((item) => item.id === blockPicker.value)?.noteType !== "pdf")));
   dialog.addEventListener("close", () => { source = null; message = null; });
 
   return {
@@ -178,6 +198,7 @@ export function setupAnnotationTargets(api, { notify, onCurrent, onPdf, onMove }
       targetId = null;
       message = null;
       get("annotation-target-id").value = "";
+      showError("");
       get("annotation-target-search").value = "";
       get("annotation-target-pdf").hidden = !item.pdfHash;
       get("annotation-target-heading").textContent = "选择批注位置";
