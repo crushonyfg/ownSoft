@@ -101,9 +101,25 @@ body[data-view="pdf"] .ribbon, body[data-view="apps"] .ribbon, body[data-view="m
 .review-comments .review-pane > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 7px; }
 .review-comment-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
 .review-comment-actions button { min-height: 27px; padding: 3px 7px; font-size: 12px; }
+.annotation-target-dialog { width: min(1060px, calc(100% - 24px)); max-height: min(90vh, 900px); }
+.annotation-target-shortcuts { display: flex; flex-wrap: wrap; align-items: end; gap: 7px; margin: 12px 0; }
+.annotation-target-shortcuts label { display: grid; gap: 3px; flex: 1 1 220px; font-size: 12px; color: var(--muted); }
+.annotation-target-shortcuts input { width: 100%; min-height: 32px; }
+.annotation-target-browser { display: grid; grid-template-columns: minmax(200px, 33%) minmax(0, 1fr); gap: 12px; min-height: min(56vh, 500px); }
+#annotation-target-tree, #annotation-target-messages { min-height: 100px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--chrome); }
+#annotation-target-tree { max-height: 56vh; }
+.annotation-target-content { display: grid; grid-template-rows: auto minmax(100px, 1fr) auto minmax(100px, 1fr) auto; gap: 7px; min-width: 0; }
+.annotation-target-content h3 { margin: 0; }
+.annotation-target-content label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+.annotation-target-content select, .annotation-target-content textarea { width: 100%; }
+.annotation-tree-item, .annotation-message-item { display: block; width: 100%; min-height: 30px; overflow: hidden; border: 0; border-radius: 0; background: transparent; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-tree-item[aria-current="true"], .annotation-message-item[aria-current="true"] { background: var(--tint); color: var(--accent); }
+.annotation-target-actions { display: flex; justify-content: flex-end; gap: 7px; }
+@media (max-width: 740px) { .annotation-target-browser { grid-template-columns: 1fr; } #annotation-target-tree { max-height: 150px; } }
 .review-comments > header p { margin-top: 2px; color: var(--muted); font-size: 12px; }
 .review-comment-nav { display: flex; gap: 5px; margin-block: 9px; }
 .review-comment-nav button, .review-card footer button { min-height: 26px; font-size: 12px; }
+.review-card footer .review-undo { min-width: 27px; padding: 2px 6px; font-size: 19px; line-height: 1; }
 #review-comment-list { display: grid; gap: 8px; }
 .review-card { min-width: 0; background: var(--paper); border: 1px solid var(--line); border-radius: 7px; padding: 10px; }
 .review-card.active { border-color: var(--accent); box-shadow: inset 2px 0 var(--accent); }

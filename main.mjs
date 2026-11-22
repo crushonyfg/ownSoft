@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, net, protocol, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, shell } from "electron";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
@@ -39,6 +39,7 @@ const files = new Map([
   ["/app.mjs", "ui/app.mjs"], ["/notebook.mjs", "notebook.mjs"], ["/context-budget.mjs", "context-budget.mjs"],
   ["/markdown-dom.mjs", "ui/markdown-dom.mjs"],
   ["/internal-links.mjs", "ui/internal-links.mjs"],
+  ["/annotation-targets.mjs", "ui/annotation-targets.mjs"],
   ["/pdf-review-ui.mjs", "ui/pdf-review-ui.mjs"], ["/workspace.css", "ui/workspace.css"],
   ["/comment-chat.mjs", "ui/comment-chat.mjs"], ["/pixel-avatars.mjs", "ui/pixel-avatars.mjs"],
   ["/chat-composer.mjs", "ui/chat-composer.mjs"], ["/threads-ui.mjs", "ui/threads-ui.mjs"],
@@ -94,7 +95,7 @@ function handle(name, operation) {
     }
     try {
       const data = await operation(payload, owner);
-      if (/^(?:notebook:change|note:(?:add-images|add-md)|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
+      if (/^(?:notebook:change|note:(?:add-images|add-md)|annotation:(?:move|undo)|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
         for (const frame of frames()) if (frame !== event.senderFrame) {
           try { frame.send("library:changed"); } catch {}
         }
@@ -994,6 +995,18 @@ if (!app.requestSingleInstanceLock()) {
     await moveOldReviews();
     // An embedded chat names its chat; the page itself shows its window's chat.
     handle("notebook:read", (id, owner) => store.read(typeof id === "string" && id ? id : owner.notebookId));
+    handle("clipboard:copy-message-id", (id) => {
+      store.resolveAnnotationMessage(id);
+      clipboard.writeText(id);
+      return true;
+    });
+    handle("annotation:targets", () => store.annotationTargets());
+    handle("annotation:messages", (id) => store.annotationMessages(id));
+    handle("annotation:message", ({ notebookId, messageId }) => store.annotationMessage(notebookId, messageId));
+    handle("annotation:resolve", (messageId) => store.resolveAnnotationMessage(messageId));
+    handle("annotation:move", ({ sourceId, ids, targetId, anchor }) =>
+      store.moveMessageToChatAnnotation(sourceId, ids, targetId, anchor));
+    handle("annotation:undo", ({ targetId, noteId }) => store.undoChatAnnotation(targetId, noteId));
     handle("library:read", () => store.library());
     handle("library:open", (id, owner) => {
       const result = store.open(id);

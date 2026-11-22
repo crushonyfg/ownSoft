@@ -13,6 +13,7 @@ test("model tools search and trace chat, save Markdown, and edit annotations", (
       [], undefined, [{ id: "read-1", title: "Read", detail: "第 3 页", result: "样本 A 的证据", status: "done" }]);
     const question = chat.blocks.find((block) => block.kind === "question");
     const answer = chat.blocks.find((block) => block.kind === "reply");
+    assert.equal(tools.resolveMessage({ messageId: answer.id }).notebookId, chat.id);
     assert.equal(tools.list({ query: "样本 A" })[0].id, chat.id);
     assert.match(tools.readChat({ notebookId: chat.id }).messages.find((item) => item.kind === "question").text, /为什么选择/);
     assert.match(tools.readMessage({ notebookId: chat.id, messageId: answer.id }).text, /样本 A 的证据/);

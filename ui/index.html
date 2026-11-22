@@ -360,6 +360,7 @@
     <span>选中任意消息里的一段文字后点「挂在这里」，或直接点一条消息挂在它开头。</span>
     <button type="button" data-action="pick-selection" class="primary">挂在选中文字上</button>
     <button type="button" data-action="pick-nearby">挂在相邻消息</button>
+    <button type="button" data-action="pick-other">其他会话 / 消息 ID…</button>
     <button type="button" data-action="pick-cancel">取消</button>
   </div>
   <div id="selection-tools" class="selection-tools" role="group" aria-label="对选中文字操作" hidden>
@@ -369,6 +370,31 @@
   </div>
   <div id="status" class="status" role="status" hidden></div>
   <div id="context-menu" class="context-menu" role="menu" hidden></div>
+  <dialog id="annotation-target-dialog" class="appearance-dialog annotation-target-dialog" aria-labelledby="annotation-target-heading">
+    <div class="appearance-heading"><div><p class="eyebrow">MOVE TO ANNOTATION</p><h2 id="annotation-target-heading">选择批注位置</h2></div>
+      <button type="button" id="annotation-target-close" aria-label="关闭">×</button></div>
+    <p class="muted">可以浏览上层或下层会话，选择消息及其中一段文字；也可以粘贴消息 ID 直接定位。</p>
+    <div class="annotation-target-shortcuts">
+      <button type="button" id="annotation-target-current">在当前会话选文字</button>
+      <button type="button" id="annotation-target-pdf" hidden>挂到 PDF 原文</button>
+      <label>筛选会话 <input id="annotation-target-search" type="search" placeholder="标题、PDF 或批注" autocomplete="off"></label>
+      <label>消息 ID <input id="annotation-target-id" type="text" placeholder="粘贴消息 ID" autocomplete="off" spellcheck="false"></label>
+      <button type="button" id="annotation-target-find">定位 ID</button>
+    </div>
+    <div class="annotation-target-browser">
+      <nav id="annotation-target-tree" aria-label="会话层级"></nav>
+      <section class="annotation-target-content">
+        <h3 id="annotation-target-title">选择会话</h3>
+        <div id="annotation-target-messages" aria-label="可作为批注位置的消息"></div>
+        <label>消息段落 <select id="annotation-target-block" disabled></select></label>
+        <textarea id="annotation-target-text" readonly rows="6" aria-label="选择要挂靠的原文"></textarea>
+        <div class="annotation-target-actions">
+          <button type="button" id="annotation-target-start" disabled>挂到消息开头</button>
+          <button type="button" id="annotation-target-selection" class="primary" disabled>挂到选中文字</button>
+        </div>
+      </section>
+    </div>
+  </dialog>
   <dialog id="appearance-dialog" class="appearance-dialog">
     <div class="appearance-heading"><div><p class="eyebrow">PERSONALIZE</p><h2>装扮你的笔记本</h2></div>
       <button type="button" data-action="close-appearance" aria-label="关闭外观设置">×</button></div>

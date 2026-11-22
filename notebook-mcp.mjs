@@ -15,6 +15,8 @@ const tools = [
     inputSchema: schema({ notebookId: str, cursor: num, limit: num }, ["notebookId"]), method: "readChat", readOnly: true },
   { name: "read_message", description: "Read one full chat message and its saved tool results, using offset to continue.",
     inputSchema: schema({ notebookId: str, messageId: str, offset: num, limit: num }, ["notebookId", "messageId"]), method: "readMessage", readOnly: true },
+  { name: "resolve_message_id", description: "Find which chat and message contain a given message or paragraph ID.",
+    inputSchema: schema({ messageId: str }, ["messageId"]), method: "resolveMessage", readOnly: true },
   { name: "read_markdown", description: "Read a Markdown document and its annotations in chunks. Follow nextOffset for more text.",
     inputSchema: schema({ mdId: str, offset: num, limit: num }, ["mdId"]), method: "readMarkdown", readOnly: true },
   { name: "read_annotation", description: "Read one full annotation and find its follow-up chat ID, if it has one.",
@@ -35,7 +37,13 @@ const tools = [
       blockId: str, page: num, quote: str, text: str, title: str }, ["kind", "text"]), method: "annotate" },
   { name: "edit_annotation", description: "Change the text of a chat, Markdown, or PDF annotation by ID.",
     inputSchema: schema({ kind: { enum: ["chat", "md", "pdf"] }, notebookId: str, mdId: str, hash: str,
-      annotationId: str, text: str }, ["kind", "annotationId", "text"]), method: "editAnnotation" }
+      annotationId: str, text: str }, ["kind", "annotationId", "text"]), method: "editAnnotation" },
+  { name: "move_message_to_annotation", description: "Move a complete message from one chat to an annotation anchored in another chat. First resolve the target message ID and read its text to choose an exact quote and offset.",
+    inputSchema: schema({ sourceId: str, messageIds: { type: "array", items: str, minItems: 1 }, targetId: str,
+      anchor: schema({ blockId: str, start: num, quote: str }, ["blockId", "start", "quote"]) },
+    ["sourceId", "messageIds", "targetId", "anchor"]), method: "moveMessageToAnnotation" },
+  { name: "undo_message_annotation", description: "Undo a message-to-annotation conversion and restore the source message. The annotation must have no follow-up chat turns.",
+    inputSchema: schema({ targetId: str, noteId: str }, ["targetId", "noteId"]), method: "undoMessageAnnotation" }
 ];
 const byName = new Map(tools.map((tool) => [tool.name, tool]));
 const line = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);

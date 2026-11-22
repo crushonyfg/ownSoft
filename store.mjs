@@ -1253,6 +1253,98 @@ export class NotebookStore {
     return this.write(state);
   }
 
+  annotationTargets() {
+    const rows = this.db.prepare("SELECT id, snapshot, updated FROM notebook_documents ORDER BY updated DESC").all();
+    const chats = rows.map(({ id, snapshot, updated }) => {
+      const { title, parent } = JSON.parse(snapshot);
+      return { id, title, parent, updated };
+    });
+    const pdfChats = new Map(chats.filter((chat) => chat.parent?.kind === "pdf-chat")
+      .map((chat) => [chat.parent.hash, chat.id]));
+    const mdChats = new Map(chats.filter((chat) => chat.parent?.kind === "md-chat")
+      .map((chat) => [chat.parent.mdId, chat.id]));
+    const ids = new Set(chats.map((chat) => chat.id));
+    return chats.map(({ id, title, parent, updated }) => {
+      const parentId = parent?.notebookId || (parent?.kind === "pdf-comment" ? pdfChats.get(parent.hash) : null) ||
+        (parent?.kind === "md-comment" ? mdChats.get(parent.mdId) : null) || parent?.rosterNotebookId || null;
+      return { id, title, kind: parent?.kind || "chat", parentId: parentId !== id && ids.has(parentId) ? parentId : null, updated };
+    });
+  }
+
+  annotationMessages(notebookId) {
+    const state = this.read(notebookId);
+    return messageGroups(state.blocks).flatMap((group) => {
+      const live = group.blocks.filter((block) => !block.removed && block.text?.trim());
+      return live.length ? [{ id: group.blocks[0].id, kind: group.kind,
+        preview: live.map((block) => block.text).join(" ").replace(/\s+/g, " ").slice(0, 180) }] : [];
+    });
+  }
+
+  annotationMessage(notebookId, messageId) {
+    const state = this.read(notebookId);
+    const group = messageGroups(state.blocks).find((item) => item.blocks.some((block) => block.id === messageId));
+    if (!group) throw new Error("找不到这个消息 ID。");
+    const blocks = group.blocks.filter((block) => !block.removed && block.text?.trim())
+      .map(({ id, text }) => ({ id, text }));
+    if (!blocks.length) throw new Error("这条消息已移除，不能作为批注锚点。");
+    return { notebookId, messageId: group.blocks[0].id, kind: group.kind, blocks };
+  }
+
+  resolveAnnotationMessage(messageId) {
+    if (typeof messageId !== "string" || messageId.length < 1 || messageId.length > 80) throw new Error("消息 ID 无效。");
+    for (const { id } of this.db.prepare("SELECT id FROM notebook_documents ORDER BY updated DESC").all()) {
+      const state = this.read(id);
+      if (!state.blocks.some((block) => block.id === messageId)) continue;
+      return { title: state.title, ...this.annotationMessage(id, messageId) };
+    }
+    throw new Error("找不到这个消息 ID。");
+  }
+
+  moveMessageToChatAnnotation(sourceId, ids, targetId, anchor) {
+    if (sourceId === targetId) {
+      const state = this.change({ type: "message-to-annotation", ids, anchor }, sourceId);
+      return { sourceId, targetId, noteId: state.notes.at(-1).id };
+    }
+    const source = this.read(sourceId);
+    const target = this.read(targetId);
+    const checked = checkedAnchor(target, anchor);
+    const blocks = messageBlocks(source, ids);
+    const { text, author, attachments, speaker, sourceMessageId } = convertedMessage(source, blocks);
+    const note = { id: randomUUID(), anchor: checked, text: requireText(text, 160_000), author,
+      pinned: false, sourceNotebookId: sourceId, sourceMessageId,
+      ...(attachments.length ? { attachments } : {}), ...(speaker ? { source: speaker } : {}) };
+    target.notes.push(note);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.write(source);
+      this.write(target);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return { sourceId, targetId, noteId: note.id };
+  }
+
+  undoChatAnnotation(targetId, noteId) {
+    const target = this.read(targetId);
+    const note = find(target.notes, noteId);
+    const sourceId = note.sourceNotebookId || targetId;
+    if (sourceId === targetId) return this.change({ type: "undo-message-to-annotation", id: noteId }, targetId);
+    if (!note.sourceMessageId) throw new Error("原消息已无法撤销。");
+    if (note.turns?.length) throw new Error("这条批注已有追问，请先处理追问再撤销。");
+    const source = this.read(sourceId);
+    restoreConvertedMessage(source, note.sourceMessageId);
+    target.notes = target.notes.filter((item) => item.id !== noteId);
+    if (target.context?.notes) target.context.notes = target.context.notes.filter((id) => id !== noteId);
+    target.mainMemoryIds = (target.mainMemoryIds || []).filter((id) => id !== noteId);
+    for (const branch of target.branches) branch.memoryIds = branch.memoryIds.filter((id) => id !== noteId);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.write(source);
+      this.write(target);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return target;
+  }
+
   addMarkdownBlock(notebookId, mdId, afterId) {
     const doc = this.mdDocument(mdId);
     if (!doc) throw new Error("Markdown 文档不存在。");

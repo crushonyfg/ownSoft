@@ -162,7 +162,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       const actions = make("footer");
       const revise = make("button", "", "编辑");
       const remove = make("button", "", "删除");
-      const undo = item.movedFrom ? make("button", "", "撤销转批注") : null;
+      const undo = item.movedFrom ? make("button", "review-undo", "↶") : null;
       revise.type = remove.type = "button";
       revise.addEventListener("click", () => edit({
         heading: item.title || "编辑批注", reference: item.quote, text: item.text, limit: 9000,
@@ -187,6 +187,8 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       });
       if (undo) {
         undo.type = "button";
+        undo.title = "撤销转批注，恢复原消息";
+        undo.setAttribute("aria-label", "撤销转批注，恢复原消息");
         undo.addEventListener("click", () => attempt(async () => {
           if (commentChats.pending(key)) throw new Error("请先停止这条批注的追问。");
           if (dirty) await save();

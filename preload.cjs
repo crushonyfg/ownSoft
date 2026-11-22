@@ -28,6 +28,14 @@ async function fileEntries(files) {
 
 contextBridge.exposeInMainWorld("notebook", {
   read: (id) => invoke("notebook:read", id),
+  copyMessageId: (id) => invoke("clipboard:copy-message-id", id),
+  annotationTargets: () => invoke("annotation:targets"),
+  annotationMessages: (id) => invoke("annotation:messages", id),
+  annotationMessage: (notebookId, messageId) => invoke("annotation:message", { notebookId, messageId }),
+  resolveAnnotationMessage: (messageId) => invoke("annotation:resolve", messageId),
+  moveMessageToChatAnnotation: (sourceId, ids, targetId, anchor) =>
+    invoke("annotation:move", { sourceId, ids, targetId, anchor }),
+  undoChatAnnotation: (targetId, noteId) => invoke("annotation:undo", { targetId, noteId }),
   library: () => invoke("library:read"),
   openNotebook: (id) => invoke("library:open", id),
   openNotebookWindow: (id) => invoke("window:open", id),

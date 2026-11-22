@@ -159,6 +159,21 @@ export class NotebookTools {
       revision: state.revision };
   }
 
+  resolveMessage({ messageId } = {}) {
+    const found = this.store.resolveAnnotationMessage(messageId);
+    return { notebookId: found.notebookId, messageId: found.messageId, title: found.title,
+      blocks: found.blocks.map(({ id, text }) => ({ id, preview: excerpt(text, 300) })) };
+  }
+
+  moveMessageToAnnotation({ sourceId, messageIds, targetId, anchor } = {}) {
+    return this.store.moveMessageToChatAnnotation(sourceId, messageIds, targetId, anchor);
+  }
+
+  undoMessageAnnotation({ targetId, noteId } = {}) {
+    this.store.undoChatAnnotation(targetId, noteId);
+    return { targetId, noteId, restored: true };
+  }
+
   annotate({ kind = "chat", notebookId, mdId, hash, blockId, page, quote, text, title = "" } = {}) {
     requireText(text, 20_000);
     if (kind === "chat") {

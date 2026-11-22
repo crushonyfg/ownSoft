@@ -62,3 +62,33 @@ test("a PDF chat message can hang on selected PDF text and restore on undo", () 
     assert.equal(store.read(chatId).blocks.find((block) => block.id === reply.id).text, "PDF 分析结果");
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("messages can become annotations in ancestor and descendant chats by message ID", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ownsoft-cross-annotation-"));
+  const store = new NotebookStore(join(dir, "notebook.sqlite"));
+  try {
+    const root = store.saveReply(null, "root question", "root answer", undefined);
+    const rootQuestion = root.blocks.find((block) => block.kind === "question");
+    const rootReply = root.blocks.find((block) => block.kind === "reply");
+    const withNote = store.change({ type: "add-note", anchor: { blockId: rootQuestion.id, start: 0, quote: "root" },
+      text: "follow-up" }, root.id);
+    const childId = store.openChildChat({ kind: "note", notebookId: root.id, itemId: withNote.notes[0].id });
+    const child = store.saveReply(null, "child question", "child answer", undefined, [], childId);
+    const childQuestion = child.blocks.find((block) => block.kind === "question");
+    const childReply = child.blocks.find((block) => block.kind === "reply");
+    assert.equal(store.annotationTargets().find((item) => item.id === childId).parentId, root.id);
+    assert.equal(store.resolveAnnotationMessage(childReply.id).notebookId, childId);
+    assert.equal(store.annotationMessage(childId, childReply.id).blocks[0].text, "child answer");
+    const up = store.moveMessageToChatAnnotation(childId, [childReply.id], root.id,
+      { blockId: rootQuestion.id, start: 0, quote: "root" });
+    assert.equal(store.read(root.id).notes.find((item) => item.id === up.noteId).sourceNotebookId, childId);
+    assert.equal(store.read(childId).blocks.find((block) => block.id === childReply.id).removed, true);
+    store.undoChatAnnotation(root.id, up.noteId);
+    assert.equal(store.read(childId).blocks.find((block) => block.id === childReply.id).text, "child answer");
+    const down = store.moveMessageToChatAnnotation(root.id, [rootReply.id], childId,
+      { blockId: childQuestion.id, start: 0, quote: "child" });
+    assert.equal(store.read(childId).notes.find((item) => item.id === down.noteId).sourceNotebookId, root.id);
+    store.undoChatAnnotation(childId, down.noteId);
+    assert.equal(store.read(root.id).blocks.find((block) => block.id === rootReply.id).text, "root answer");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});

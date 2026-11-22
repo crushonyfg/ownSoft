@@ -3,6 +3,7 @@ import { renderMarkdown, selectionSource, sourceRange } from "./markdown-dom.mjs
 import { setupPdfReview } from "./pdf-review-ui.mjs";
 import { setupMdReview } from "./md-review-ui.mjs";
 import { attachSlashLinks } from "./internal-links.mjs";
+import { setupAnnotationTargets } from "./annotation-targets.mjs";
 import { embedChat } from "./embedded-chat.mjs";
 import { setupCommentChats, toolDetails as renderToolDetails } from "./comment-chat.mjs";
 import { createComposer } from "./chat-composer.mjs";
@@ -35,7 +36,8 @@ const iconPaths = {
   fold: "M6 9l6 6 6-6", edit: "M12 20h9 M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z",
   trash: "M4 7h16 M10 11v6 M14 11v6 M6 7l1 13h10l1-13 M9 7V4h6v3",
   note: "M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6",
-  margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5",
+  margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5", undo: "M9 14 4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-2",
+  copy: "M8 4h11v14H8z M5 7H4v14h11v-1",
   pin: "M8 3h8l-1 5 3 3v2H6v-2l3-3z M12 13v8",
   popout: "M14 4h6v6 M20 4l-8 8 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"
 };
@@ -319,18 +321,7 @@ function markedText(element, block, notes, focusId = null) {
 
 let annotationPick = null;
 
-async function startAnnotationPick(messageId, ids) {
-  if (state.parent?.kind === "pdf-chat") {
-    const request = { hash: state.parent.hash, notebookId: state.id, ids };
-    if (embedId && window.parent !== window) {
-      window.parent.postMessage({ type: "ownsoft:pdf-message-annotation", ...request }, location.origin);
-    } else {
-      await openSavedReview(request.hash);
-      pdfReview.beginMessageConversion(request);
-    }
-    say("请在 PDF 左侧选中文字，再点「挂选中为批注」。");
-    return;
-  }
+function startAnnotationPick(messageId, ids) {
   annotationPick = { messageId, ids };
   window.getSelection()?.removeAllRanges();
   document.body.classList.add("picking-annotation");
@@ -338,6 +329,32 @@ async function startAnnotationPick(messageId, ids) {
   get("annotation-pick-bar").hidden = false;
   say("选一个位置挂这条批注：选中任意消息里的一段文字后点「挂在这里」，或直接点一条消息。");
 }
+
+async function beginPdfAnnotation(source) {
+  const request = { hash: source.pdfHash, notebookId: source.notebookId, ids: source.ids };
+  if (embedId && window.parent !== window) {
+    window.parent.postMessage({ type: "ownsoft:pdf-message-annotation", ...request }, location.origin);
+  } else {
+    await openSavedReview(request.hash);
+    pdfReview.beginMessageConversion(request);
+  }
+  say("请在 PDF 左侧选中文字，再点「挂选中为批注」。");
+}
+
+const annotationChooser = setupAnnotationTargets(api, { notify: say,
+  onCurrent: (source) => startAnnotationPick(source.messageId, source.ids),
+  onPdf: beginPdfAnnotation,
+  onMove: async ({ source, targetId, anchor, targetTitle }) => {
+    if (source.notebookId === targetId) await change({ type: "message-to-annotation", ids: source.ids, anchor });
+    else {
+      await api.moveMessageToChatAnnotation(source.notebookId, source.ids, targetId, anchor);
+      accept(await api.read(state.id));
+      void api.openNotebookWindow(targetId).catch((error) => say(error.message));
+    }
+    renderDocument();
+    say(`已转为「${targetTitle}」中的批注。`);
+  }
+});
 
 function stopAnnotationPick() {
   annotationPick = null;
@@ -395,8 +412,7 @@ function annotation(note, { focused = false } = {}) {
   const edit = iconButton("edit", "edit-note", "编辑批注");
   const remove = iconButton("trash", "delete-note", "删除批注");
   const undo = note.sourceMessageId || annotationOriginalKind(note)
-    ? button("撤销转批注", "undo-note-conversion", "annotation-undo") : null;
-  if (undo) undo.title = note.sourceMessageId ? "恢复原消息" : "恢复旧版批注中的消息内容";
+    ? iconButton("undo", "undo-note-conversion", "撤销转批注，恢复原消息") : null;
   const expand = button("↗", "focus-note", "note-expand");
   expand.title = "放大批注和追问";
   expand.setAttribute("aria-label", "放大批注和追问");
@@ -1097,7 +1113,9 @@ function renderDocument() {
     edit.dataset.messageId = messageId;
     const remove = iconButton("trash", "delete-message", "移除这条消息");
     remove.dataset.messageId = messageId;
-    meta.append(collapse, edit, remove);
+    const copyId = iconButton("copy", "copy-message-id", "复制消息 ID，用于跨会话挂批注");
+    copyId.dataset.messageId = messageId;
+    meta.append(collapse, edit, remove, copyId);
     // Any message can become a note block (questions too) or move out of the chat into an annotation.
     if (visible.length) {
       if (kind !== "note") {
@@ -1112,7 +1130,7 @@ function renderDocument() {
         privately.disabled = editingThis;
         meta.append(privately);
       }
-      const toMargin = iconButton("margin", "message-to-annotation", "转为页边批注（移出主对话）");
+      const toMargin = iconButton("margin", "message-to-annotation", "转为批注，选择本会话或其他层级的位置");
       toMargin.dataset.messageId = messageId;
       toMargin.disabled = editingThis;
       meta.append(toMargin);
@@ -2193,9 +2211,14 @@ async function handleAction(control) {
       const id = control.dataset.messageId;
       const group = messageGroups(state.blocks).find((item) => item.blocks[0].id === id);
       if (!group) throw new Error("消息已改变，请重试。");
-      await startAnnotationPick(id, group.blocks.map((block) => block.id));
+      await annotationChooser.open({ notebookId: state.id, messageId: id,
+        ids: group.blocks.map((block) => block.id), pdfHash: state.parent?.kind === "pdf-chat" ? state.parent.hash : null });
       break;
     }
+    case "copy-message-id":
+      await api.copyMessageId(control.dataset.messageId);
+      say("已复制消息 ID。可在转批注窗口中粘贴定位。");
+      break;
     case "pick-selection":
       if (!annotationPick) break;
       await finishAnnotationPick(anchor(true));
@@ -2207,6 +2230,14 @@ async function handleAction(control) {
     case "pick-cancel":
       stopAnnotationPick();
       break;
+    case "pick-other": {
+      if (!annotationPick) break;
+      const source = { notebookId: state.id, messageId: annotationPick.messageId, ids: annotationPick.ids,
+        pdfHash: state.parent?.kind === "pdf-chat" ? state.parent.hash : null };
+      stopAnnotationPick();
+      await annotationChooser.open(source);
+      break;
+    }
     case "new-shared-block":
       startNewNote(insertionPoint());
       break;
@@ -2738,7 +2769,8 @@ async function handleAction(control) {
     case "undo-note-conversion":
       if (!note) return;
       if (action === "delete-note" && !window.confirm("删除这条批注及其追问？")) break;
-      await change({ type: action === "undo-note-conversion" ? "undo-message-to-annotation" : action, id: note.id });
+      if (action === "undo-note-conversion") accept(await api.undoChatAnnotation(state.id, note.id));
+      else await change({ type: action, id: note.id });
       if (action === "delete-note" || action === "undo-note-conversion") {
         if (focusedNoteId === note.id) closeFocus();
         commentChats.forget(`note:${state.id}:${note.id}`);
