@@ -116,11 +116,13 @@ export class Antigravity {
     // Headless agy takes text only; images are named in the prompt but not sent.
     const skipped = input.images?.length || 0;
     const prompt = buildPrompt({ ...input, images: [] }) +
-      (skipped ? `\n\n（另有 ${skipped} 张图片未发送：Antigravity CLI 的无界面模式不支持图片输入。）` : "");
+      (skipped ? `\n\n（本次随附的 ${skipped} 张图片没有直接发送：Antigravity CLI 的无界面模式不支持图片输入。需要时请按上面「附件文件」里的路径打开图片。）` : "");
     if (effort && !effortLevels.includes(effort)) throw new Error("此 Gemini Effort 不可用。");
     const args = ["-p", "", "--input-format", "stream-json", "--output-format", "stream-json"];
     if (model) args.push("--model", model);
     if (effort) args.push("--effort", effort);
+    // Attached files (images included, which headless agy cannot be sent) are read from these folders.
+    for (const dir of input.dirs || []) args.push("--add-dir", dir);
     signal.throwIfAborted();
     return new Promise((resolve, reject) => {
       const child = spawn(agyExecutable(), args, { cwd: cwd || this.directory, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
@@ -155,6 +157,7 @@ export class Antigravity {
           const parameters = step.tool_info?.parameters;
           tool({ id: `agy:${step.step_index}`, title: name,
             detail: parameters ? Object.values(parameters).filter((value) => typeof value === "string").join(" ").slice(0, 300) : "",
+            ...(step.state === "DONE" ? { result: step.tool_info } : {}),
             status: step.tool_info?.error ? "failed" : step.state === "DONE" ? "done" : "running" });
         }
       });

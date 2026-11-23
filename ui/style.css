@@ -251,7 +251,7 @@ button.attachment-chip { min-height: 25px; text-align: left; }
 }
 .selection-tools button { min-height: 28px; padding-block: 3px; font-size: 12px; }
 .status {
-  position: fixed; z-index: 8; bottom: 15px; right: 16px; max-width: min(550px, calc(100% - 32px));
+  position: fixed; z-index: 90; bottom: 15px; right: 16px; max-width: min(550px, calc(100% - 32px));
   padding: 10px 14px; border: 1px solid var(--line); border-radius: 7px;
   background: var(--paper); color: var(--text); box-shadow: 0 3px 12px var(--shadow); overflow-wrap: anywhere;
 }
@@ -419,6 +419,10 @@ body[data-chat-background="night"] :is(.paper-title, .paper-end) { background: #
 .tool-status.is-running { color: #ba8234; animation: typing-pulse 1.2s infinite; }
 .tool-status.is-failed { color: var(--danger); }
 .tool-detail { color: var(--muted); overflow-wrap: anywhere; }
+.tool-result { flex-basis: 100%; margin: 2px 0 4px 20px; min-width: 0; }
+.tool-result summary { font-weight: 400; color: var(--muted); }
+.tool-result pre { max-height: 240px; overflow: auto; margin: 5px 0; padding: 8px;
+  border-radius: 7px; background: var(--paper); white-space: pre-wrap; overflow-wrap: anywhere; }
 .note-symbol { flex: none; display: grid; place-items: center; width: 42px; height: 42px;
   border-radius: 13px; background: #fffbd8; color: #b68d47; box-shadow: 0 6px 16px #967b4422; }
 .document-grid.notes-hidden { grid-template-columns: minmax(0, 1fr); }

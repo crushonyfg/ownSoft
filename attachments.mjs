@@ -1,13 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, open, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, extname, join } from "node:path";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
 
 export const maxFilesPerMessage = 6;
-const maxFileSize = 20 * 1024 * 1024;
-const maxPdfPages = 60;
-const maxPdfText = 100_000;
+const maxFileSize = 100 * 1024 * 1024;
+// Images sent along with one question (the ones attached to it, or a box cut from a PDF page).
 const maxImages = 12;
 const extensions = new Set([".pdf", ".png", ".jpg", ".jpeg", ".webp"]);
 const storedName = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}\.(?:pdf|png|jpg|jpeg|webp)$/i;
@@ -16,11 +15,20 @@ const pdfAssets = dirname(require.resolve("pdfjs-dist/package.json"));
 const assetDirectory = (name) => join(pdfAssets, name).replaceAll("\\", "/") + "/";
 let pdfModule;
 
+const turnFiles = (turns = []) => turns.flatMap((turn) => turn.attachments || []);
+
+// Every file a notebook still uses: messages, note blocks (PDF notes and their review chats),
+// annotations and their follow-ups, side branches and side conversations with single members.
 export function allAttachmentRefs(state) {
   return [
-    ...state.blocks.flatMap((block) => block.attachments || []),
-    ...state.branches.flatMap((branch) => branch.turns.flatMap((turn) => turn.attachments || [])),
-    ...(state.notes || []).flatMap((note) => note.attachments || [])
+    // An edited image keeps its original (to edit again or restore).
+    ...state.blocks.flatMap((block) => [...(block.attachments || []), ...(block.imageEdit?.original ? [block.imageEdit.original] : []),
+      ...turnFiles(block.review?.chat), ...(block.review?.comments || []).flatMap((item) => turnFiles(item.turns))]),
+    ...state.branches.flatMap((branch) => turnFiles(branch.turns)),
+    ...(state.notes || []).flatMap((note) => [...(note.attachments || []), ...turnFiles(note.turns)]),
+    // Deleted annotations are kept for undo, with their files.
+    ...(state.removedNotes || []).flatMap((note) => note.attachments || []),
+    ...(state.threads || []).flatMap((thread) => turnFiles(thread.turns))
   ];
 }
 
@@ -36,7 +44,7 @@ async function readCandidate(path, name) {
   try {
     const status = await file.stat();
     if (!status.isFile() || status.size < 1 || status.size > maxFileSize) {
-      throw new Error(`「${name}」需要是 20 MB 以内的非空文件。`);
+      throw new Error(`「${name}」需要是 100 MB 以内的非空文件。`);
     }
     const data = Buffer.alloc(status.size);
     let offset = 0;
@@ -63,7 +71,9 @@ async function resizeImage(data) {
   return canvas.encode("png");
 }
 
-export async function readPdf(data, name, { signal, addImage, addText }) {
+// Reads a PDF's text page by page; render: also draw pages with little text (scans) as images.
+// Returns the page count.
+export async function readPdf(data, name, { signal, addImage = async () => {}, addText, render = true, maxPages = 5000 }) {
   pdfModule ||= import("pdfjs-dist/legacy/build/pdf.mjs");
   const { getDocument } = await pdfModule;
   const task = getDocument({
@@ -74,8 +84,8 @@ export async function readPdf(data, name, { signal, addImage, addText }) {
   });
   try {
     const pdf = await task.promise;
-    if (pdf.numPages > maxPdfPages) {
-      throw new Error(`「${name}」超过 ${maxPdfPages} 页，请先拆分后再添加。`);
+    if (pdf.numPages > maxPages) {
+      throw new Error(`「${name}」超过 ${maxPages} 页，请先拆分后再添加。`);
     }
     for (let number = 1; number <= pdf.numPages; number += 1) {
       signal.throwIfAborted();
@@ -85,7 +95,7 @@ export async function readPdf(data, name, { signal, addImage, addText }) {
         const text = content.items.map((item) => typeof item.str === "string"
           ? item.str + (item.hasEOL ? "\n" : " ") : "").join("").trim();
         if (text) addText({ file: name, page: number, text });
-        if (pdf.numPages <= 3 || text.replace(/\s/g, "").length < 35) {
+        if (render && (pdf.numPages <= 3 || text.replace(/\s/g, "").length < 35)) {
           const box = page.getViewport({ scale: 1 });
           const viewport = page.getViewport({ scale: Math.min(3, 1700 / Math.max(box.width, box.height)) });
           const canvas = createCanvas(Math.max(1, Math.ceil(viewport.width)), Math.max(1, Math.ceil(viewport.height)));
@@ -96,6 +106,7 @@ export async function readPdf(data, name, { signal, addImage, addText }) {
         page.cleanup();
       }
     }
+    return pdf.numPages;
   } catch (error) {
     if (error.name === "PasswordException") throw new Error(`「${name}」有密码保护，请先解锁。`);
     if (error.name === "InvalidPDFException") throw new Error(`无法读取「${name}」，请检查 PDF 是否完整。`);
@@ -110,10 +121,13 @@ export class AttachmentStore {
 
   // Saved files that no message uses any more go to `trash` instead of being deleted, so restoring
   // an older backup of the notes can bring them back.
-  constructor(directory, work, trash = join(dirname(directory), "attachments-trash")) {
+  constructor(directory, work, trash = join(dirname(directory), "attachments-trash"),
+    texts = join(dirname(directory), "attachment-text")) {
     this.directory = directory;
     this.work = work;
     this.trash = trash;
+    // Text pulled out of PDFs once (page by page), and PDFs from open reviews, for models to read.
+    this.texts = texts;
   }
 
   async #discard(name) {
@@ -121,7 +135,7 @@ export class AttachmentStore {
   }
 
   async initialize(saved) {
-    await Promise.all([this.directory, this.work, this.trash].map((dir) => mkdir(dir, { recursive: true })));
+    await Promise.all([this.directory, this.work, this.trash, this.texts].map((dir) => mkdir(dir, { recursive: true })));
     const keep = new Set(saved.map((ref) => ref.id + ref.extension));
     const present = new Set((await readdir(this.directory)).filter((name) => storedName.test(name)));
     // Files referenced again (for example after restoring a backup) come back from the trash.
@@ -160,7 +174,7 @@ export class AttachmentStore {
       try {
         if (!extensions.has(extension)) throw new Error(`「${name}」不是支持的 PDF、PNG、JPG 或 WebP 文件。`);
         if (inline && (entry.data.byteLength < 1 || entry.data.byteLength > maxFileSize)) {
-          throw new Error(`「${name}」需要是 20 MB 以内的非空文件。`);
+          throw new Error(`「${name}」需要是 100 MB 以内的非空文件。`);
         }
         const data = inline ? Buffer.from(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength)
           : await readCandidate(entry, name);
@@ -206,31 +220,47 @@ export class AttachmentStore {
     await Promise.allSettled(refs.filter((ref) => !keep.has(ref.id)).map((ref) => this.#discard(basename(this.path(ref)))));
   }
 
-  async prepare(refs, signal, screenshot) {
-    const documents = [];
+  // A PDF's text, extracted once and kept next to the attachments, marked page by page.
+  async #pdfText(path, key, name, signal) {
+    const text = join(this.texts, `${key}.txt`);
+    const info = join(this.texts, `${key}.json`);
+    try {
+      return { textPath: text, ...JSON.parse(await readFile(info, "utf8")) };
+    } catch {}
+    const parts = [];
+    let chars = 0;
+    const pages = await readPdf(await readFile(path), name, { signal, render: false,
+      addText: (entry) => {
+        chars += entry.text.length;
+        parts.push(`===== 第 ${entry.page} 页 =====\n${entry.text}`);
+      } });
+    await writeFile(text, parts.join("\n\n") || "（这份 PDF 没有可抽取的文字，可能是扫描版。）", "utf8");
+    const summary = { pages, chars };
+    await writeFile(info, JSON.stringify(summary), "utf8");
+    return { textPath: text, ...summary };
+  }
+
+  /**
+   * What a model gets for a question: the files as paths it can open with its own tools (with each
+   * PDF's extracted text), and the images it should see right away (those attached to this very
+   * question, and a box cut from a PDF page). Nothing is size-limited by the app; the model reads
+   * what it needs.
+   *  refs: every file the conversation uses; inline: the ones attached to this question;
+   *  screenshot: { bytes, name } of a PDF box; pdf: { bytes, name } of a PDF open for review.
+   */
+  async provide(refs, signal, { inline = [], screenshot, pdf } = {}) {
     const images = [];
+    const files = [];
     const temp = [];
-    let textLength = 0;
-    let imageBytes = 0;
     const dispose = () => Promise.allSettled(temp.map((path) => unlink(path)));
     const addImage = async (data, name) => {
-      if (images.length >= maxImages) {
-        throw new Error(`每次最多读取 ${maxImages} 张图片或扫描页，请拆分文件或开启新分支。`);
-      }
-      imageBytes += data.length;
-      if (imageBytes > 18 * 1024 * 1024) {
-        throw new Error("图片内容太大，请缩小图片、拆分 PDF 或开启新分支。");
-      }
+      if (images.length >= maxImages) return;
       const path = join(this.work, randomUUID() + ".png");
       temp.push(path);
       await writeFile(path, data, { flag: "wx" });
       images.push({ path, name });
     };
-    const addText = (entry) => {
-      textLength += entry.text.length;
-      if (textLength > maxPdfText) throw new Error("附件正文太长，请拆分 PDF 或开启新分支。");
-      documents.push(entry);
-    };
+    const now = new Set(inline.map((ref) => ref.id));
     try {
       if (screenshot) {
         signal.throwIfAborted();
@@ -240,26 +270,38 @@ export class AttachmentStore {
         }
         await addImage(await resizeImage(data), screenshot.name);
       }
+      if (pdf) {
+        // A review's PDF may live inside an .aipdf; a copy named by its content is kept to be read.
+        const bytes = Buffer.from(pdf.bytes);
+        const key = `review-${createHash("sha256").update(bytes).digest("hex").slice(0, 32)}`;
+        const path = join(this.texts, `${key}.pdf`);
+        await access(path).catch(() => writeFile(path, bytes));
+        files.push({ name: pdf.name, kind: "pdf", path, subject: true, ...(await this.#pdfText(path, key, pdf.name, signal)) });
+      }
       for (const ref of new Map(refs.map((item) => [item.id, item])).values()) {
         signal.throwIfAborted();
-        let data;
+        const path = this.path(ref);
         try {
-          data = await readFile(this.path(ref));
+          await access(path);
         } catch {
-          throw new Error(`找不到本地附件「${ref.name}」。`);
+          files.push({ name: ref.name, kind: "missing" });
+          continue;
         }
-        if (ref.extension === ".pdf") await readPdf(data, ref.name, { signal, addImage, addText });
-        else {
-          let image;
+        if (ref.extension === ".pdf") {
+          files.push({ name: ref.name, kind: "pdf", path, current: now.has(ref.id),
+            ...(await this.#pdfText(path, ref.id, ref.name, signal)) });
+          continue;
+        }
+        files.push({ name: ref.name, kind: "image", path, current: now.has(ref.id) });
+        if (now.has(ref.id)) {
           try {
-            image = await resizeImage(data);
+            await addImage(await resizeImage(await readFile(path)), ref.name);
           } catch {
             throw new Error(`无法处理图片「${ref.name}」，请检查文件或缩小尺寸。`);
           }
-          await addImage(image, ref.name);
         }
       }
-      return { documents, images, dispose };
+      return { files, images, dirs: [this.directory, this.texts], dispose };
     } catch (error) {
       await dispose();
       throw error;

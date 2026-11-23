@@ -3,6 +3,8 @@ import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
+import { maxPromptChars } from "./context-budget.mjs";
+import { codexMcpConfig } from "./mcp-configuration.mjs";
 
 export function codexExecutable() {
   if (process.platform !== "win32") return "codex";
@@ -43,9 +45,9 @@ function desktopCodex() {
 
 const options = [
   'model_provider="openai"', 'forced_login_method="chatgpt"',
-  'web_search="live"', 'history.persistence="none"',
+  'web_search="live"',
   "features.apps=false", "features.plugins=false", "features.hooks=false",
-  "features.memories=false", "skills.include_instructions=false", "mcp_servers={}"
+  "features.memories=false", "skills.include_instructions=false"
 ].flatMap((option) => ["-c", option]);
 
 // In the group chat each model is told who it is and who else is present; earlier answers in the
@@ -62,19 +64,37 @@ function personaSection({ name, provider, others = [], round = [], role = "" }) 
     "直接回答，不要在开头写自己的名字。"].filter(Boolean).join("");
 }
 
-export function buildPrompt({ context, memories, history, question, documents = [], images = [], persona, peers = "" }) {
+// Attached files are listed with their paths; the model opens what it needs with its own tools.
+function filesSection(files) {
+  const lines = files.map((file, index) => {
+    if (file.kind === "missing") return `${index + 1}. 「${file.name}」：本地文件已不存在`;
+    if (file.kind === "image") {
+      return `${index + 1}. 图片「${file.name}」：${file.path}${file.current ? "（本次提问随附，已直接发给你看）" : ""}`;
+    }
+    return [`${index + 1}. PDF「${file.name}」，${file.pages} 页${file.subject ? "（这次对话讨论的就是这份 PDF）" : ""}` +
+      `${file.current ? "（本次提问随附）" : ""}`,
+      `   原文件：${file.path}`,
+      `   抽取好的文字（按页标注「===== 第 N 页 =====」，约 ${file.chars} 字）：${file.textPath}`].join("\n");
+  });
+  return "附件文件（在本机。需要时用你的读文件工具打开，可以只读相关的页；能直接读 PDF 的可以读原文件看图表，" +
+    "否则读抽取好的文字。回答时说明依据的是第几页。）\n" + lines.join("\n");
+}
+
+export function buildPrompt({ context, memories, history, question, files = [], images = [], persona, peers = "", notebookId }) {
   const sections = [];
   if (persona) sections.push("你的身份\n" + personaSection(persona));
+  if (notebookId && persona?.provider !== "Gemini") sections.push(`当前 AI 笔记本会话 ID：${notebookId}。` +
+    "需要追查局部引句以外的消息、工具依据或关联 Markdown 时，按需调用 ownsoft 的 search_library、read_chat、read_message、read_markdown；不要猜测未读取的内容。" +
+    "用户要求保存成果或修改批注时，可用相应的 ownsoft 写入工具。笔记内的 ownsoft://chat/… 和 ownsoft://md/… 链接可按 ID 继续追溯。");
   if (history.length) sections.push("已有对话\n" + JSON.stringify(history));
   if (peers) sections.push("本轮其他成员已经回答了同一个问题\n" + peers);
   if (context) sections.push("笔记上下文\n" + context);
   if (memories.length) sections.push("我选入的记忆\n" + memories.map((text, index) => `${index + 1}. ${text}`).join("\n"));
-  if (documents.length) sections.push("PDF 正文\n" + documents.map(({ file, page, text }) =>
-    `「${file}」第 ${page} 页\n${text}`).join("\n\n"));
+  if (files.length) sections.push(filesSection(files));
   if (images.length) sections.push("随附图片的顺序\n" + images.map(({ name }, index) => `${index + 1}. ${name}`).join("\n"));
   const text = sections.length ? [...sections, "本次提问\n" + question].join("\n\n") : question;
-  if (text.length > 160_000) {
-    throw new Error("本次上下文太长。请开启新分支，或减少引用的内容。");
+  if (text.length > maxPromptChars) {
+    throw new Error("这次的对话历史太长。请开启新分支，或在「主对话上下文」里只选需要的消息。");
   }
   return text;
 }
@@ -92,11 +112,12 @@ export class Codex extends EventEmitter {
   #requestId = 0;
   #pending = new Map();
 
-  constructor(directory, configDirectory, approve) {
+  constructor(directory, configDirectory, approve, dataDir) {
     super();
     this.directory = directory;
     this.configDirectory = configDirectory;
     this.approve = approve;
+    this.dataDir = dataDir;
   }
 
   async connect() {
@@ -106,7 +127,8 @@ export class Codex extends EventEmitter {
         ...(this.configDirectory ? ["CODEX_HOME", "CODEX_SQLITE_HOME"] : [])].includes(key.toUpperCase())));
     if (this.configDirectory) env.CODEX_HOME = this.configDirectory;
     const profileOptions = this.configDirectory ? ["-c", 'cli_auth_credentials_store="file"'] : [];
-    const child = spawn(codexExecutable(), ["app-server", "--listen", "stdio://", ...options, ...profileOptions], {
+    const child = spawn(codexExecutable(), ["app-server", "--listen", "stdio://", ...options,
+      "-c", codexMcpConfig(this.dataDir), ...profileOptions], {
       cwd: this.directory, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"]
     });
     this.#child = child;
@@ -257,8 +279,7 @@ export class Codex extends EventEmitter {
   }
 
   async answer(payload, { signal, update, activity = () => {}, tool = () => {}, usage = () => {},
-    model: selectedModel, effort, cwd }) {
-    let text = buildPrompt(payload);
+    model: selectedModel, effort, cwd, resumeSession, persistSession = false }) {
     const account = await this.account();
     if (!account.signedIn) throw new Error("请先用 ChatGPT 订阅登录 Codex。");
     const models = await this.models();
@@ -270,13 +291,18 @@ export class Codex extends EventEmitter {
       throw new Error("所选模型不支持图片。请更换模型后再发送。");
     }
     signal.throwIfAborted();
-    const { thread } = await this.#request("thread/start", {
-      cwd: cwd || this.directory, ephemeral: true, sandbox: "workspace-write", approvalPolicy: "on-request",
-      model: model.id
-    });
+    const resumed = Boolean(resumeSession && persistSession);
+    const { thread } = resumed
+      ? await this.#request("thread/resume", { threadId: resumeSession, excludeTurns: true })
+      : await this.#request("thread/start", {
+        cwd: cwd || this.directory, ephemeral: !persistSession,
+        sandbox: "workspace-write", approvalPolicy: "on-request", model: model.id
+      });
     try {
       signal.throwIfAborted();
-      const items = nativeHistory(payload.history);
+      let text = buildPrompt(resumed ? { ...payload, history: [], context: "", memories: [],
+        files: payload.files.filter((file) => file.current) } : payload);
+      const items = resumed ? [] : nativeHistory(payload.history);
       if (items.length) {
         try {
           await this.#request("thread/inject_items", { threadId: thread.id, items });
@@ -288,8 +314,9 @@ export class Codex extends EventEmitter {
       signal.throwIfAborted();
       const input = [{ type: "text", text },
         ...(payload.images || []).map(({ path }) => ({ type: "localImage", path }))];
-      return await this.#turn(thread.id, input, { signal, update, activity, tool, usage,
+      const answer = await this.#turn(thread.id, input, { signal, update, activity, tool, usage,
         effort: effort || model.defaultEffort });
+      return { text: answer, sessionId: persistSession ? thread.id : undefined };
     } finally {
       if (this.#child) await this.#request("thread/unsubscribe", { threadId: thread.id }).catch(() => {});
     }
@@ -342,7 +369,8 @@ export class Codex extends EventEmitter {
         if (params.threadId !== threadId || !toolLabels[params.item?.type]) return;
         const item = params.item;
         const detail = item.query || item.command || item.tool || item.name || item.path || "";
-        tool({ id: item.id || `${item.type}:${detail}`, title: toolLabels[item.type], detail, status });
+        tool({ id: item.id || `${item.type}:${detail}`, title: toolLabels[item.type], detail, status,
+          ...(status === "done" ? { result: item } : {}) });
       };
       add("item/started", (params) => {
         if (params.threadId !== threadId) return;

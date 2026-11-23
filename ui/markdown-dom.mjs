@@ -1,9 +1,9 @@
-import { parseMarkdown, textOffsets } from "./markdown.mjs";
+import { parseMarkdown, renderMath, textOffsets } from "./markdown.mjs";
 
 const sourceOffsets = new WeakMap();
 const inlineTags = { emphasis: "em", strong: "strong", delete: "del" };
 const blockTags = { paragraph: "p", blockquote: "blockquote", listItem: "li" };
-const markClasses = { highlight: "highlighted", underline: "underlined", note: "has-note" };
+const markClasses = { highlight: "highlighted", underline: "underlined", note: "has-note", focus: "has-note focus-mark" };
 
 function element(parent, tag) {
   const child = document.createElement(tag);
@@ -15,6 +15,9 @@ function safeUrl(value) {
   try {
     const url = new URL(value);
     if (["https:", "http:"].includes(url.protocol) && !url.username && !url.password) return url.href;
+    if (url.protocol === "ownsoft:" && !url.username && !url.password && !url.search && !url.hash &&
+        ((["chat", "md"].includes(url.hostname) && /^\/[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(url.pathname)) ||
+          (url.hostname === "pdf" && /^\/[\da-f]{64}$/i.test(url.pathname)))) return url.href;
   } catch {
     // Relative or malformed links are rendered as text.
   }
@@ -108,6 +111,21 @@ export function renderMarkdown(target, source, { literal = false, marks = null }
         else label.textContent = "图片";
         break;
       }
+      // A formula is one unit: it carries the source range of its delimiters and contents, so a
+      // selection touching it maps to the whole formula and annotations can mark it.
+      case "inlineMath":
+      case "math": {
+        const display = type === "math" || node.display;
+        const box = element(parent, type === "math" ? "div" : "span");
+        box.className = display ? "math math-display" : "math math-inline";
+        box.dataset.sourceStart = start;
+        box.dataset.sourceEnd = end;
+        box.title = source.slice(start, end).slice(0, 400);
+        renderMath(box, node.value, display);
+        const covering = (marks || []).filter((mark) => mark.start < end && mark.end > start);
+        if (covering.length) box.classList.add(...covering.flatMap((mark) => markClasses[mark.style].split(" ")));
+        break;
+      }
       case "break":
         element(parent, "br");
         break;
@@ -160,16 +178,23 @@ function* trackedText(element) {
   }
 }
 
+const mathBoxes = (element) => element.querySelectorAll("[data-source-start]");
+
 export function selectionSource(element, range) {
-  let start;
-  let end;
+  let start = Infinity;
+  let end = -Infinity;
   for (const { node, offsets } of trackedText(element)) {
     if (!range.intersectsNode(node)) continue;
     const first = range.startContainer === node ? range.startOffset : 0;
     const last = range.endContainer === node ? range.endOffset : node.length;
     if (first >= last) continue;
-    start ??= offsets[first * 2];
-    end = offsets[last * 2 - 1];
+    start = Math.min(start, offsets[first * 2]);
+    end = Math.max(end, offsets[last * 2 - 1]);
+  }
+  for (const box of mathBoxes(element)) {
+    if (!range.intersectsNode(box)) continue;
+    start = Math.min(start, Number(box.dataset.sourceStart));
+    end = Math.max(end, Number(box.dataset.sourceEnd));
   }
   return end > start ? { start, end } : null;
 }
@@ -184,9 +209,20 @@ export function sourceRange(element, start, end) {
       last = [node, index + 1];
     }
   }
-  if (!first) return null;
+  const boxes = [...mathBoxes(element)].filter((box) =>
+    Number(box.dataset.sourceStart) < end && Number(box.dataset.sourceEnd) > start);
+  if (!first && !boxes.length) return null;
   const range = document.createRange();
-  range.setStart(...first);
-  range.setEnd(...last);
+  if (first) {
+    range.setStart(...first);
+    range.setEnd(...last);
+  } else {
+    range.setStartBefore(boxes[0]);
+    range.setEndAfter(boxes.at(-1));
+  }
+  // Formulas at either end are taken in whole.
+  if (boxes.length && range.comparePoint(boxes[0], 0) < 0) range.setStartBefore(boxes[0]);
+  const lastBox = boxes.at(-1);
+  if (lastBox && range.comparePoint(lastBox, lastBox.childNodes.length) > 0) range.setEndAfter(lastBox);
   return range;
 }

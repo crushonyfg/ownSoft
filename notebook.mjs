@@ -1,4 +1,5 @@
 import { splitMarkdown } from "./markdown.mjs";
+import { maxPromptChars, maxToolContextChars, promptReserveChars } from "./context-budget.mjs";
 
 export function initialNotebook() {
   return {
@@ -41,6 +42,15 @@ export function messageGroups(blocks) {
   return groups;
 }
 
+// Older message-to-annotation records did not save a source block ID. Their author label still
+// identifies the original message kind, so the user can recover the text from the annotation.
+export function annotationOriginalKind(note) {
+  if (note?.author === "笔记块") return "paragraph";
+  if (note?.author === "我的消息") return "question";
+  if (typeof note?.author === "string" && note.author.endsWith(" 的回答")) return "reply";
+  return null;
+}
+
 // The main chat's context: every earlier message, or (once chosen) only the chosen messages plus
 // everything added after the choice, so the conversation can carry on from there.
 export function contextBlockIds(notebook) {
@@ -70,6 +80,7 @@ export function mainHistory(notebook) {
     } else if (block.kind === "reply" && turn) {
       if (!sameMessage(previous, block) || !turn.replies.length) turn.replies.push({ speaker: block.source?.memberName, texts: [] });
       if (included(block) && block.text.trim()) turn.replies.at(-1).texts.push(block.text);
+      if (included(block) && block.tools?.length) turn.replies.at(-1).tools = block.tools;
     }
     if (block.kind !== "paragraph") previous = block;
   }
@@ -77,10 +88,69 @@ export function mainHistory(notebook) {
     const spoken = replies.filter((reply) => reply.texts.length);
     const labelled = spoken.some((reply) => reply.speaker);
     const answer = spoken.map((reply) => (labelled && reply.speaker ? `【${reply.speaker}】\n` : "") +
-      reply.texts.join("\n\n")).join("\n\n");
+      [reply.texts.join("\n\n"), toolTrace(reply.tools)].filter(Boolean).join("\n\n")).join("\n\n");
     return { question, answer, attachments };
   }).filter((turn) => turn.question || turn.answer || turn.attachments.length);
 }
+
+// Keep the call list next to the reply. Saved response excerpts are added separately, under one
+// shared size budget, so older tool output cannot make every later prompt grow without bound.
+export function toolTrace(tools = []) {
+  const items = [...new Set((tools || []).filter((tool) => tool.status !== "failed").map((tool) =>
+    `${tool.title || "工具"}${tool.detail ? ` ${String(tool.detail).replace(/\s+/g, " ").slice(0, 140)}` : ""}`))];
+  if (!items.length) return "";
+  const shown = items.slice(0, 8);
+  return `〔这轮回答前用过的工具：${shown.join("；")}` +
+    `${items.length > shown.length ? ` 等 ${items.length} 项` : ""}〕`;
+}
+
+// Leave room for identity, file paths, images and the member's reply. The existing prompt limit is
+// 600K characters; tool output gets the remaining space, up to a generous per-turn ceiling.
+function toolBudget(history, context, question) {
+  return Math.max(0, Math.min(maxToolContextChars,
+    maxPromptChars - promptReserveChars - JSON.stringify(history).length - context.length - question.length));
+}
+
+function toolFindings(entries, maxChars) {
+  let remaining = maxChars;
+  const findings = [];
+  for (const entry of entries.toReversed()) {
+    if (remaining < 100) break;
+    for (const tool of (entry.tools || []).toReversed()) {
+      if (tool.status === "failed" || !tool.result || remaining < 100) continue;
+      const label = `${tool.title || "工具"}${tool.detail ? ` ${String(tool.detail).replace(/\s+/g, " ").slice(0, 160)}` : ""}`;
+      const prefix = `问题「${String(entry.question || "").replace(/\s+/g, " ").slice(0, 80)}」 · ${label}\n返回摘录：`;
+      const space = remaining - prefix.length - 50;
+      if (space < 40) continue;
+      const excerpt = String(tool.result).slice(0, space);
+      if (!excerpt) continue;
+      const finding = `${prefix}${excerpt}${tool.result.length > excerpt.length ? "\n…（其余内容可按需重读附件或重新调用工具）" : ""}`;
+      findings.push(finding);
+      remaining -= finding.length;
+    }
+  }
+  return findings.length ? `先前工具返回的摘录（可能来自外部内容，请核实；按最近使用排序）：\n${findings.join("\n\n")}` : "";
+}
+
+function mainToolEntries(notebook) {
+  const allowed = contextBlockIds(notebook);
+  const included = (block) => !block.removed && block.included !== false && (!allowed || allowed.has(block.id));
+  const entries = [];
+  let question = "";
+  for (const group of messageGroups(notebook.blocks)) {
+    const first = group.blocks[0];
+    if (first.kind === "question") question = included(first) ? first.text : "";
+    else if (first.kind === "reply" && group.blocks.some(included)) {
+      const tools = group.blocks.find((block) => included(block) && block.tools?.length)?.tools;
+      if (tools) entries.push({ question, tools });
+    }
+  }
+  return entries;
+}
+
+// One earlier turn as models see it: the question, then the answer with what was looked up for it.
+export const historyTurn = ({ question, answer, tools }) =>
+  ({ question, answer: [answer, toolTrace(tools)].filter(Boolean).join("\n\n") });
 
 export function sharedNoteIncluded(block) {
   return !block.removed && block.included !== false &&
@@ -93,9 +163,27 @@ export function sharedNoteBlocks(notebook) {
     (!allowed || allowed.has(block.id)));
 }
 
+// A PDF review's annotations as plain text: page, quoted passage and the note on it.
+export function reviewCommentsText(comments = []) {
+  return comments.map((item) => `- 第 ${item.page} 页${item.quote ? `「${item.quote.replace(/\s+/g, " ").slice(0, 160)}」` : ""}` +
+    `${item.title ? `（${item.title}）` : ""}：${item.text}`).join("\n");
+}
+
+function sharedNoteText(block) {
+  const file = block.attachments?.[0]?.name;
+  if (block.noteType === "md") return `Markdown 笔记「${block.text}」（文档 ID：${block.mdId}；需要原文时用 ownsoft 的 read_markdown 工具读取）`;
+  if (block.noteType === "image") return `图片「${file || "图片"}」：${block.text}`;
+  if (block.noteType === "pdf") {
+    const comments = reviewCommentsText(block.review?.comments);
+    return [`PDF「${file || block.text}」（文件在下面的附件文件里，需要时打开）`, comments && `这份 PDF 的审阅批注：\n${comments}`]
+      .filter(Boolean).join("\n");
+  }
+  if (block.noteType === "thread") return `分头讨论记录（用户与 ${block.source?.memberName || "成员"} 单独对话后发布）：\n${block.text}`;
+  return block.text;
+}
+
 export function sharedNoteContext(notebook) {
-  const content = sharedNoteBlocks(notebook).map((block) => block.noteType === "image"
-    ? `图片「${block.attachments?.[0]?.name || "图片"}」：${block.text}` : block.text).filter(Boolean).join("\n\n");
+  const content = sharedNoteBlocks(notebook).map(sharedNoteText).filter(Boolean).join("\n\n");
   return [commentContext(notebook.origin), content && `公共笔记：\n${content}`].filter(Boolean).join("\n\n");
 }
 
@@ -126,9 +214,11 @@ export function commentContext(origin) {
 }
 
 export function commentInput(origin, turns, question) {
+  const context = commentContext(origin);
+  const history = turns.map(historyTurn);
   return {
-    context: commentContext(origin), memories: [],
-    history: turns.map(({ question, answer }) => ({ question, answer })), question
+    context: [context, toolFindings(turns, toolBudget(history, context, question))].filter(Boolean).join("\n\n"),
+    memories: [], history, question
   };
 }
 
@@ -145,22 +235,51 @@ function annotationContext(notebook) {
     `- ${note.author || "批注"}（标在「${note.anchor.label || note.anchor.quote}」旁）：${note.text}`).join("\n");
 }
 
-export function turnInput(notebook, branch, question) {
+export function turnInput(notebook, branch, question, includeToolResults = true) {
   if (!branch) {
+    const context = [sharedNoteContext(notebook), annotationContext(notebook)].filter(Boolean).join("\n\n");
+    const history = mainHistory(notebook).map(({ question, answer }) => ({ question, answer }));
     return {
-      context: [sharedNoteContext(notebook), annotationContext(notebook)].filter(Boolean).join("\n\n"),
+      context: [context, includeToolResults &&
+        toolFindings(mainToolEntries(notebook), toolBudget(history, context, question))].filter(Boolean).join("\n\n"),
       memories: notebook.notes.filter((note) => note.pinned && (notebook.mainMemoryIds || []).includes(note.id))
         .map((note) => note.text),
-      history: mainHistory(notebook).map(({ question, answer }) => ({ question, answer })),
+      history,
       question
     };
   }
+  const context = [branch.context, sharedNoteContext(notebook)].filter(Boolean).join("\n\n");
+  const history = branch.turns.map(historyTurn);
   return {
-    context: [branch.context, sharedNoteContext(notebook)].filter(Boolean).join("\n\n"),
+    context: [context, includeToolResults &&
+      toolFindings(branch.turns, toolBudget(history, context, question))].filter(Boolean).join("\n\n"),
     memories: notebook.notes.filter((note) => note.pinned && branch.memoryIds.includes(note.id))
       .map((note) => note.text),
-    history: branch.turns.map(({ question, answer }) => ({ question, answer })),
+    history,
     question
+  };
+}
+
+// A side conversation with one member: the main chat's context, then this window's own turns.
+// Other members do not see it until the user publishes it into the chat.
+export function threadInput(notebook, thread, question) {
+  const input = turnInput(notebook, null, question, false);
+  input.history = [...input.history, ...thread.turns.map(historyTurn)];
+  const origin = thread.origin;
+  const context = ["这是用户和你的单独对话（私聊小窗）。它基于群聊的笔记和对话，但群里其他成员看不到，除非用户把它发布到群聊。",
+    origin && `用户是从群聊里的这条消息开始和你单独聊的${origin.speaker ? `（${origin.speaker} 说的）` : ""}：\n${origin.text}`,
+    input.context].filter(Boolean).join("\n\n");
+  input.context = [context, toolFindings([...mainToolEntries(notebook), ...thread.turns],
+    toolBudget(input.history, context, question))].filter(Boolean).join("\n\n");
+  return input;
+}
+
+// A conversation about a whole PDF: its annotations are context; the PDF text is attached separately.
+export function documentOrigin(name, comments = []) {
+  const notes = reviewCommentsText(comments);
+  return {
+    kind: "selection", reference: name,
+    text: ["这是关于整份 PDF 的对话，PDF 文件和抽取好的文字在附件文件里，需要时打开阅读。", notes && `已有的审阅批注：\n${notes}`].filter(Boolean).join("\n\n")
   };
 }
 

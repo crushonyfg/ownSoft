@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -43,15 +43,23 @@ test("attachments retain text and visual PDF pages, and clean up temporary rende
   const { items, errors } = await store.stage(inputPaths, 6);
   assert.equal(items.length, 3);
   assert.match(errors[0], /格式不匹配/);
-  const prepared = await store.prepare(items, new AbortController().signal);
+  // Files go to the model as paths (PDFs with their text extracted once); only images attached to
+  // this very question are also sent as pictures.
+  const prepared = await store.provide(items, new AbortController().signal, { inline: [items[2]] });
   try {
-    assert.deepEqual(prepared.documents, [{ file: "text.pdf", page: 1, text: "Original PDF text" }]);
-    assert.deepEqual(prepared.images.map((image) => image.name),
-      ["text.pdf · 第 1 页", "visual.pdf · 第 1 页", "image.png"]);
+    assert.deepEqual(prepared.files.map(({ name, kind, pages }) => [name, kind, pages]),
+      [["text.pdf", "pdf", 1], ["visual.pdf", "pdf", 1], ["image.png", "image", undefined]]);
+    assert.match(await readFile(prepared.files[0].textPath, "utf8"), /第 1 页[\s\S]+Original PDF text/);
+    assert.match(await readFile(prepared.files[1].textPath, "utf8"), /没有可抽取的文字/);
+    assert.deepEqual(prepared.images.map((image) => image.name), ["image.png"]);
+    assert.ok(prepared.dirs.includes(join(directory, "saved")));
   } finally {
     await prepared.dispose();
   }
   assert.deepEqual(await readdir(work), []);
+  // The extracted text is kept, so a second question does not read the PDF again.
+  const again = await store.provide(items.slice(0, 1), new AbortController().signal);
+  assert.equal(again.files[0].textPath, prepared.files[0].textPath);
 });
 
 test("pasted images without a file path are staged from their bytes", async () => {

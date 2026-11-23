@@ -1,0 +1,462 @@
+/* ---- One question box everywhere (group chat, branches, annotations, PDF, side threads) ---- */
+.chat-composer { position: relative; }
+.composer-label { font-size: 13px; font-weight: 650; color: var(--text); }
+.chat-composer.is-compact { gap: 5px; }
+.chat-composer.is-compact .composer-label { font-size: 12px; color: var(--muted); font-weight: 600; }
+.chat-composer.is-compact textarea { min-height: 58px; font-size: 13px; }
+.chat-composer.is-compact .composer-row button { min-height: 34px; }
+.chat-composer.is-compact .mention-chip { min-height: 25px; font-size: 12px; }
+.chat-composer.is-compact .mention-chip .pixel-avatar { width: 19px; height: 19px; }
+.chat-composer .file-tools { row-gap: 4px; }
+.chat-composer .mention-hint { flex: 1; min-width: 140px; }
+.main-composer .chat-composer { gap: 7px; }
+.main-composer #main-context { margin: 0; }
+.threads-entry { color: var(--accent); }
+
+/* Follow-up conversations read like the chat: your question on the right, the answer on the left. */
+.comment-history { display: grid; gap: 12px; }
+.comment-turn { display: grid; gap: 7px; min-width: 0; }
+.comment-turn + .comment-turn { border-top: 0; margin-top: 0; padding-top: 0; }
+.comment-ask { display: grid; justify-items: end; gap: 4px; min-width: 0; }
+.comment-ask .question-bubble { max-width: 92%; margin: 0; background: var(--chat-user, var(--tint)); border-radius: 13px 13px 4px 13px; }
+.comment-reply { min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 13px 13px 13px 4px;
+  background: var(--chat-agent, var(--paper)); overflow-wrap: anywhere; }
+.comment-reply.is-pending { border-style: dashed; }
+.comment-reply-meta { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 12px; color: var(--chat-ink, var(--muted)); min-width: 0; }
+.comment-reply-meta strong { font-size: 12.5px; }
+.comment-reply-meta span { opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.comment-reply-meta .pixel-avatar { width: 24px; height: 24px; border-radius: 7px; border-width: 1px; box-shadow: none; }
+.comment-reply-meta .pixel-avatar svg { width: 18px; height: 18px; }
+.comment-reply-meta .avatar-signal { display: none !important; }
+.comment-reply-meta > button { margin-left: auto; min-height: 24px; padding: 1px 9px; font-size: 12px; }
+.comment-reply-meta .comment-turn-actions { display: inline-flex; gap: 4px; margin-left: auto; opacity: 1; }
+.comment-turn-action { min-height: 23px; padding: 1px 8px; font-size: 11.5px; }
+.comment-progress { border-top: 0 !important; margin-top: 10px; padding-top: 0 !important; display: grid; gap: 7px; }
+.comment-conversation .chat-composer { margin-top: 10px; }
+.comment-thread.is-embedded { border-top: 0; margin-top: 4px; padding-top: 0; }
+
+/* ---- Annotation focus view: the source passage beside the annotation and its follow-ups ---- */
+.note-focus { position: fixed; z-index: 60; inset: 56px max(18px, 3vw) 18px max(18px, 3vw);
+  display: grid; grid-template-columns: minmax(0, 1fr) 8px min(var(--note-focus-side, 42%), 70%);
+  grid-template-rows: minmax(0, 1fr);
+  border-radius: 16px; overflow: hidden; background: var(--paper); box-shadow: 0 18px 70px #0005; }
+.note-focus-source { display: flex; flex-direction: column; min-height: 0; min-width: 0;
+  background: var(--chat-bg, var(--surface)); border-right: 1px solid var(--line); }
+.note-focus-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 14px 20px 10px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--paper) 70%, transparent); }
+.note-focus-heading > div { min-width: 0; }
+.note-focus-heading .eyebrow { letter-spacing: .12em; }
+.note-focus-reference { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note-focus-heading button { min-height: 28px; font-size: 12px; flex: none; }
+.note-focus-message { flex: 1; overflow: auto; padding: 22px clamp(14px, 2.4vw, 34px) 40px; display: grid; align-content: start; gap: 10px; }
+.note-focus-row { display: flex; align-items: flex-start; gap: 9px; min-width: 0; padding: 4px; border-radius: 16px; }
+.note-focus-row.is-user { justify-content: flex-end; }
+.note-focus-row.is-user .note-focus-paper { max-width: 82%; }
+.note-focus-row.is-note .note-focus-paper { width: 100%; }
+.note-focus-row > .pixel-avatar { width: 34px; height: 34px; border-radius: 10px; }
+.note-focus-row > .pixel-avatar svg { width: 26px; height: 26px; }
+.note-focus-row:not(.is-anchor) .note-focus-paper { opacity: .82; }
+.note-focus-row.is-anchor { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.note-focus-row.is-anchor .note-focus-paper { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent), 0 7px 22px #243d4314; }
+.note-focus-paper .shared-image { max-height: 420px; }
+.note-focus-paper .attachments.sent { justify-content: flex-start; }
+.note-focus-question { justify-self: end; max-width: 80%; padding: 9px 13px; border-radius: 15px 15px 5px 15px;
+  background: var(--chat-user, var(--tint)); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
+.note-focus-paper { flex: 0 1 auto; padding: 13px 17px 15px; border-radius: 18px; background: var(--chat-agent, var(--paper));
+  border: 1px solid #ffffffb0; box-shadow: 0 7px 22px #243d4314; min-width: 0; color: var(--text); }
+.note-focus-paper.is-user { background: var(--chat-user, var(--tint)); }
+.note-focus-paper.is-note { border: 1px dashed var(--chat-dot, var(--line)); }
+.note-focus-paper .message-meta { align-items: center; }
+.note-focus-paper .message-meta .pixel-avatar { width: 28px; height: 28px; border-radius: 8px; }
+.note-focus-paper .message-meta .pixel-avatar svg { width: 21px; height: 21px; }
+.note-focus-paper .body-text { font-size: 15px; line-height: 1.75; overflow-wrap: anywhere; }
+.note-focus-paper .body-text + .body-text { margin-top: .85em; }
+.note-focus-paper .body-text:not(.markdown-content) { white-space: pre-wrap; }
+.focus-mark { background: var(--highlight); border-bottom: 2px solid var(--accent); border-radius: 2px;
+  animation: focus-mark-pulse 1.6s ease-out 2; }
+.note-focus-quote { border-left: 3px solid var(--accent); padding-left: 10px; white-space: pre-wrap; }
+.note-focus-card { min-height: 0; overflow: auto; padding: 18px clamp(14px, 2vw, 26px) 26px; background: var(--paper); }
+.annotation.is-focus-card { border: 0; border-left: 0; padding: 0; gap: 10px; background: transparent; }
+.annotation.is-focus-card .author { font-size: 14px; }
+.annotation.is-focus-card .quote-button { font-size: 13px; border-left: 3px solid var(--highlight); padding-left: 9px; }
+.annotation.is-focus-card .note-content { font-size: 15px; line-height: 1.75; padding: 12px 14px; border-radius: 12px;
+  background: var(--chrome); border: 1px solid var(--line); }
+.annotation.is-focus-card .comment-thread { border-top: 0; padding-top: 0; }
+.annotation.is-focus-card .comment-thread-controls [data-comment-chat] { display: none; }
+.annotation.is-focus-source { outline: 2px solid var(--accent); outline-offset: 1px; }
+@keyframes focus-mark-pulse {
+  0% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 35%, transparent); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (max-width: 900px) {
+  .note-focus { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(160px, 45%) minmax(0, 1fr); inset: 56px 8px 8px; }
+  #note-focus-split { display: none; }
+  .note-focus-source { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+
+/* ---- PDF notes in the chat ---- */
+.chat-row.is-note .paper-block.is-pdf-note { width: min(100%, 820px); }
+.note-symbol.is-pdf { font-size: 11px; font-weight: 800; letter-spacing: .04em; color: #b34b3d; background: #ffe9e3; }
+.pdf-note { display: grid; grid-template-columns: minmax(180px, 300px) minmax(0, 1fr); gap: 16px; margin: 4px 0 10px; }
+.pdf-note-viewer { display: grid; gap: 6px; min-width: 0; align-content: start; }
+.pdf-note-preview { display: block; width: 100%; min-height: 160px; padding: 0; border: 1px solid var(--line);
+  border-radius: 9px; overflow: hidden; background: #fff; cursor: zoom-in; line-height: 0; }
+.pdf-note-preview canvas { display: block; width: 100%; height: auto; }
+.pdf-note-preview:hover { border-color: var(--accent); box-shadow: 0 4px 16px var(--shadow); }
+.pdf-note-loading { display: grid; place-items: center; min-height: 160px; padding: 12px; color: var(--muted); font-size: 12px; line-height: 1.4; white-space: normal; }
+.pdf-note-pager { display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.pdf-note-pager button { min-height: 24px; padding: 0 10px; }
+.pdf-note-side { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.pdf-note-name { font-size: 15px; overflow-wrap: anywhere; }
+.pdf-note-annotation-count { align-self: flex-start; min-height: 27px; padding: 3px 9px; color: var(--accent); font-size: 12px; font-weight: 700; }
+.pdf-note-stats, .pdf-note-hint, .pdf-note-more { color: var(--muted); font-size: 12px; }
+.pdf-note-comments { display: grid; gap: 4px; }
+.pdf-note-comment { display: flex; gap: 7px; align-items: baseline; min-height: 0; padding: 5px 8px; white-space: normal;
+  text-align: left; font-size: 12.5px; background: var(--chrome); border-color: transparent; border-radius: 8px; }
+.pdf-note-comment span:last-child { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.pdf-note-comment-page { flex: none; color: var(--accent); font-weight: 700; font-size: 11px; }
+.pdf-note-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+.pdf-note-actions button { min-height: 30px; font-size: 12.5px; }
+@media (max-width: 700px) { .pdf-note { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---- Published side threads in the chat ---- */
+.chat-row.is-note .paper-block.is-thread-note { border-style: solid; border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: light-dark(#f7fbff, #2f3c52); }
+.thread-published { padding: 0 7px; border-radius: 8px; background: var(--tint); color: var(--accent); font-size: 11px; }
+.thread-reopen { min-height: 22px; padding: 0 8px; font-size: 11.5px; }
+
+dialog#editor.is-wide { width: min(920px, calc(100% - 36px)); }
+dialog#editor.is-wide textarea { min-height: 360px; font-size: 13px; line-height: 1.6; }
+
+.library-create-actions .new-pdf-session { grid-column: 1 / -1; color: var(--accent); }
+/* Formulas (KaTeX). Display formulas scroll sideways instead of overflowing the message. */
+.math-inline { white-space: nowrap; }
+.math-display { display: block; margin: .55em 0; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.math-display .katex-display { margin: 0; }
+.math .katex { font-size: 1.08em; }
+.math.has-note { box-shadow: inset 0 -2px 0 #e0a43b; border-radius: 3px; }
+.math.highlighted { background: #fff1a8; border-radius: 3px; }
+.math-error { color: var(--danger, #c2453d); font-family: ui-monospace, Consolas, monospace; font-size: .9em; }
+/* ---- Markdown documents: preview / split / source, annotations and chat on the side ---- */
+body[data-focus="md"] .md-view { position: fixed; z-index: 60; inset: 56px 18px 16px 44px; height: auto; min-height: 0;
+  background: var(--paper); border-radius: 13px; overflow: hidden; box-shadow: 0 18px 70px #0005; }
+body[data-focus="md"] .md-view .review-back { display: inline-flex; }
+@media (max-width: 900px) { body[data-focus="md"] .md-view { inset: 56px 8px 8px; } }
+.md-file-info { flex-wrap: wrap; row-gap: 2px; }
+.md-path { color: var(--muted); font-size: 11.5px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.md-status { font-size: 11.5px; color: var(--muted); }
+.md-status.is-unsynced { color: #b5731f; }
+.md-modes { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.md-modes button { border: 0; border-radius: 0; min-height: 30px; padding: 3px 12px; }
+.md-modes button[aria-pressed="true"] { background: var(--tint); color: var(--accent); font-weight: 650; }
+.md-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) min(400px, 36%); }
+.md-main { position: relative; min-height: 0; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+.md-main .slash-link-menu { top: 45px; right: auto; width: min(420px, calc(100% - 20px)); }
+.md-view[data-mode="split"] .md-main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.md-view[data-mode="preview"] .md-source, .md-view[data-mode="source"] .md-preview { display: none; }
+.md-source { min-height: 0; width: 100%; height: 100%; resize: none; border: 0; border-radius: 0; padding: 18px 22px;
+  font: 13.5px/1.65 ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace; tab-size: 2;
+  background: light-dark(#fbfcfe, #1b2230); color: var(--text); outline: none; }
+.md-view[data-mode="split"] .md-source { border-right: 1px solid var(--line); }
+.md-preview { min-height: 0; overflow: auto; padding: 22px clamp(18px, 4vw, 48px) 60px; font-size: 15px; line-height: 1.75; }
+.md-preview > * { max-width: 860px; }
+.md-preview h1, .md-preview h2, .md-preview h3 { margin: 1.1em 0 .45em; line-height: 1.35; }
+.md-preview h1 { font-size: 1.75em; } .md-preview h2 { font-size: 1.4em; } .md-preview h3 { font-size: 1.18em; }
+.md-preview p, .md-preview ul, .md-preview ol, .md-preview blockquote, .md-preview pre { margin: .6em 0; }
+.md-preview .has-note { cursor: pointer; }
+.md-side { min-height: 0; overflow: auto; padding: 12px 13px 20px; background: var(--chrome); border-left: 1px solid var(--line); }
+.md-side-head { display: flex; align-items: baseline; gap: 8px; margin: 6px 0 8px; }
+.md-side-head h2 { font-size: 15px; } .md-side-head span { color: var(--muted); font-size: 12px; }
+.md-chat-head { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); }
+.md-side .review-card { margin-bottom: 10px; }
+.md-lost { color: #b5731f; font-size: 12px; margin: 2px 0; }
+#md-tools { position: fixed; z-index: 80; }
+@media (max-width: 960px) { .md-layout { grid-template-columns: minmax(0, 1fr); } .md-side { border-left: 0; border-top: 1px solid var(--line); max-height: 45vh; } }
+/* Any conversation can open as a full chat (its own window). */
+.comment-full, .thread-full { font-size: 12px; }
+.comment-full-bar { display: flex; justify-content: flex-end; margin: -2px 0 6px; }
+.comment-full-bar .comment-full { min-height: 26px; padding: 2px 10px; }
+.chat-parent { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 2px; padding: 6px 10px;
+  border-radius: 9px; background: var(--tint); color: var(--accent); font-size: 12.5px; }
+.chat-parent[hidden] { display: none; }
+.chat-parent button { min-height: 25px; padding: 1px 9px; font-size: 12px; }
+/* ---- Embedded chats: one conversation inside a review panel, an enlarged annotation, a branch or a window ---- */
+iframe.embedded-chat { display: block; flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; border: 0; background: transparent; }
+body[data-embed="1"] .top-bar, body[data-embed="1"] .notebook-library, body[data-embed="1"] .thread-dock,
+body[data-embed="1"] .paper-title .eyebrow, body[data-embed="1"] #document-title, body[data-embed="1"] .sidebar-toggle { display: none !important; }
+body[data-embed="1"] .workspace-layout { grid-template-columns: minmax(0, 1fr) !important; }
+body[data-embed="1"] .document-view { padding: 6px 8px 0; }
+body[data-embed="1"] .document-view::before, body[data-embed="1"] .document-view::after { display: none; }
+body[data-embed="1"] .paper-title { margin-bottom: 6px; padding: 6px 10px; border-radius: 12px; box-shadow: none; }
+/* The host view already says what this conversation is; keep the chat itself compact. */
+body[data-embed="1"] .paper-title, body[data-embed="1"] .margin-heading { display: none !important; }
+body[data-embed="1"] .ribbon { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+body[data-embed="1"] .ribbon .tool-group { flex-wrap: nowrap; flex: none; gap: 2px; padding-right: 4px; }
+body[data-embed="1"] .ribbon button { white-space: nowrap; }
+body[data-embed="1"] .ribbon { gap: 3px 4px; padding: 4px 8px; }
+body[data-embed="1"] .ribbon .tool-label, body[data-embed="1"] .model-controls,
+body[data-embed="1"] .ribbon [data-action="appearance"] { display: none; }
+body[data-embed="1"] .ribbon button { min-height: 26px; padding: 2px 7px; font-size: 12px; }
+body[data-embed="1"] .paper-end { margin-top: 8px; padding: 8px 10px 10px; }
+body[data-embed="1"] .chat-row { padding-inline: 0; }
+/* PDF review: the lower pane holds a full chat that scrolls on its own. */
+#review-chat-pane.review-chat-pane { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 0; }
+#review-chat-pane .review-chat-head { flex: none; align-items: center; }
+#review-chat-pane .review-chat-head h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.review-chat-full { margin-left: auto; min-height: 26px; padding: 2px 9px; font-size: 12px; }
+.review-chat-back { min-height: 26px; padding: 2px 9px; font-size: 12px; }
+#review-chat-pane > .muted { flex: none; }
+.review-embedded-chat { display: flex; flex-direction: column; flex: 1; min-height: 160px; margin: 0 -13px; border-top: 1px solid var(--line); }
+.review-follow { font-weight: 600; }
+.review-card.is-chatting { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Markdown documents: annotations above, a full chat below. */
+.md-side { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.md-side-top { flex: 1 1 42%; min-height: 120px; overflow: auto; padding: 12px 13px 10px; }
+.md-side-chat { flex: 1 1 58%; min-height: 220px; display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+.md-side-chat .md-chat-head { flex: none; align-items: center; margin: 0; padding: 8px 13px 6px; border-top: 0; }
+.md-side-chat .md-chat-head h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.md-embedded-chat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+/* Enlarged annotation: the annotation above, its follow-up as a full chat below. */
+.note-focus-card { display: flex; flex-direction: column; overflow: hidden !important; padding-bottom: 0 !important; }
+.note-focus-note { flex: none; max-height: 45%; overflow: auto; }
+.note-focus-chat-head { flex: none; display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; }
+.note-focus-chat-head h2 { font-size: 15px; }
+.note-focus-chat-head button { margin-left: auto; min-height: 26px; padding: 2px 9px; font-size: 12px; }
+.note-focus-chat { display: flex; flex-direction: column; flex: 1; min-height: 240px; margin: 0 calc(-1 * clamp(14px, 2vw, 26px)); border-top: 1px solid var(--line); }
+/* Enlarged branch: its full chat replaces the compact list. */
+.side-embedded { display: none; }
+body[data-focus="branch"] #side-chat { display: flex; flex-direction: column; overflow: hidden; }
+body[data-focus="branch"] #side-chat :is(#context-details, .side-turns, #side-pending, #side-composer) { display: none; }
+body[data-focus="branch"] #side-chat .side-embedded { display: flex; flex-direction: column; flex: 1; min-height: 300px; width: min(100%, 1050px); margin-inline: auto; }
+/* Private windows: the compact list or the full chat. */
+.thread-full-chat { display: none; }
+.thread-window.is-full-chat .thread-turns, .thread-window.is-full-chat > .chat-composer { display: none; }
+.thread-window.is-full-chat .thread-full-chat { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.thread-full[aria-pressed="true"] { color: var(--accent); }
+
+/* Relation view: the chat and everything that grew out of it (ui/relation-view.mjs). */
+.relation-view { max-width: none; height: calc(100vh - var(--ribbon-height)); display: flex; flex-direction: column; padding: 18px 24px; }
+.relation-header { flex: none; display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.relation-header h1 { margin: 0; }
+.relation-header #relation-count { margin: 4px 0 0; }
+.relation-tools { display: flex; align-items: center; gap: 8px; }
+.relation-body { flex: 1; min-height: 0; display: flex; gap: 14px; }
+.relation-scroll { flex: 1; min-width: 0; background: radial-gradient(var(--line) 1px, transparent 1px) 0 0 / 15px 15px, var(--chrome); }
+.relation-board { min-height: 100%; background: none; }
+.relation-links { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.relation-links path { fill: none; stroke: var(--accent); stroke-opacity: .45; stroke-width: 1.5; }
+.relation-links path:is(.is-note, .is-pdf-comment, .is-md-comment) { stroke: #c48a12; }
+.relation-links path.is-thread { stroke: #7a55c4; }
+.relation-node { --kind: var(--accent); position: absolute; width: 232px; height: 72px; display: flex; }
+.relation-node.is-note, .relation-node.is-pdf-comment, .relation-node.is-md-comment { --kind: #c48a12; }
+.relation-node.is-thread { --kind: #7a55c4; }
+.relation-node.is-pdf, .relation-node.is-md { --kind: #c2410c; }
+.relation-node.is-root { --kind: var(--text); }
+.relation-node-main {
+  flex: 1; min-width: 0; height: 100%; padding: 6px 10px 6px 12px; text-align: left; display: grid; align-content: center; gap: 1px; line-height: 1.35;
+  background: var(--paper); border: 1px solid var(--line); border-left: 4px solid var(--kind); border-radius: 8px;
+  box-shadow: 0 3px 8px var(--shadow); white-space: normal;
+}
+.relation-node-main[aria-pressed="true"] { background: var(--tint); border-color: var(--accent); border-left-color: var(--kind); }
+.relation-node-main strong, .relation-node-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.relation-node-main strong { font-size: 13px; }
+.relation-node-main small { color: var(--muted); font-size: 11px; }
+.relation-kind { font-size: 10.5px; font-weight: 700; color: var(--kind); letter-spacing: .02em; }
+.relation-toggle {
+  position: absolute; right: -14px; top: 50%; transform: translateY(-50%); min-height: 0; padding: 1px 5px;
+  font-size: 10.5px; border-radius: 999px; background: var(--paper); z-index: 1;
+}
+.relation-outline { padding: 14px 18px; }
+.relation-outline-list { list-style: none; margin: 0; padding: 0 0 0 22px; border-left: 1px dashed var(--line); }
+.relation-outline > .relation-outline-list { padding-left: 0; border-left: 0; }
+.relation-outline-list > li { margin: 6px 0; }
+.relation-outline .relation-node { position: relative; width: min(100%, 520px); height: 64px; }
+.relation-detail {
+  flex: 0 0 min(460px, 42%); min-width: 320px; display: flex; flex-direction: column; overflow: hidden;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px;
+}
+.relation-detail-head { flex: none; display: flex; align-items: flex-start; gap: 8px; padding: 12px 14px 4px; }
+.relation-detail-head > div { flex: 1; min-width: 0; }
+.relation-detail-head h2 { margin: 2px 0; font-size: 16px; overflow-wrap: anywhere; }
+.relation-detail-head p.muted { margin: 4px 0 0; font-size: 12px; max-height: 4.5em; overflow: auto; overflow-wrap: anywhere; }
+.relation-actions { flex: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 14px 10px; border-bottom: 1px solid var(--line); }
+.relation-actions:empty { display: none; }
+.relation-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.relation-hint { margin: 16px; color: var(--muted); font-size: 13px; }
+@media (max-width: 900px) {
+  .relation-body { flex-direction: column; }
+  .relation-detail { flex: 1 1 55%; min-width: 0; }
+}
+
+/* Structural edits (ui/structure-ui.mjs): drag handles, the undo notice, the command line. */
+.note-drag-handle { display: inline-grid; place-items: center; width: 16px; height: 20px; margin-right: 2px;
+  color: var(--muted); cursor: grab; user-select: none; font-size: 13px; }
+.note-drag-handle:active { cursor: grabbing; }
+.chat-row .shared-drag-handle { opacity: .35; transition: opacity .15s; }
+.chat-row:hover .shared-drag-handle, .chat-row.active .shared-drag-handle { opacity: 1; }
+.structure-toast { position: fixed; z-index: 90; left: 50%; bottom: 22px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px; max-width: min(640px, calc(100vw - 32px)); padding: 9px 10px 9px 16px;
+  border-radius: 10px; background: #1f2b33; color: #f4f7f6; box-shadow: 0 10px 30px #0004; font-size: 13px; }
+.structure-toast[hidden] { display: none; }
+.structure-toast button { min-height: 28px; padding: 3px 12px; border-radius: 7px; border: 1px solid #ffffff40;
+  background: transparent; color: #fff; font-weight: 650; }
+.structure-toast button:hover { background: #ffffff1c; }
+.command-dialog { width: min(760px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--paper); color: var(--text); box-shadow: 0 24px 80px #0006; margin-top: 12vh; }
+.command-dialog::backdrop { background: #0003; }
+.command-form { display: flex; flex-direction: column; }
+.command-input { border: 0; border-bottom: 1px solid var(--line); padding: 14px 16px; font: 15px ui-monospace, Consolas, monospace;
+  background: transparent; color: inherit; outline: none; }
+.command-output { max-height: 50vh; overflow: auto; padding: 6px 16px 12px; }
+.command-output:empty { display: none; }
+.command-line { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.55 ui-monospace, Consolas, monospace; }
+.command-line.is-echo { color: var(--muted); }
+.command-line.is-error { color: #b42318; }
+
+/* Every split can be dragged (ui/splitter.mjs); sizes are remembered on this computer. */
+.md-layout { grid-template-columns: minmax(0, 1fr) 8px var(--md-side, min(400px, 36%)); }
+#md-layout-split { border-left: 1px solid var(--line); }
+.md-side { border-left: 0; }
+#md-main-split { display: none; }
+.md-view[data-mode="split"] .md-main { grid-template-columns: var(--md-source, minmax(0, 1fr)) 8px minmax(0, 1fr); }
+.md-view[data-mode="split"] #md-main-split { display: block; }
+.md-view[data-mode="split"] .md-source { border-right: 0; }
+.md-side-top { flex: 0 0 var(--md-side-top, 42%); }
+.md-side-chat { flex: 1 1 0; border-top: 0; }
+#md-side-split, #note-focus-card-split { flex: none; border-top: 1px solid var(--line); }
+/* Enlarged annotation: a compact card (where it hangs, its actions); its text and follow-ups are its chat below. */
+.note-focus-note { flex: none; max-height: 30%; overflow: auto; }
+.note-focus-note .annotation.is-focus-card { padding-bottom: 6px; }
+/* Editing an annotation enlarged: the editor takes the whole upper part. */
+.note-focus-note:has(.editing-inline) { display: flex; flex-direction: column; overflow: hidden; }
+.note-focus-note .annotation.editing-inline { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.note-focus-note .annotation.editing-inline .note-inline-text { flex: 1; min-height: 80px; resize: none; }
+.note-focus-note .annotation.editing-inline .markdown-content { flex: 1; min-height: 0; overflow: auto; }
+.relation-body:has(.relation-detail:not([hidden])) #relation-split { display: block; }
+#relation-split { flex: none; width: 8px; display: none; }
+.relation-detail { flex: 0 0 var(--relation-side, min(460px, 42%)); }
+@media (max-width: 960px) {
+  .md-layout { grid-template-columns: minmax(0, 1fr); }
+  #md-layout-split { display: none; }
+}
+@media (max-width: 900px) { #relation-split { display: none !important; } }
+
+/* Picture viewer and editor (ui/image-viewer.mjs). */
+.shared-image[data-block-id] { cursor: zoom-in; }
+.image-viewer { position: fixed; inset: 0; z-index: 120; display: flex; flex-direction: column; background: #10161b; color: #eef2f1; }
+.image-viewer[hidden] { display: none; }
+.image-viewer button { min-height: 30px; padding: 3px 11px; border-radius: 7px; border: 1px solid #ffffff2e; background: #ffffff12;
+  color: #eef2f1; font-size: 13px; }
+.image-viewer button:hover:not(:disabled) { background: #ffffff26; }
+.image-viewer button:disabled { opacity: .4; }
+.image-viewer button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.image-viewer button[aria-pressed="true"] { background: #ffffffe6; color: #10161b; border-color: #fff; }
+.image-viewer-bar, .image-editor-bar { flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 8px 12px;
+  border-bottom: 1px solid #ffffff1a; }
+.image-editor-bar[hidden] { display: none; }
+.image-viewer-title { font-size: 14px; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-viewer-spacer { flex: 1; }
+.image-viewer-zoom { min-width: 62px; font-variant-numeric: tabular-nums; }
+.image-viewer-close { font-size: 18px !important; width: 34px; padding: 0 !important; }
+.image-editor-group { display: flex; align-items: center; gap: 4px; padding-right: 8px; margin-right: 2px; border-right: 1px solid #ffffff1a; }
+.image-editor-group:last-child { border-right: 0; }
+.image-viewer .image-swatch { width: 24px; min-height: 24px; height: 24px; padding: 0; border-radius: 50%; border: 2px solid #ffffff55; }
+.image-viewer .image-swatch[aria-pressed="true"] { outline: 2px solid #fff; outline-offset: 2px; border-color: #10161b; }
+.image-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; cursor: grab; touch-action: none;
+  background: repeating-conic-gradient(#1b232a 0 25%, #151c22 0 50%) 0 0 / 24px 24px; }
+.image-viewer.is-panning .image-stage { cursor: grabbing; }
+.image-viewer.is-editing .image-stage { cursor: crosshair; }
+.image-viewer.is-editing[data-tool="pan"] .image-stage { cursor: grab; }
+.image-viewer.is-editing[data-tool="select"] .image-stage { cursor: default; }
+.image-viewer.is-editing[data-tool="text"] .image-stage { cursor: text; }
+.image-canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; box-shadow: 0 8px 40px #0008; }
+.image-picture { display: block; max-width: none; user-select: none; -webkit-user-drag: none; }
+.image-layer { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+.image-viewer.is-editing[data-tool="select"] .image-layer .image-shape { pointer-events: visiblePainted; cursor: move; }
+.image-viewer.is-editing .image-layer .image-shape[data-index] text { pointer-events: auto; }
+.image-selection { fill: none; stroke: #0090ff; pointer-events: none; }
+.image-text-input { position: absolute; z-index: 2; min-width: 120px; padding: 0; margin: 0; border: 1px dashed #0090ff; background: #ffffffd9;
+  font-weight: 600; line-height: 1.25; font-family: system-ui, "Microsoft YaHei", sans-serif; resize: none; outline: none; overflow: hidden; }
+.image-viewer-hint { flex: none; padding: 6px 14px; font-size: 12px; color: #aab6b4; border-top: 1px solid #ffffff12; }
+
+/* Enlarged annotation: the original on the left is the chat itself, embedded (mirror mode). */
+#note-focus-source:has(> iframe.embedded-chat) { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+
+/* The floating bar for selected text also shows above the enlarged annotation; inside an
+   annotation's own text it offers just highlight and underline. */
+.selection-tools { z-index: 80; }
+.selection-tools.for-note .selection-block-only { display: none; }
+
+/* In an annotation's chat, the message it hangs on comes first as context (read from its chat). */
+.paper-block.is-source-message { border: 1px dashed var(--line); background: color-mix(in srgb, var(--paper) 80%, transparent); }
+.paper-block.is-source-message .message-meta strong { color: var(--muted); }
+.source-context { color: var(--muted); font-size: 11.5px; }
+.message-meta .source-open { min-height: 24px; padding: 1px 9px; font-size: 12px; }
+
+
+/* Levels of the enlarged view (annotations and side questions, nested). */
+#focus-level-back { flex: none; min-height: 28px; font-size: 12px; }
+.focus-level-head { display: flex; align-items: baseline; gap: 8px; padding: 12px 16px 6px; min-width: 0; }
+.focus-level-head strong { color: var(--accent); font-size: 14px; flex: none; }
+.focus-level-quote { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* To-dos and their calendar (ui/todo-ui.mjs). */
+.todo-badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 4px;
+  border-radius: 999px; background: #e5484d; color: #fff; font-size: 11px; font-weight: 700; }
+.todo-badge[hidden] { display: none; }
+.todo-view { height: calc(100vh - var(--ribbon-height)); display: flex; flex-direction: column; padding: 18px 24px; }
+.todo-header { flex: none; display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.todo-header h1 { margin: 0; }
+.todo-header #todo-count { margin: 4px 0 0; }
+.todo-tools { display: flex; align-items: center; gap: 8px; }
+.todo-body { flex: 1; min-height: 0; display: flex; }
+.todo-main { flex: 1; min-width: 0; overflow: auto; padding-right: 4px; }
+#todo-split[hidden] { display: none; }
+.todo-detail { flex: 0 0 var(--todo-side, min(520px, 46%)); min-width: 320px; display: flex; flex-direction: column; overflow: hidden;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px; }
+.todo-detail[hidden] { display: none; }
+.todo-detail-head { flex: none; padding: 12px 16px 10px; border-bottom: 1px solid var(--line); }
+.todo-detail-head h2 { margin: 2px 0 4px; font-size: 16px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 8em; overflow: auto; }
+.todo-detail-head p.muted { margin: 0 0 8px; font-size: 12.5px; }
+.todo-detail-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.todo-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.todo-group { margin: 16px 2px 6px; font-size: 13px; color: var(--muted); }
+.todo-group-toggle { margin: 14px 0 6px; font-size: 13px; }
+.todo-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin-bottom: 6px; cursor: pointer;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px; }
+.todo-item:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.todo-item.is-selected { border-color: var(--accent); background: var(--tint); }
+.todo-item.is-done .todo-item-text { text-decoration: line-through; color: var(--muted); }
+.todo-item.is-ran { border-left: 4px solid #30a46c; }
+.todo-item.is-running { border-left: 4px solid #f5a524; }
+.todo-item input { margin-top: 3px; }
+.todo-item-body { min-width: 0; }
+.todo-item-text { white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.todo-item-meta { margin-top: 4px; font-size: 12px; color: var(--muted); }
+.todo-empty { margin: 30px 4px; }
+.todo-calendar-head { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.todo-calendar-head strong { min-width: 120px; text-align: center; }
+.todo-calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.todo-weekday { text-align: center; font-size: 12px; color: var(--muted); padding: 2px 0; }
+.todo-day { min-height: 92px; padding: 4px; display: flex; flex-direction: column; gap: 3px; background: var(--paper);
+  border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.todo-day.is-other { opacity: .5; }
+.todo-day.is-today { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.todo-day-number { font-size: 12px; color: var(--muted); }
+.todo-chip { min-height: 0; padding: 1px 5px; font-size: 11.5px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-radius: 5px; background: color-mix(in srgb, var(--accent) 14%, transparent); border: 0; }
+.todo-chip.is-ran { background: color-mix(in srgb, #30a46c 22%, transparent); }
+.todo-chip.is-done { text-decoration: line-through; opacity: .6; }
+.todo-chip.is-selected { outline: 2px solid var(--accent); }
+.todo-hint { font-size: 12px; margin: 8px 2px; }
+.todo-dialog { width: min(560px, calc(100vw - 32px)); }
+.todo-form { display: flex; flex-direction: column; gap: 10px; }
+.todo-form h2 { margin: 0; }
+.todo-source { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
+.todo-text { width: 100%; resize: vertical; min-height: 90px; }
+.todo-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.todo-row > span:first-child { min-width: 64px; color: var(--muted); font-size: 13px; }
+.todo-inline { display: inline-flex; align-items: center; gap: 6px; }
+.todo-inline input[type="number"] { width: 64px; }
+.todo-inline[hidden] { display: none; }
+@media (max-width: 900px) { .todo-body { flex-direction: column; } .todo-detail { flex: 1 1 60%; min-width: 0; } #todo-split { display: none; } }

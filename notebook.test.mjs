@@ -3,10 +3,108 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { commentInput, findAnchor, mainHistory, messageGroups, noteOrigin, sharedNoteBlocks, turnInput } from "./notebook.mjs";
+import { commentInput, findAnchor, mainHistory, messageGroups, noteOrigin, sharedNoteBlocks, threadInput, turnInput } from "./notebook.mjs";
 import { NotebookStore } from "./store.mjs";
 import { Profiles } from "./profiles.mjs";
 import { allAttachmentRefs } from "./attachments.mjs";
+import { buildPrompt } from "./codex.mjs";
+
+test("model session mode and reset belong to each chat and persist", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const first = store.read();
+    store.saveModelSession(first.id, "main:member-a", { id: "thread-1", profileId: "account-a" });
+    assert.equal(store.read().modelSessions["main:member-a"].id, "thread-1");
+    store.change({ type: "reset-model-sessions" });
+    assert.deepEqual(store.read().modelSessions, {});
+    assert.equal(store.read().modelSessionMode, undefined);
+    store.change({ type: "set-model-session-mode", mode: "manual" });
+    assert.equal(store.read().modelSessionMode, "manual");
+    store.saveModelSession(first.id, "main:member-a", { id: "thread-2", profileId: "account-a" });
+    store.saveModelSession(first.id, "branch:other:member-b", { id: "thread-3", profileId: "account-b" });
+    store.clearProfileModelSessions("account-a");
+    assert.deepEqual(Object.keys(store.read().modelSessions), ["branch:other:member-b"]);
+    store.change({ type: "set-model-session-mode", mode: "continue" });
+    assert.equal(store.read().modelSessionMode, "continue");
+    assert.deepEqual(store.read().modelSessions, {});
+  } finally {
+    store.close();
+  }
+});
+
+test("later questions receive bounded tool results from included messages and follow-up chats", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const fileRead = { id: "read-1", title: "Read", detail: "paper.txt 第 3 页", status: "done",
+      result: "第 3 页：样本量 214，主要结果为 91%。" };
+    const failed = { id: "read-2", title: "Read", status: "failed", result: "失败时的秘密内容" };
+    const saved = store.saveReply(null, "请看论文第 3 页", "主要结果为 91%。", undefined, [], undefined,
+      [fileRead, failed]);
+    const input = turnInput(saved, null, "样本量呢？");
+    assert.match(input.context, /第 3 页：样本量 214/);
+    assert.match(buildPrompt(input), /先前工具返回的摘录[\s\S]+第 3 页：样本量 214/);
+    assert.match(input.history[0].answer, /Read paper\.txt 第 3 页/);
+    assert.doesNotMatch(input.context, /失败时的秘密内容/);
+    const question = saved.blocks.find((block) => block.kind === "question");
+    store.change({ type: "set-context", ids: [question.id], noteIds: [] });
+    assert.doesNotMatch(turnInput(store.read(), null, "继续").context, /样本量 214/);
+    assert.doesNotMatch(mainHistory(store.read())[0].answer, /paper\.txt/);
+    const followup = commentInput({ kind: "selection", reference: "论文" },
+      [{ question: "第 3 页？", answer: "见原文", tools: [fileRead] }], "继续");
+    assert.match(followup.context, /样本量 214/);
+    const privateInput = threadInput(store.read(), {
+      turns: [{ question: "第 3 页？", answer: "见原文", tools: [fileRead] }]
+    }, "继续");
+    assert.match(privateInput.context, /样本量 214/);
+    assert.doesNotMatch(privateInput.context, /失败时的秘密内容/);
+    assert.ok(privateInput.context.length < 9000);
+    const branch = store.change({ type: "create-branch",
+      anchor: { blockId: question.id, start: 0, quote: "请看论文" } }).branches.at(-1);
+    store.saveReply(branch.id, "第 3 页？", "见原文", undefined, [], saved.id, [fileRead]);
+    const branchState = store.read(saved.id);
+    assert.match(turnInput(branchState, branchState.branches.at(-1), "继续").context, /样本量 214/);
+  } finally { store.close(); }
+});
+
+test("older tool output yields to recent findings under the context budget", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    for (let index = 0; index < 12; index += 1) {
+      store.saveReply(null, `问题 ${index}`, `回答 ${index}`, undefined, [], undefined,
+        [{ id: `read-${index}`, title: "Read", status: "done",
+          result: `第 ${index} 页的发现：` + "x".repeat(30_000) }]);
+    }
+    const context = turnInput(store.read(), null, "继续").context;
+    assert.match(context, /第 11 页的发现/);
+    assert.doesNotMatch(context, /第 0 页的发现/);
+    assert.ok(context.length < 161_000);
+  } finally { store.close(); }
+});
+
+test("tool output allowance shrinks when the existing conversation is long", () => {
+  const notebook = { title: "长会话", notes: [], branches: [], blocks: [
+    { id: "question", kind: "question", text: "前一问" },
+    { id: "reply", kind: "reply", text: "a".repeat(520_000),
+      tools: [{ id: "read", title: "Read", status: "done", result: "b".repeat(100_000) }] }
+  ] };
+  const input = turnInput(notebook, null, "继续");
+  assert.ok(input.context.length < 41_000);
+  assert.ok(buildPrompt(input).length < 600_000);
+});
+
+test("tool result excerpts survive reopening a chat database", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "ai-notebook-tool-result-")), "notes.sqlite");
+  let store = new NotebookStore(path);
+  try {
+    const saved = store.saveReply(null, "查第 8 页", "结论", undefined, [], undefined,
+      [{ id: "read-8", title: "Read", status: "done",
+        result: "第 8 页：置信区间 95%。" + "数据".repeat(5_000) + "末尾仍在" }]);
+    store.close();
+    store = new NotebookStore(path);
+    assert.match(turnInput(store.read(saved.id), null, "置信区间是多少？").context, /置信区间 95%/);
+    assert.match(turnInput(store.read(saved.id), null, "末尾是什么？").context, /末尾仍在/);
+  } finally { store.close(); }
+});
 
 test("annotation replies stay local and a fork copies their context into editable history", () => {
   const store = new NotebookStore(":memory:");
@@ -161,7 +259,8 @@ test("selected messages create an independent chat with its question, tool log, 
     const copied = store.createFromMessages(second.id, [second.blocks.find((block) =>
       block.kind === "reply" && block.text === "第二答前段。").id]).state;
     assert.deepEqual(mainHistory(copied).map(({ question, answer }) => ({ question, answer })),
-      [{ question: "第二问", answer: "第二答前段。\n\n第二答后段。" }]);
+      [{ question: "第二问", answer: "第二答前段。\n\n第二答后段。\n\n" +
+        "〔这轮回答前用过的工具：搜索网页〕" }]);
     assert.equal(copied.blocks.find((block) => block.id === question.id)?.text, "第二问");
     assert.equal(copied.blocks.find((block) => block.tools?.length)?.tools[0].title, "搜索网页");
     assert.equal(copied.notes[0].id, note.id);
@@ -301,7 +400,8 @@ test("group members each speak through an account with their own model, avatar a
   try {
     const profiles = new Profiles(store.db);
     const initial = profiles.read();
-    assert.deepEqual(initial.members.map((member) => member.name), ["gpt1", "claude1"]);
+    // Every account starts with a member, the Gemini (Antigravity) login included.
+    assert.deepEqual(initial.members.map((member) => member.name), ["gpt1", "claude1", "gemini1"]);
     assert.equal(profiles.member().member.name, "gpt1");
     profiles.change({ type: "model", model: "gpt-first" });
     profiles.change({ type: "effort", effort: "low" });
@@ -323,10 +423,12 @@ test("group members each speak through an account with their own model, avatar a
     assert.deepEqual([profiles.read().usage[claude2.id].turns, profiles.read().usage[claude2.id].outputTokens], [2, 21]);
     profiles.change({ type: "member-remove", id: profiles.read().members.at(-1).id });
     profiles.change({ type: "member-remove", id: initial.members[1].id });
-    assert.equal(profiles.read().members.length, 2);
+    assert.equal(profiles.read().members.length, 3);
+    // A member removed on purpose is not brought back on the next start.
+    assert.equal(new Profiles(store.db).read().members.length, 3);
     profiles.change({ type: "members-import" });
-    // The removed claude1's account, plus the Gemini (Antigravity) login.
-    assert.equal(profiles.read().lastImport, 2);
+    // The removed claude1's account.
+    assert.equal(profiles.read().lastImport, 1);
     assert.ok(profiles.read().members.some((member) => member.name === "gemini1"));
     assert.throws(() => profiles.change({ type: "account-add", provider: "gemini", name: "第二个" }), /本机/);
     assert.throws(() => profiles.change({ type: "account-remove", id: "gpt-native" }), /本机账户/);
@@ -486,9 +588,9 @@ test("a chat gets its own members, several of them on one account with different
     const id = store.read().id;
     const { state, result: added } = store.changeMembers(id, { type: "member-add", profileId: "claude-native",
       name: "审稿人", prompt: "你只指出漏洞。" }, profiles.read());
-    assert.deepEqual(state.members.map((member) => member.name), ["gpt1", "claude1", "审稿人"]);
+    assert.deepEqual(state.members.map((member) => member.name), ["gpt1", "claude1", "gemini1", "审稿人"]);
     assert.equal(added.profileId, "claude-native");
-    assert.equal(profiles.read().members.length, 2);
+    assert.equal(profiles.read().members.length, 3);
     const other = store.create("另一份").state;
     assert.equal(other.members, undefined);
     assert.throws(() => store.changeMembers(id, { type: "member-update", id: added.id, prompt: "x".repeat(4001) },

@@ -5,8 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; font-src 'self' blob: data:; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>AI 笔记本</title>
+  <link rel="stylesheet" href="katex/katex.min.css">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="workspace.css">
+  <link rel="stylesheet" href="features.css">
+  <link rel="stylesheet" href="windows.css">
 </head>
 <body>
   <header class="app-header">
@@ -15,8 +18,8 @@
       <div class="brand"><span class="brand-icon" aria-hidden="true">▤</span>AI 笔记本</div>
       <nav aria-label="工作区视图">
         <button type="button" data-view="document" aria-current="page">正文</button>
-        <button type="button" data-view="canvas">分支画布</button>
-        <button type="button" data-view="pdf">PDF 审阅</button>
+        <button type="button" data-view="canvas">关系图</button>
+        <button type="button" data-view="todos">待办 <span id="todo-badge" class="todo-badge" hidden></span></button>
       </nav>
       <div class="account">
         <label class="account-caption" for="member-picker">默认成员</label>
@@ -32,7 +35,7 @@
         <span class="tool-label" aria-hidden="true">编辑</span>
         <button type="button" data-action="select-messages" aria-pressed="false" title="也可按住 Ctrl 或 Shift 点消息来多选">多选消息</button>
         <button type="button" data-action="new-shared-block" title="插入到选中消息下方；未选中时插入到对话末尾（快捷键 B，上方用 A）">新建笔记块</button>
-        <button type="button" data-action="choose-note-images" title="插入到选中消息下方；未选中时插入到对话末尾">插入图片</button>
+        <button type="button" data-action="choose-note-images" title="图片或 PDF，插入到选中消息下方；未选中时插入到对话末尾。PDF 笔记可预览，右键可审阅">插入图片/PDF</button>
         <button type="button" data-action="highlight"><span class="highlight-icon" aria-hidden="true">A</span>高亮</button>
         <button type="button" data-action="underline"><span class="underline-icon" aria-hidden="true">U</span>下划线</button>
       </div>
@@ -45,6 +48,8 @@
         <span class="tool-label" aria-hidden="true">对话</span>
         <button type="button" data-action="ask" class="primary document-tools" aria-controls="side-chat" aria-expanded="false">侧边提问</button>
         <button type="button" data-action="branch">从选区建分支</button>
+        <button type="button" data-action="open-threads" class="document-tools" title="开一个和某位成员单独聊的小窗；群聊里回答还在生成时直接发新问题，它也会转进小窗">私聊小窗</button>
+        <button type="button" data-action="add-todo" class="document-tools" title="把选中的文字（没有选中时是当前这条消息）加入待办，可以设时间让 AI 去做">加入待办</button>
       </div>
       <div class="tool-group" role="group" aria-label="外观">
         <button type="button" data-action="appearance">✦ 外观</button>
@@ -72,9 +77,20 @@
       </div>
       <h2>主题与会话</h2>
       <nav id="notebook-list" aria-label="切换笔记"></nav>
-      <section id="recent-review-section" hidden>
-        <h2>PDF 审阅</h2>
-        <button type="button" id="recent-review" data-view="pdf"></button>
+      <section class="review-library" aria-label="PDF 审阅">
+        <div class="review-library-head">
+          <h2>PDF 审阅</h2>
+          <button type="button" data-action="open-pdf-file" title="打开电脑上的 PDF 或 .aipdf 来审阅">＋ 打开</button>
+        </div>
+        <div id="review-list" class="review-list"></div>
+      </section>
+      <section class="review-library md-library" aria-label="Markdown 文档">
+        <div class="review-library-head">
+          <h2 title="Markdown 文档">MD 文档</h2>
+          <button type="button" data-action="md-open-file" title="打开电脑上的 .md 文件，也可以把文件拖进窗口">＋ 打开</button>
+          <button type="button" data-action="md-new" title="新建一份空白文档">＋ 新建</button>
+        </div>
+        <div id="md-list" class="review-list"></div>
       </section>
       <button type="button" class="apps-entry" data-view="apps">应用与账户</button>
       <button type="button" class="data-manage" data-action="open-data">数据管理与备份</button>
@@ -85,6 +101,7 @@
       <section class="document-grid" id="document-grid" aria-label="正文和批注">
         <header class="paper-title">
           <p class="eyebrow">AI NOTEBOOK · 对话与灵感</p>
+          <p id="chat-parent" class="chat-parent" hidden></p>
           <h1 id="document-title"></h1>
           <details id="notebook-origin" class="notebook-origin" hidden>
             <summary>来源批注</summary>
@@ -94,45 +111,36 @@
           </details>
         </header>
         <div class="margin-heading"><h2>页边批注</h2><span id="note-count"></span></div>
-        <input type="file" id="note-image-files" accept=".png,.jpg,.jpeg,.webp" multiple hidden>
+        <input type="file" id="note-image-files" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple hidden>
         <div id="blocks" class="blocks" aria-label="对话和笔记块"></div>
         <section class="paper-end">
           <div id="main-pending" class="pending" hidden></div>
-          <form id="main-form" class="composer">
-            <label for="main-question" id="main-prompt-label">向 GPT 提问</label>
-            <details id="main-context">
-              <summary>主对话上下文 <span id="main-context-count"></span></summary>
-              <div class="context-content">
-                <div id="context-scope" class="context-scope"></div>
-                <p>点消息旁的铅笔可单独编辑；公共笔记块会进入 AI 上下文。</p>
-                <fieldset id="main-memory-choices" hidden><legend>带入的记忆</legend><div id="main-memory-list"></div></fieldset>
+          <details id="main-context">
+            <summary>主对话上下文 <span id="main-context-count"></span></summary>
+            <div class="context-content">
+              <div id="context-scope" class="context-scope"></div>
+              <div class="model-session-controls">
+                <label><input id="session-continue" type="checkbox" checked> 续接模型会话</label>
+                <button type="button" data-action="reset-model-session">按当前上下文重开底层会话</button>
+                <small>默认续接。修改已选消息后会自动重开；关闭开关则每轮按当前上下文新开。适用于 GPT 和 Claude。</small>
               </div>
-            </details>
-            <div id="main-attachments" class="attachments" hidden></div>
-            <div id="mention-bar" class="mention-bar" aria-label="点名字 @ 成员"></div>
-            <div class="composer-row">
-              <textarea id="main-question" rows="2" maxlength="10000" placeholder="输入问题，用 @名字 指定谁回答，可以 @ 多位" required></textarea>
-              <button class="primary" type="submit">发送</button>
+              <p>点消息旁的铅笔可单独编辑；公共笔记块会进入 AI 上下文。</p>
+              <fieldset id="main-memory-choices" hidden><legend>带入的记忆</legend><div id="main-memory-list"></div></fieldset>
             </div>
-            <div class="file-tools">
-              <input type="file" id="main-files" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple hidden>
-              <button type="button" data-action="choose-files" data-composer="main">＋ 附件</button>
-              <span title="PDF、PNG、JPG、WebP">也可 Ctrl+V 粘贴截图</span>
-              <span id="mention-hint" class="mention-hint" aria-live="polite"></span>
-              <span class="work-dir" id="work-dir">
-                <button type="button" data-action="choose-work-dir" id="work-dir-label" title="选择这个聊天里模型读写文件的文件夹"></button>
-                <button type="button" data-action="open-work-dir" class="work-dir-icon" title="在资源管理器中打开" aria-label="打开工作文件夹">↗</button>
-                <button type="button" data-action="clear-work-dir" class="work-dir-icon" id="clear-work-dir" title="改回默认文件夹" aria-label="清除工作文件夹">×</button>
-              </span>
-            </div>
-          </form>
+          </details>
+          <span class="work-dir" id="work-dir">
+            <button type="button" data-action="choose-work-dir" id="work-dir-label" title="选择这个聊天里模型读写文件的文件夹"></button>
+            <button type="button" data-action="open-work-dir" class="work-dir-icon" title="在资源管理器中打开" aria-label="打开工作文件夹">↗</button>
+            <button type="button" data-action="clear-work-dir" class="work-dir-icon" id="clear-work-dir" title="改回默认文件夹" aria-label="清除工作文件夹">×</button>
+          </span>
+          <div id="main-composer" class="main-composer"></div>
         </section>
       </section>
 
       <aside id="side-chat" class="side-chat" aria-label="侧边对话" hidden>
         <header class="side-header">
           <div><p class="eyebrow" id="chat-provider">GPT</p><h2>侧边对话</h2></div>
-          <div class="side-header-actions"><button type="button" data-action="focus-branch" title="放大分支">放大</button><button type="button" data-action="close-chat">收起</button></div>
+          <div class="side-header-actions"><button type="button" data-action="branch-full" title="在新窗口以完整会话打开这条分支：编辑、收起、高亮、转批注等都能用">完整会话 ↗</button><button type="button" data-action="focus-branch" title="放大分支">放大</button><button type="button" data-action="close-chat">收起</button></div>
         </header>
         <div class="side-actions">
           <button type="button" data-action="locate-branch">定位原文</button>
@@ -149,19 +157,8 @@
         </details>
         <div id="side-turns" class="side-turns"></div>
         <div id="side-pending" class="pending" hidden></div>
-        <form id="side-form" class="composer">
-          <label class="sr-only" for="side-question">针对这一段提问</label>
-          <div id="side-attachments" class="attachments" hidden></div>
-          <div class="composer-row">
-            <textarea id="side-question" rows="2" maxlength="10000" placeholder="针对这一段提问" required></textarea>
-            <button class="primary" type="submit">发送</button>
-          </div>
-          <div class="file-tools">
-            <input type="file" id="side-files" accept=".pdf,.png,.jpg,.jpeg,.webp" multiple hidden>
-            <button type="button" data-action="choose-files" data-composer="side">＋ 附件</button>
-            <span>PDF、图片</span>
-          </div>
-        </form>
+        <div id="side-composer"></div>
+        <div id="side-embedded" class="side-embedded"></div>
       </aside>
     </div>
   </main>
@@ -176,9 +173,62 @@
     <button type="button" data-action="cancel-message-selection">取消</button>
   </div>
 
+  <main id="md-view" class="pdf-review-view md-view" aria-label="Markdown 文档" data-mode="preview" hidden>
+    <div class="review-toolbar md-toolbar">
+      <button type="button" data-action="close-focus" class="review-back">← 关闭文档</button>
+      <div class="review-file-info md-file-info">
+        <strong id="md-name">Markdown 文档</strong>
+        <span id="md-path" class="md-path"></span>
+        <span id="md-status" class="md-status"></span>
+      </div>
+      <div class="md-modes" role="group" aria-label="显示方式">
+        <button type="button" data-md-mode="preview" aria-pressed="true">预览</button>
+        <button type="button" data-md-mode="split" aria-pressed="false">分栏</button>
+        <button type="button" data-md-mode="source" aria-pressed="false">源码</button>
+      </div>
+      <button type="button" id="md-ask" disabled title="就选中的文字提问">问所选</button>
+      <button type="button" id="md-annotate" disabled title="给选中的文字写批注">批注所选</button>
+      <button type="button" id="md-save" class="primary" title="写回 .md 文件（Ctrl+S）">保存到文件</button>
+      <button type="button" id="md-save-as" title="保存为另一个 .md 文件（Ctrl+Shift+S）">另存为…</button>
+      <button type="button" id="md-reveal" title="在资源管理器中显示文件">打开所在文件夹</button>
+    </div>
+    <div class="md-layout">
+      <div class="md-main">
+        <textarea id="md-source" class="md-source" spellcheck="false" aria-label="Markdown 源码"></textarea>
+        <div class="splitter is-columns" id="md-main-split" aria-label="调整源码和预览的宽度"></div>
+        <article id="md-preview" class="md-preview markdown-content" aria-label="预览"></article>
+      </div>
+      <div class="splitter is-columns" id="md-layout-split" aria-label="调整文档和侧栏的宽度"></div>
+      <aside class="md-side" aria-label="批注和对话">
+        <div class="md-side-top">
+        <section id="md-selection-chat" class="review-card review-selection-chat" aria-label="选区对话" hidden>
+          <header><h2>所选文字</h2><button type="button" id="md-selection-close" aria-label="关闭选区对话">×</button></header>
+          <div id="md-selection-preview"></div>
+          <div id="md-selection-conversation"></div>
+        </section>
+        <div class="md-side-head"><h2>批注</h2><span id="md-count"></span></div>
+        <div id="md-comment-list"></div>
+        </div>
+        <div class="splitter is-rows" id="md-side-split" aria-label="调整批注和对话的高度"></div>
+        <div class="md-side-chat">
+          <div class="md-side-head md-chat-head">
+            <button type="button" id="md-chat-back" class="review-chat-back" hidden title="回到整篇文档的对话">← 全文对话</button>
+            <h2 id="md-chat-title">全文对话</h2><span id="md-chat-count"></span>
+            <button type="button" id="md-chat-full" class="review-chat-full" title="在新窗口以完整会话打开">完整会话 ↗</button>
+          </div>
+          <div id="md-document-conversation" class="md-embedded-chat"></div>
+        </div>
+      </aside>
+    </div>
+    <div id="md-tools" class="selection-tools" role="group" aria-label="对选中文字操作" hidden>
+      <button type="button" class="primary" id="md-tools-ask">问 AI</button>
+      <button type="button" id="md-tools-note">批注</button>
+    </div>
+  </main>
+
   <main id="pdf-view" class="pdf-review-view" aria-label="PDF 审阅" hidden>
     <div class="review-toolbar">
-      <button type="button" data-action="close-focus" class="review-back">← 返回聊天</button>
+      <button type="button" data-action="close-focus" class="review-back">← 关闭审阅</button>
       <input type="file" id="review-file" accept=".aipdf,.pdf" hidden>
       <button type="button" id="review-open">打开</button>
       <div class="review-file-info"><strong id="review-name">PDF 审阅</strong><span id="review-dirty" hidden>未保存</span></div>
@@ -195,11 +245,13 @@
         <button type="button" id="review-ask" disabled>问选区</button>
         <button type="button" id="review-box-mode" aria-pressed="false" title="拖出一个矩形，把截图带到右栏提问">框选提问</button>
       </div>
-      <button type="button" id="review-save" class="primary" hidden>保存审阅</button>
+      <button type="button" id="review-popout" data-action="pop-out-review" hidden title="把这份 PDF 放到单独的窗口，可以拖到另一块屏幕，会话留在这里">在新窗口打开</button>
+      <button type="button" id="review-export" hidden title="把这个 PDF 和它的批注、对话另存为 .aipdf 文件">导出 .aipdf</button>
+      <button type="button" id="review-save" hidden disabled>已自动保存</button>
     </div>
     <div class="review-empty" id="review-empty">
       <h1>打开 PDF 开始审阅</h1>
-      <p>选择 PDF 或 .aipdf 审阅文件，在页边查看和编辑批注。</p>
+      <p>点「打开」选择 PDF 或 .aipdf。也可以在聊天里右键任何 PDF，选「审阅」。</p>
     </div>
     <div id="review-layout" class="review-layout" hidden>
       <div id="review-scroll" class="review-scroll" aria-label="PDF 页面">
@@ -215,7 +267,9 @@
         </div>
         </div>
       </div>
-      <aside class="review-comments" aria-label="PDF 批注">
+      <div class="splitter is-columns" id="review-split" aria-label="调整 PDF 和侧栏的宽度"></div>
+      <aside class="review-comments" id="review-side" aria-label="PDF 批注和对话">
+        <div id="review-comments-pane" class="review-pane">
         <section id="review-selection-chat" class="review-card review-selection-chat" aria-label="PDF 选区对话" hidden>
           <header><h2 id="review-selection-title">选区对话</h2><button type="button" id="review-selection-close" aria-label="关闭选区对话">×</button></header>
           <div id="review-selection-preview"></div>
@@ -223,13 +277,24 @@
         </section>
         <header>
           <div><h2>批注</h2><p id="review-count"></p></div>
-          <button type="button" id="review-add" disabled>新建批注</button>
+          <div class="review-comment-actions"><button type="button" id="review-move-message" hidden disabled>挂选中为批注</button><button type="button" id="review-add" disabled>新建批注</button></div>
         </header>
         <div class="review-comment-nav">
           <button type="button" id="review-comment-prev">上一条</button>
           <button type="button" id="review-comment-next">下一条</button>
         </div>
         <div id="review-comment-list"></div>
+        </div>
+        <div class="splitter is-rows" id="review-side-split" aria-label="调整批注和全文对话的高度"></div>
+        <div id="review-chat-pane" class="review-pane review-chat-pane">
+          <header class="review-chat-head">
+            <button type="button" id="review-chat-back" class="review-chat-back" hidden title="回到整份 PDF 的对话">← 全文对话</button>
+            <h2 id="review-chat-title">全文对话</h2><span id="review-chat-count"></span>
+            <button type="button" id="review-chat-full" class="review-chat-full" title="在新窗口以完整会话打开">完整会话 ↗</button>
+          </header>
+          <p class="muted" id="review-chat-hint">和群聊成员讨论整份 PDF：PDF 正文和已有批注会一起发给回答的成员。</p>
+          <div id="review-document-conversation" class="review-embedded-chat"></div>
+        </div>
       </aside>
     </div>
   </main>
@@ -244,38 +309,133 @@
     <p class="muted apps-footnote">GPT 显示 ChatGPT 订阅的 5 小时和每周额度。Claude Code 不提供剩余百分比，只在回答时附带限额状态和重置时间。用量是这个应用里统计的回答次数和 token（由各 CLI 报告）。</p>
   </main>
 
-  <main id="canvas-view" class="canvas-view" hidden>
-    <header class="canvas-header">
-      <div><p class="eyebrow">工作笔记</p><h1>分支画布</h1></div>
-      <p id="branch-count" class="muted"></p>
-    </header>
-    <div class="canvas-scroll">
-      <div id="canvas-board" class="canvas-board">
-        <svg id="canvas-links" aria-hidden="true"></svg>
-        <div id="canvas-nodes"></div>
+  <main id="todo-view" class="todo-view" hidden>
+    <header class="todo-header">
+      <div><p class="eyebrow">待办与日历</p><h1>待办</h1><p id="todo-count" class="muted"></p></div>
+      <div class="todo-tools">
+        <button type="button" class="primary" id="todo-new">＋ 新待办</button>
+        <div class="md-modes" role="group" aria-label="显示方式">
+          <button type="button" data-todo-mode="list" aria-pressed="true">列表</button>
+          <button type="button" data-todo-mode="calendar" aria-pressed="false">月历</button>
+        </div>
       </div>
+    </header>
+    <div class="todo-body">
+      <div class="todo-main">
+        <div id="todo-list" class="todo-list"></div>
+        <div id="todo-calendar" class="todo-calendar" hidden></div>
+      </div>
+      <div class="splitter is-columns" id="todo-split" aria-label="调整列表和待办会话的宽度" hidden></div>
+      <aside id="todo-detail" class="todo-detail" hidden>
+        <header class="todo-detail-head">
+          <p class="eyebrow">待办</p>
+          <h2 id="todo-detail-text"></h2>
+          <p id="todo-detail-meta" class="muted"></p>
+          <div id="todo-detail-actions" class="todo-detail-actions"></div>
+        </header>
+        <div id="todo-chat" class="todo-chat"></div>
+      </aside>
     </div>
-    <div class="canvas-detail" id="canvas-detail" hidden>
-      <div><strong id="branch-title"></strong><p class="muted" id="branch-quote"></p></div>
-      <button type="button" class="primary" data-action="open-branch">打开侧边对话</button>
+  </main>
+
+  <main id="canvas-view" class="canvas-view relation-view" hidden>
+    <header class="canvas-header relation-header">
+      <div><p class="eyebrow">这段会话派生出的对话</p><h1>关系图</h1><p id="relation-count" class="muted"></p></div>
+      <div class="relation-tools">
+        <button type="button" id="relation-expand">全部收起</button>
+        <div class="md-modes" role="group" aria-label="显示方式">
+          <button type="button" data-relation-mode="graph" aria-pressed="true">图</button>
+          <button type="button" data-relation-mode="tree" aria-pressed="false">树</button>
+        </div>
+      </div>
+    </header>
+    <div class="relation-body">
+      <div class="canvas-scroll relation-scroll">
+        <div id="relation-board" class="canvas-board relation-board">
+          <svg id="relation-links" class="relation-links" aria-hidden="true"></svg>
+          <div id="relation-nodes"></div>
+        </div>
+        <div id="relation-outline" class="relation-outline" hidden></div>
+      </div>
+      <div class="splitter is-columns" id="relation-split" aria-label="调整关系图和会话的宽度"></div>
+      <aside id="relation-detail" class="relation-detail" hidden>
+        <header class="relation-detail-head">
+          <div><p class="eyebrow" id="relation-kind"></p><h2 id="relation-title"></h2><p id="relation-quote" class="muted"></p></div>
+          <button type="button" id="relation-close" title="关闭">×</button>
+        </header>
+        <div id="relation-actions" class="relation-actions"></div>
+        <div id="relation-chat" class="relation-chat"></div>
+      </aside>
     </div>
   </main>
     </div>
   </div>
+
+  <section id="note-focus" class="note-focus" aria-label="批注与追问" hidden>
+    <div class="note-focus-source">
+      <header class="note-focus-heading">
+        <button type="button" id="focus-level-back" data-action="focus-level-back" title="回到上一层" hidden>← 上一层</button>
+        <div><p class="eyebrow" id="note-focus-eyebrow">原文 · 完整对话</p><p id="note-focus-reference" class="note-focus-reference"></p></div>
+        <button type="button" id="locate-focused-note" data-action="locate-focused-note">在正文中定位</button>
+      </header>
+      <div id="note-focus-source" class="note-focus-message"></div>
+    </div>
+    <div class="splitter is-columns" id="note-focus-split" aria-label="调整原文和批注的宽度"></div>
+    <div id="note-focus-card" class="note-focus-card">
+      <div id="note-focus-note" class="note-focus-note"></div>
+      <div class="note-focus-chat-head"><h2 id="note-focus-chat-title">批注会话 · 批注正文和追问</h2><button type="button" data-action="note-focus-full" title="在新窗口打开这条批注的会话">完整会话 ↗</button></div>
+      <div id="note-focus-chat" class="note-focus-chat"></div>
+    </div>
+  </section>
+
+  <div id="thread-windows" class="thread-windows" aria-label="私聊小窗"></div>
+  <nav id="thread-dock" class="thread-dock" aria-label="私聊小窗"></nav>
 
   <div id="annotation-pick-bar" class="message-selection-bar annotation-pick-bar" hidden>
     <strong>转为批注</strong>
     <span>选中任意消息里的一段文字后点「挂在这里」，或直接点一条消息挂在它开头。</span>
     <button type="button" data-action="pick-selection" class="primary">挂在选中文字上</button>
     <button type="button" data-action="pick-nearby">挂在相邻消息</button>
+    <button type="button" data-action="pick-other">其他会话 / 消息 ID…</button>
     <button type="button" data-action="pick-cancel">取消</button>
   </div>
   <div id="selection-tools" class="selection-tools" role="group" aria-label="对选中文字操作" hidden>
     <button type="button" class="primary" data-action="pick-selection" id="pick-here" hidden>把批注挂在这里</button>
-    <button type="button" class="primary" data-action="ask">侧边追问</button>
-    <button type="button" data-action="note">写批注</button>
+    <button type="button" data-action="highlight">高亮</button>
+    <button type="button" data-action="underline">下划线</button>
+    <button type="button" class="primary selection-block-only" data-action="ask">侧边追问</button>
+    <button type="button" data-action="note" class="selection-block-only">写批注</button>
+    <button type="button" data-action="add-todo">加入待办</button>
   </div>
   <div id="status" class="status" role="status" hidden></div>
+  <div id="context-menu" class="context-menu" role="menu" hidden></div>
+  <dialog id="annotation-target-dialog" class="appearance-dialog annotation-target-dialog" aria-labelledby="annotation-target-heading">
+    <div class="appearance-heading"><div><p class="eyebrow">MOVE TO ANNOTATION</p><h2 id="annotation-target-heading">选择批注位置</h2></div>
+      <button type="button" id="annotation-target-close" aria-label="关闭">×</button></div>
+    <p class="muted">可以浏览上层或下层会话，选择消息及其中一段文字；也可以粘贴消息 ID 直接定位。</p>
+    <div class="annotation-target-shortcuts">
+      <button type="button" id="annotation-target-current">在当前会话选文字</button>
+      <button type="button" id="annotation-target-pdf" hidden>挂到 PDF 原文</button>
+      <label>筛选会话 <input id="annotation-target-search" type="search" placeholder="标题、PDF 或批注" autocomplete="off"></label>
+      <label>消息 ID <input id="annotation-target-id" type="text" placeholder="粘贴消息 ID" autocomplete="off" spellcheck="false"></label>
+      <button type="button" id="annotation-target-find">定位 ID</button>
+    </div>
+    <div class="annotation-target-browser">
+      <nav id="annotation-target-tree" aria-label="会话层级"></nav>
+      <section class="annotation-target-content">
+        <h3 id="annotation-target-title">选择会话</h3>
+        <div id="annotation-target-messages" aria-label="可作为批注位置的消息"></div>
+        <label>消息段落 <select id="annotation-target-block" disabled></select></label>
+        <textarea id="annotation-target-text" readonly rows="6" aria-label="选择要挂靠的原文"></textarea>
+        <p id="annotation-target-hint" class="annotation-target-hint" hidden>这是一份 PDF 笔记。批注会挂在这张 PDF 卡片上，无需选中文件名。</p>
+        <p id="annotation-target-error" class="annotation-target-error" role="alert" hidden></p>
+        <div class="annotation-target-actions">
+          <button type="button" id="annotation-target-start" disabled>挂到消息开头</button>
+          <button type="button" id="annotation-target-selection" class="primary" disabled>挂到选中文字</button>
+        </div>
+      </section>
+    </div>
+  </dialog>
   <dialog id="appearance-dialog" class="appearance-dialog">
     <div class="appearance-heading"><div><p class="eyebrow">PERSONALIZE</p><h2>装扮你的笔记本</h2></div>
       <button type="button" data-action="close-appearance" aria-label="关闭外观设置">×</button></div>
@@ -285,7 +445,6 @@
     <h3>像素伙伴</h3>
     <div id="avatar-options" class="avatar-options"></div>
   </dialog>
-  <div id="mention-menu" class="mention-menu" role="listbox" aria-label="选择成员" hidden></div>
   <dialog id="members-dialog" class="appearance-dialog members-dialog">
     <div class="appearance-heading"><div><p class="eyebrow">GROUP CHAT</p><h2>本聊天成员</h2></div>
       <button type="button" data-action="close-members" aria-label="关闭成员管理">×</button></div>
