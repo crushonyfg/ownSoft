@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, net, Notification, powerMonitor, protocol, shell } from "electron";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
@@ -23,6 +23,7 @@ import {
 import { NotebookStore, requireText, validateMdComments } from "./store.mjs";
 import { mdCommentOrigin, mdDocumentOrigin, mdSelectionOrigin, mdTextLimit, reanchor } from "./md-document.mjs";
 import { childKey } from "./child-chats.mjs";
+import { todoPrompt } from "./todos.mjs";
 import { readReviewFile, saveReviewFile, validateComments, validateTurns } from "./pdf-review.mjs";
 import {
   Backups, checkDatabase, copyData, dataInfo, exportArchive, finishPendingCopy, hasDatabase, importArchive, replaceDatabase,
@@ -45,7 +46,7 @@ const files = new Map([
   ["/chat-composer.mjs", "ui/chat-composer.mjs"], ["/threads-ui.mjs", "ui/threads-ui.mjs"],
   ["/pdf-note.mjs", "ui/pdf-note.mjs"], ["/features.css", "ui/features.css"], ["/splitter.mjs", "ui/splitter.mjs"], ["/windows.css", "ui/windows.css"],
   ["/md-review-ui.mjs", "ui/md-review-ui.mjs"], ["/md-document.mjs", "md-document.mjs"], ["/embedded-chat.mjs", "ui/embedded-chat.mjs"],
-  ["/relation-view.mjs", "ui/relation-view.mjs"]
+  ["/relation-view.mjs", "ui/relation-view.mjs"], ["/structure-ui.mjs", "ui/structure-ui.mjs"], ["/image-viewer.mjs", "ui/image-viewer.mjs"], ["/todo-ui.mjs", "ui/todo-ui.mjs"]
 ]);
 protocol.registerSchemesAsPrivileged([
   { scheme: "notebook", privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }
@@ -78,8 +79,11 @@ const sessions = new Map();
 // The app's page, or the same page embedded to show one chat ("?embed=<chat id>") inside a PDF or
 // document review, an enlarged annotation, a branch or a private window.
 const embedPrefix = `${entryUrl}?embed=`;
+// An embedded chat: ?embed=<chat id>, optionally &mirror=1&focus=<annotation id> (the chat shown as
+// the original beside one of its annotations enlarged) or &back=<chat id> (opened from that chat,
+// one level up the tree).
 const appFrame = (url) => url === entryUrl || (typeof url === "string" && url.startsWith(embedPrefix) &&
-  /^[\da-f-]{36}$/i.test(url.slice(embedPrefix.length)));
+  /^[\da-f-]{36}(?:&(?:mirror=1|focus=[\w-]{1,80}|back=[\da-f-]{36}))*$/i.test(url.slice(embedPrefix.length)));
 
 // Every page in every window, embedded chats included.
 function frames() {
@@ -95,7 +99,7 @@ function handle(name, operation) {
     }
     try {
       const data = await operation(payload, owner);
-      if (/^(?:notebook:change|note:(?:add-images|add-md)|annotation:(?:move|undo)|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
+      if (/^(?:notebook:change|note:(?:add-images|add-md)|annotation:(?:move|undo)|structure:(?:apply|undo)|image:edit|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
         for (const frame of frames()) if (frame !== event.senderFrame) {
           try { frame.send("library:changed"); } catch {}
         }
@@ -105,6 +109,77 @@ function handle(name, operation) {
       return { ok: false, error: String(error.message || error) };
     }
   });
+}
+
+// ---- to-dos (todos.mjs): the AI works on them when their time comes ---------------------------
+const runningTodos = new Set();
+let checkingTodos = false;
+async function runDueTodos() {
+  if (checkingTodos || !store) return;
+  checkingTodos = true;
+  try {
+    for (const todo of store.dueTodos(Date.now())) await runTodo(todo.id).catch(() => {});
+  } finally {
+    checkingTodos = false;
+    scheduleTodos();
+  }
+}
+
+// No polling: a single timer waits for the next to-do due, and is set again whenever to-dos change
+// or one has run. Timers cannot wait longer than about 24 days, so a farther one is waited for in
+// steps.
+const longestWait = 20 * 24 * 60 * 60_000;
+let todoTimer = null;
+function scheduleTodos() {
+  clearTimeout(todoTimer);
+  todoTimer = null;
+  const next = store?.nextTodoDue();
+  if (next === null || next === undefined) return;
+  const wait = Math.max(1000, Math.min(next - Date.now(), longestWait));
+  todoTimer = setTimeout(() => {
+    todoTimer = null;
+    if (next - Date.now() > 1000) scheduleTodos();
+    else void runDueTodos();
+  }, wait);
+}
+
+// Asks the to-do's member, in the to-do's chat, to do it now. Its chat starts with the message it
+// came from; the AI can look further with its tools (the ownsoft notebook tools).
+async function runTodo(id) {
+  if (runningTodos.has(id)) throw new Error("这条待办正在执行。");
+  const todo = store.todo(id);
+  runningTodos.add(id);
+  notify("todos:changed");
+  try {
+    const chatId = store.openChildChat({ kind: "todo", itemId: id });
+    await generate({ requestId: randomUUID(), question: todoPrompt(todo), memberIds: todo.memberId ? [todo.memberId] : [],
+      attachmentIds: [], notebookId: chatId });
+    const done = store.finishTodoRun(id, { ok: true, dueAtStart: todo.dueAt });
+    announceTodo(done, `AI 已执行：${done.text.slice(0, 60)}`);
+    return done;
+  } catch (error) {
+    const failed = store.finishTodoRun(id, { ok: false, error: error.message });
+    announceTodo(failed, `待办执行失败：${error.message}`.slice(0, 120));
+    throw error;
+  } finally {
+    runningTodos.delete(id);
+    scheduleTodos();
+    notify("todos:changed");
+    notify("library:changed");
+  }
+}
+
+function announceTodo(todo, body) {
+  if (!Notification.isSupported()) return;
+  const note = new Notification({ title: "AI 笔记本 · 待办", body });
+  note.on("click", () => {
+    const target = [...windows].find((item) => !item.isDestroyed());
+    if (!target) return;
+    if (target.isMinimized()) target.restore();
+    target.focus();
+    target.webContents.send("todos:open", todo.id);
+  });
+  note.show();
 }
 
 function notify(event, value) {
@@ -654,7 +729,12 @@ async function parentContext(notebook, includePdf = true) {
       const owner = store.read(parent.notebookId);
       if (parent.kind === "note") {
         const note = owner.notes.find((item) => item.id === parent.noteId);
-        return note ? { context: commentContext(noteOrigin(owner, note)), refs: note.attachments || [] } : {};
+        if (!note) return {};
+        // The annotation's text is this chat's first note block (sent with the chat's notes), so
+        // the source only says where it hangs.
+        const origin = noteOrigin(owner, note);
+        const inChat = notebook.blocks.some((block) => block.noteType === "annotation" && !block.removed);
+        return { context: commentContext(inChat ? { ...origin, kind: "selection", text: "" } : origin), refs: note.attachments || [] };
       }
       if (parent.kind === "branch") {
         const branch = owner.branches.find((item) => item.id === parent.branchId);
@@ -665,6 +745,15 @@ async function parentContext(notebook, includePdf = true) {
       const thread = (owner.threads || []).find((item) => item.id === parent.threadId);
       const base = threadInput(owner, { turns: [], origin: thread?.origin }, "");
       return { context: base.context, history: base.history };
+    }
+    if (parent.kind === "todo") {
+      const todo = store.todo(parent.todoId);
+      if (!todo.chatId) return {};
+      const owner = store.read(todo.chatId);
+      const found = todo.blockId ? (() => { try { return store.findMessage(todo.blockId, todo.chatId); } catch { return null; } })() : null;
+      const message = found?.blocks.filter((block) => !block.removed).map((block) => block.text).join("\n\n");
+      return { context: [`来源：会话「${owner.title}」里的一条消息（待办就是从这里记下的）`,
+        todo.quote && `选中的文字：\n${todo.quote}`, message && `那条消息：\n${message}`].filter(Boolean).join("\n\n") };
     }
     if (parent.kind === "pdf-chat" || parent.kind === "pdf-comment") {
       const review = store.pdfReview(parent.hash);
@@ -977,7 +1066,20 @@ if (!app.requestSingleInstanceLock()) {
         console.error("Could not move conversations into chats:", error);
       }
     }
+    // Messages and annotations kept inside chat documents by earlier versions become rows (backed up first).
+    if (store.needsRowMove()) {
+      try {
+        backups.create("before-rows");
+        store.moveToRows();
+      } catch (error) {
+        console.error("Could not move messages into rows:", error);
+      }
+    }
     backupTimer = setInterval(autoBackup, autoBackupInterval);
+    // To-dos: one timer for the next one due (see scheduleTodos); right after start, the ones that
+    // came due while the app was closed; after the computer wakes, whatever came due while asleep.
+    setTimeout(() => void runDueTodos(), 15_000);
+    powerMonitor.on("resume", () => void runDueTodos());
     let dataVersion = store.db.prepare("PRAGMA data_version").get().data_version;
     externalChangeTimer = setInterval(() => {
       try {
@@ -985,6 +1087,9 @@ if (!app.requestSingleInstanceLock()) {
         if (next !== dataVersion) {
           dataVersion = next;
           notify("library:changed");
+          // e.g. the AI added or rescheduled a to-do through the ownsoft tools
+          scheduleTodos();
+          notify("todos:changed");
         }
       } catch (error) { console.error("Could not refresh external notebook changes:", error); }
     }, 1500);
@@ -1004,6 +1109,34 @@ if (!app.requestSingleInstanceLock()) {
     handle("annotation:messages", (id) => store.annotationMessages(id));
     handle("annotation:message", ({ notebookId, messageId }) => store.annotationMessage(notebookId, messageId));
     handle("annotation:resolve", (messageId) => store.resolveAnnotationMessage(messageId));
+    // Structural edits (move, remove, annotation <-> note block …), undoable; see store.structure.
+    const structured = ({ label, chats, focus }) => ({ label, chats, focus: focus || null });
+    handle("structure:apply", (op) => {
+      // A new picture file only comes from image:edit below; the page may only ask to restore.
+      if (op?.type === "edit-image" && !op.restore) throw new Error("请在图片编辑器里保存。");
+      return structured(store.structure(op));
+    });
+    // An edited image note: the flattened picture becomes a new attachment; the original and the
+    // shapes stay on the block (store "edit-image", undoable).
+    handle("image:edit", async ({ chatId, blockId, file, edit }) => {
+      if (!file || !ArrayBuffer.isView(file.data) || !/\.png$/i.test(String(file.name || ""))) throw new Error("图片无效。");
+      const { items, errors } = await attachments.stage([{ name: file.name, data: file.data }], 1);
+      if (!items.length) throw new Error(errors[0] || "图片无法保存。");
+      try {
+        const result = structured(store.structure({ type: "edit-image", chat: chatId, blockId, ref: items[0],
+          edit: { shapes: edit?.shapes, width: edit?.width, height: edit?.height } }));
+        attachments.commit(items);
+        return result;
+      } catch (error) {
+        await Promise.allSettled(items.map((ref) => attachments.remove(ref.id)));
+        throw error;
+      }
+    });
+    handle("structure:undo", () => structured(store.undoStructure()));
+    handle("structure:log", () => store.structureLog(30));
+    handle("structure:find", (id) => store.findMessage(id));
+    handle("structure:search", (text) => store.searchMessages(text, 20));
+    handle("structure:relations", (id) => store.relationsOf(id));
     handle("annotation:move", ({ sourceId, ids, targetId, anchor }) =>
       store.moveMessageToChatAnnotation(sourceId, ids, targetId, anchor));
     handle("annotation:undo", ({ targetId, noteId }) => store.undoChatAnnotation(targetId, noteId));
@@ -1034,9 +1167,29 @@ if (!app.requestSingleInstanceLock()) {
       if (kind === "md-chat" || kind === "md-comment") {
         return store.openChildChat({ kind, mdId: spec.mdId, commentId: spec.commentId, rosterId });
       }
+      if (kind === "todo") return store.openChildChat({ kind, itemId: spec.itemId });
       throw new Error("无法打开这段对话。");
     };
     handle("chat:child-id", (spec, owner) => childChatId(spec, owner));
+    // To-dos: listed with which are running; saved, deleted, or done by the AI now.
+    handle("todo:list", () => store.todos().map((todo) => ({ ...todo, running: runningTodos.has(todo.id) })));
+    handle("todo:save", ({ id, fields }) => {
+      const todo = store.saveTodo(fields || {}, id || null);
+      scheduleTodos();
+      notify("todos:changed");
+      return todo;
+    });
+    handle("todo:delete", (id) => {
+      if (runningTodos.has(id)) throw new Error("这条待办正在执行，请稍后再删。");
+      store.deleteTodo(id);
+      scheduleTodos();
+      notify("todos:changed");
+    });
+    handle("todo:run", (id) => {
+      // Runs in the background; the list shows it running and the result arrives in its chat.
+      runTodo(id).catch(() => {});
+      return true;
+    });
     // What grew out of a chat (annotations, branches, windows, PDF reviews …), for the relation view.
     handle("chat:tree", async (id) => {
       const tree = store.chatTree(typeof id === "string" && id ? id : store.activeId());

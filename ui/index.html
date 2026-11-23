@@ -19,6 +19,7 @@
       <nav aria-label="工作区视图">
         <button type="button" data-view="document" aria-current="page">正文</button>
         <button type="button" data-view="canvas">关系图</button>
+        <button type="button" data-view="todos">待办 <span id="todo-badge" class="todo-badge" hidden></span></button>
       </nav>
       <div class="account">
         <label class="account-caption" for="member-picker">默认成员</label>
@@ -48,6 +49,7 @@
         <button type="button" data-action="ask" class="primary document-tools" aria-controls="side-chat" aria-expanded="false">侧边提问</button>
         <button type="button" data-action="branch">从选区建分支</button>
         <button type="button" data-action="open-threads" class="document-tools" title="开一个和某位成员单独聊的小窗；群聊里回答还在生成时直接发新问题，它也会转进小窗">私聊小窗</button>
+        <button type="button" data-action="add-todo" class="document-tools" title="把选中的文字（没有选中时是当前这条消息）加入待办，可以设时间让 AI 去做">加入待办</button>
       </div>
       <div class="tool-group" role="group" aria-label="外观">
         <button type="button" data-action="appearance">✦ 外观</button>
@@ -193,8 +195,10 @@
     <div class="md-layout">
       <div class="md-main">
         <textarea id="md-source" class="md-source" spellcheck="false" aria-label="Markdown 源码"></textarea>
+        <div class="splitter is-columns" id="md-main-split" aria-label="调整源码和预览的宽度"></div>
         <article id="md-preview" class="md-preview markdown-content" aria-label="预览"></article>
       </div>
+      <div class="splitter is-columns" id="md-layout-split" aria-label="调整文档和侧栏的宽度"></div>
       <aside class="md-side" aria-label="批注和对话">
         <div class="md-side-top">
         <section id="md-selection-chat" class="review-card review-selection-chat" aria-label="选区对话" hidden>
@@ -205,6 +209,7 @@
         <div class="md-side-head"><h2>批注</h2><span id="md-count"></span></div>
         <div id="md-comment-list"></div>
         </div>
+        <div class="splitter is-rows" id="md-side-split" aria-label="调整批注和对话的高度"></div>
         <div class="md-side-chat">
           <div class="md-side-head md-chat-head">
             <button type="button" id="md-chat-back" class="review-chat-back" hidden title="回到整篇文档的对话">← 全文对话</button>
@@ -304,6 +309,35 @@
     <p class="muted apps-footnote">GPT 显示 ChatGPT 订阅的 5 小时和每周额度。Claude Code 不提供剩余百分比，只在回答时附带限额状态和重置时间。用量是这个应用里统计的回答次数和 token（由各 CLI 报告）。</p>
   </main>
 
+  <main id="todo-view" class="todo-view" hidden>
+    <header class="todo-header">
+      <div><p class="eyebrow">待办与日历</p><h1>待办</h1><p id="todo-count" class="muted"></p></div>
+      <div class="todo-tools">
+        <button type="button" class="primary" id="todo-new">＋ 新待办</button>
+        <div class="md-modes" role="group" aria-label="显示方式">
+          <button type="button" data-todo-mode="list" aria-pressed="true">列表</button>
+          <button type="button" data-todo-mode="calendar" aria-pressed="false">月历</button>
+        </div>
+      </div>
+    </header>
+    <div class="todo-body">
+      <div class="todo-main">
+        <div id="todo-list" class="todo-list"></div>
+        <div id="todo-calendar" class="todo-calendar" hidden></div>
+      </div>
+      <div class="splitter is-columns" id="todo-split" aria-label="调整列表和待办会话的宽度" hidden></div>
+      <aside id="todo-detail" class="todo-detail" hidden>
+        <header class="todo-detail-head">
+          <p class="eyebrow">待办</p>
+          <h2 id="todo-detail-text"></h2>
+          <p id="todo-detail-meta" class="muted"></p>
+          <div id="todo-detail-actions" class="todo-detail-actions"></div>
+        </header>
+        <div id="todo-chat" class="todo-chat"></div>
+      </aside>
+    </div>
+  </main>
+
   <main id="canvas-view" class="canvas-view relation-view" hidden>
     <header class="canvas-header relation-header">
       <div><p class="eyebrow">这段会话派生出的对话</p><h1>关系图</h1><p id="relation-count" class="muted"></p></div>
@@ -323,6 +357,7 @@
         </div>
         <div id="relation-outline" class="relation-outline" hidden></div>
       </div>
+      <div class="splitter is-columns" id="relation-split" aria-label="调整关系图和会话的宽度"></div>
       <aside id="relation-detail" class="relation-detail" hidden>
         <header class="relation-detail-head">
           <div><p class="eyebrow" id="relation-kind"></p><h2 id="relation-title"></h2><p id="relation-quote" class="muted"></p></div>
@@ -339,15 +374,16 @@
   <section id="note-focus" class="note-focus" aria-label="批注与追问" hidden>
     <div class="note-focus-source">
       <header class="note-focus-heading">
-        <div><p class="eyebrow">原文 · 完整对话</p><p id="note-focus-reference" class="note-focus-reference"></p></div>
-        <button type="button" data-action="locate-focused-note">在正文中定位</button>
+        <button type="button" id="focus-level-back" data-action="focus-level-back" title="回到上一层" hidden>← 上一层</button>
+        <div><p class="eyebrow" id="note-focus-eyebrow">原文 · 完整对话</p><p id="note-focus-reference" class="note-focus-reference"></p></div>
+        <button type="button" id="locate-focused-note" data-action="locate-focused-note">在正文中定位</button>
       </header>
       <div id="note-focus-source" class="note-focus-message"></div>
     </div>
     <div class="splitter is-columns" id="note-focus-split" aria-label="调整原文和批注的宽度"></div>
     <div id="note-focus-card" class="note-focus-card">
       <div id="note-focus-note" class="note-focus-note"></div>
-      <div class="note-focus-chat-head"><h2>追问 · 完整会话</h2><button type="button" data-action="note-focus-full" title="在新窗口打开这段追问">完整会话 ↗</button></div>
+      <div class="note-focus-chat-head"><h2 id="note-focus-chat-title">批注会话 · 批注正文和追问</h2><button type="button" data-action="note-focus-full" title="在新窗口打开这条批注的会话">完整会话 ↗</button></div>
       <div id="note-focus-chat" class="note-focus-chat"></div>
     </div>
   </section>
@@ -365,8 +401,11 @@
   </div>
   <div id="selection-tools" class="selection-tools" role="group" aria-label="对选中文字操作" hidden>
     <button type="button" class="primary" data-action="pick-selection" id="pick-here" hidden>把批注挂在这里</button>
-    <button type="button" class="primary" data-action="ask">侧边追问</button>
-    <button type="button" data-action="note">写批注</button>
+    <button type="button" data-action="highlight">高亮</button>
+    <button type="button" data-action="underline">下划线</button>
+    <button type="button" class="primary selection-block-only" data-action="ask">侧边追问</button>
+    <button type="button" data-action="note" class="selection-block-only">写批注</button>
+    <button type="button" data-action="add-todo">加入待办</button>
   </div>
   <div id="status" class="status" role="status" hidden></div>
   <div id="context-menu" class="context-menu" role="menu" hidden></div>

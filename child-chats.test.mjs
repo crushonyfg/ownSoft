@@ -20,8 +20,9 @@ test("an annotation's follow-up is a chat of its own that the annotation still s
     store.saveNoteReply(state.id, note.id, { id: "t-1", question: "展开说说", answer: "第一段。\n\n第二段。", source: claude });
     const parent = store.read(state.id);
     assert.deepEqual(parent.notes[0].turns.map((turn) => [turn.id, turn.question, turn.answer]), [["t-1", "展开说说", "第一段。\n\n第二段。"]]);
-    const raw = JSON.parse(store.db.prepare("SELECT snapshot FROM notebook_documents WHERE id = ?").get(state.id).snapshot);
-    assert.equal(raw.notes[0].turns, undefined);
+    // The annotation's row does not keep the turns; they live in the child chat.
+    const row = JSON.parse(store.db.prepare("SELECT data FROM chat_notes WHERE id = ?").get(note.id).data);
+    assert.equal(row.turns, undefined);
     const child = store.childChat(childKey.note(state.id, note.id));
     assert.equal(child.parent.kind, "note");
     assert.equal(child.parent.notebookId, state.id);
@@ -39,10 +40,12 @@ test("an annotation's follow-up is a chat of its own that the annotation still s
     store.saveReply(null, "再问", "再答", claude, [], child.id);
     assert.ok(store.read(state.id).revision > before);
     assert.equal(store.read(state.id).notes[0].turns.length, 2);
-    // Deleting the annotation deletes its chat.
+    // Deleting the annotation keeps its chat aside, so undoing the deletion brings both back.
     store.change({ type: "delete-note", id: note.id }, state.id);
-    assert.equal(store.childChat(childKey.note(state.id, note.id)), null);
-    assert.equal(store.db.prepare("SELECT 1 FROM notebook_documents WHERE id = ?").get(child.id), undefined);
+    assert.equal(store.read(state.id).notes.length, 0);
+    assert.ok(store.childChat(childKey.note(state.id, note.id)));
+    assert.equal(store.undoStructure().label, "删除批注");
+    assert.equal(store.read(state.id).notes[0].turns.length, 2);
   } finally {
     store.close();
   }
@@ -106,16 +109,23 @@ test("conversations stored inline by earlier versions move into child chats", ()
   const store = new NotebookStore(":memory:");
   try {
     const { state, note } = withNote(store);
-    const raw = JSON.parse(store.db.prepare("SELECT snapshot FROM notebook_documents WHERE id = ?").get(state.id).snapshot);
+    // A chat as an earlier version saved it: one document with its messages and annotations inline.
+    const raw = structuredClone(store.read(state.id));
     raw.notes[0].turns = [{ id: "old-1", question: "旧追问", answer: "旧回答", source: claude }];
     store.db.prepare("UPDATE notebook_documents SET snapshot = ? WHERE id = ?").run(JSON.stringify(raw), state.id);
+    store.db.prepare("DELETE FROM chat_blocks WHERE chat_id = ?").run(state.id);
+    store.db.prepare("DELETE FROM chat_notes WHERE chat_id = ?").run(state.id);
+    assert.ok(store.needsRowMove());
     store.db.prepare("INSERT INTO pdf_reviews VALUES (?, ?, ?, ?)").run("c".repeat(64), "旧.pdf",
       JSON.stringify({ comments: [], chat: [{ id: "old-2", question: "旧全文问", answer: "旧全文答" }], page: 1 }), Date.now());
     // Before moving, the old turns are still shown.
     assert.equal(store.read(state.id).notes[0].turns[0].answer, "旧回答");
     assert.ok(store.needsConversationMove());
     store.moveConversations();
+    store.moveToRows();
     assert.ok(!store.needsConversationMove());
+    assert.ok(!store.needsRowMove());
+    assert.equal(store.read(state.id).blocks.length, raw.blocks.length);
     assert.equal(chatTurns(store.childChat(childKey.note(state.id, note.id)))[0].id, "old-1");
     assert.equal(store.read(state.id).notes[0].turns[0].answer, "旧回答");
     assert.equal(store.pdfReview("c".repeat(64)).chat[0].answer, "旧全文答");
@@ -174,6 +184,61 @@ test("later turns see what tools were used before, and the member asked for last
       defaultMember: "m-1" };
     const { state } = store.changeMembers(saved.id, { type: "member-default", id: "m-1" }, settings);
     assert.equal(state.recentMember, undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test("an annotation is a node of the chat tree: its text is the first message of its own chat", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const { state, note } = withNote(store);
+    const chatId = store.openChildChat({ kind: "note", notebookId: state.id, itemId: note.id });
+    let child = store.read(chatId);
+    // First the message it hangs on (read from the main chat, with the passage marked), then its text.
+    assert.deepEqual([child.blocks[0].noteType, child.blocks[0].virtual, child.blocks[0].text], ["source", true, "这是一段有关键句的回答。"]);
+    assert.deepEqual(child.blocks[0].marks.map((mark) => [mark.quote, mark.style]), [["这是", "note"]]);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM chat_blocks WHERE chat_id = ? AND id = ?").get(chatId, child.blocks[0].id).n, 0);
+    const head = child.blocks[1];
+    assert.deepEqual([head.kind, head.noteType, head.text], ["paragraph", "annotation", "我的批注"]);
+    // Edited in its chat, the margin shows the new text.
+    store.change({ type: "edit-document", title: child.title, messages: [{ ids: [head.id], text: "改过的批注" }] }, chatId);
+    assert.equal(store.read(state.id).notes[0].text, "改过的批注");
+    // Edited in the margin (and highlighted there), its chat follows.
+    store.change({ type: "edit-note", id: note.id, text: "页边改的批注" }, state.id);
+    store.change({ type: "mark", style: "highlight", noteId: note.id, anchor: { start: 0, quote: "页边" } }, state.id);
+    child = store.read(chatId);
+    assert.equal(child.blocks[1].text, "页边改的批注");
+    assert.deepEqual(child.blocks[1].marks.map((mark) => [mark.quote, mark.blockId]), [["页边", child.blocks[1].id]]);
+    // A highlight made in the chat shows in the margin too.
+    store.change({ type: "mark", style: "underline", anchor: { blockId: child.blocks[1].id, start: 4, quote: "批注" } }, chatId);
+    assert.deepEqual(store.read(state.id).notes[0].marks.map((mark) => mark.style), ["highlight", "underline"]);
+    // An annotation on the annotation: the next level of the tree.
+    const nested = store.change({ type: "add-note", anchor: { blockId: child.blocks[1].id, start: 0, quote: "页边" }, text: "批注的批注" }, chatId);
+    const tree = store.chatTree(state.id);
+    assert.equal(tree.children[0].kind, "note");
+    assert.equal(tree.children[0].children[0].title, "批注的批注");
+    assert.equal(nested.notes[0].text, "批注的批注");
+    // Its follow-up turns are still only the questions and answers.
+    store.saveNoteReply(state.id, note.id, { id: "t-9", question: "问", answer: "答", source: claude });
+    assert.deepEqual(store.read(state.id).notes[0].turns.map((turn) => turn.answer), ["答"]);
+    assert.equal(store.read(chatId).blocks.filter((block) => block.noteType === "annotation").length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("a side question's chat begins with the message it was asked about, like an annotation's", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const saved = store.saveReply(null, "问题", "分支从这里开始。", claude);
+    const reply = saved.blocks.find((block) => block.kind === "reply");
+    const state = store.change({ type: "create-branch", anchor: { blockId: reply.id, start: 0, quote: "分支" } });
+    const chatId = store.openChildChat({ kind: "branch", notebookId: state.id, itemId: state.branches[0].id });
+    const first = store.read(chatId).blocks[0];
+    assert.deepEqual([first.noteType, first.text, first.marks[0].quote], ["source", "分支从这里开始。", "分支"]);
+    store.saveReply(null, "分支里问", "分支里答", claude, [], chatId);
+    assert.deepEqual(store.read(state.id).branches[0].turns.map((turn) => turn.answer), ["分支里答"]);
   } finally {
     store.close();
   }

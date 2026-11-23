@@ -11,6 +11,9 @@ import { keepFocus, setupThreads } from "./threads-ui.mjs";
 import { renderPdfPage } from "./pdf-note.mjs";
 import { splitter } from "./splitter.mjs";
 import { setupRelationView } from "./relation-view.mjs";
+import { setupStructure } from "./structure-ui.mjs";
+import { setupImageViewer } from "./image-viewer.mjs";
+import { setupTodos } from "./todo-ui.mjs";
 import { avatarChoices, pixelAvatar } from "./pixel-avatars.mjs";
 
 const api = window.notebook;
@@ -18,6 +21,11 @@ const api = window.notebook;
 // annotation or branch, a private window), with everything the main chat can do.
 const embedId = new URLSearchParams(location.search).get("embed") || undefined;
 if (embedId) document.body.dataset.embed = "1";
+// "mirror": this chat shown as the original next to one of its own annotations enlarged (focus).
+const mirror = Boolean(embedId) && new URLSearchParams(location.search).get("mirror") === "1";
+let mirrorNote = mirror ? new URLSearchParams(location.search).get("focus") : null;
+let mirrorScrolled = null;
+if (mirror) document.body.dataset.mirror = "1";
 const get = (id) => document.getElementById(id);
 const actionButton = (name) => document.querySelector(`[data-action="${name}"]`);
 const node = (tag, className = "", text = "") => {
@@ -39,7 +47,8 @@ const iconPaths = {
   margin: "M4 5h16v11H10l-5 4v-4H4z M8 9h8 M8 12h5", undo: "M9 14 4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-2",
   copy: "M8 4h11v14H8z M5 7H4v14h11v-1",
   pin: "M8 3h8l-1 5 3 3v2H6v-2l3-3z M12 13v8",
-  popout: "M14 4h6v6 M20 4l-8 8 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"
+  popout: "M14 4h6v6 M20 4l-8 8 M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
+  toBlock: "M12 3v10 M8 9l4 4 4-4 M4 15v5h16v-5"
 };
 const iconButton = (icon, action, label) => {
   const control = button("", action, "message-icon");
@@ -63,6 +72,14 @@ let libraryBusy = false;
 let activeView = "document";
 let focusMode = null;
 let focusedNoteId = null;
+// The enlarged view is one level of the chat tree: on the left the chat a passage is in (scrolled to
+// it), on the right the chat that grew from it (an annotation's or a side question's). Going down
+// from the right chat stacks another level; "← 上一层" goes back. Same layout at every level.
+// A level: { chatId, kind: "note" | "branch", itemId, title, quote }.
+let focusStack = [];
+// The view it was opened over (a PDF review or Markdown document) is shown again when it closes.
+let focusReturnMode = null;
+const levelKey = (level) => level ? `${level.chatId}:${level.kind}:${level.itemId}` : "";
 let activeBlock;
 let selectedText = null;
 let selectedAnswer = null;
@@ -99,7 +116,6 @@ const mainComposers = new Map();
 const sideComposers = new Map();
 // Which page each PDF note shows in the chat.
 const pdfNotePages = new Map();
-let noteFocusScrolled = null;
 // "review": this window shows one PDF note on its own (e.g. on a second screen).
 let windowMode = "";
 
@@ -251,8 +267,27 @@ function captureSelection() {
   const parent = container.nodeType === Node.ELEMENT_NODE ? container : container.parentElement;
   const block = parent?.closest(".body-text");
   const answer = parent?.closest(".answer-text");
+  const noteText = parent?.closest("[data-note-text]");
   const text = range.toString();
   if (!text.trim()) return;
+  tools.classList.toggle("for-note", Boolean(noteText && !block));
+  // Text inside an annotation: it can be highlighted or underlined (the bar shows only those two).
+  if (noteText && !block) {
+    const mapped = selectionSource(noteText, range);
+    const source = state.notes.find((item) => item.id === noteText.dataset.noteText)?.text;
+    if (!mapped || !source) return;
+    selectedText = { noteId: noteText.dataset.noteText, start: mapped.start, quote: source.slice(mapped.start, mapped.end),
+      label: selection.toString() };
+    const rect = Array.from(range.getClientRects()).at(-1);
+    if (rect?.height && !editingNote) {
+      tools.hidden = false;
+      get("pick-here").hidden = true;
+      tools.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - tools.offsetWidth - 8))}px`;
+      const above = rect.top - tools.offsetHeight - 5;
+      tools.style.top = `${above > 8 ? above : rect.bottom + 5}px`;
+    }
+    return;
+  }
   if (block) {
     const mapped = selectionSource(block, range);
     const source = state.blocks.find((item) => item.id === block.dataset.blockId)?.text;
@@ -347,14 +382,37 @@ const annotationChooser = setupAnnotationTargets(api, { notify: say,
   onMove: async ({ source, targetId, anchor, targetTitle }) => {
     if (source.notebookId === targetId) await change({ type: "message-to-annotation", ids: source.ids, anchor });
     else {
-      await api.moveMessageToChatAnnotation(source.notebookId, source.ids, targetId, anchor);
+      const { noteId } = await api.moveMessageToChatAnnotation(source.notebookId, source.ids, targetId, anchor);
       accept(await api.read(state.id));
-      void api.openNotebookWindow(targetId).catch((error) => say(error.message));
+      renderDocument();
+      // Go to the new annotation in this window (or the window this chat is embedded in).
+      await showAnnotation(targetId, noteId);
     }
     renderDocument();
     say(`已转为「${targetTitle}」中的批注。`);
   }
 });
+
+// Shows an annotation of some chat here: this chat → enlarge it; another chat in the library →
+// switch to it; a conversation embedded in this window asks the window to do it. Only a chat that
+// cannot be shown here (a child chat of another chat) opens in a window of its own.
+async function showAnnotation(chatId, noteId) {
+  if (embedId && window.parent !== window) {
+    window.parent.postMessage({ type: "ownsoft:show-annotation", chatId, noteId }, location.origin);
+    return;
+  }
+  if (chatId !== state.id) {
+    if (!libraryItems.some((item) => item.id === chatId)) return api.openNotebookWindow(chatId);
+    if (activeView !== "document") { activeView = "document"; updateView(); }
+    await switchNotebook(() => api.openNotebook(chatId));
+  } else accept(await api.read(state.id));
+  if (activeView !== "document") { activeView = "document"; updateView(); }
+  if (noteId && state.notes.some((item) => item.id === noteId)) {
+    collapsedNotes.delete(noteId);
+    setFocus("note", noteId);
+  }
+  renderDocument();
+}
 
 function stopAnnotationPick() {
   annotationPick = null;
@@ -397,7 +455,8 @@ function annotation(note, { focused = false } = {}) {
   const card = node("article", focused ? "annotation is-focus-card" : "annotation");
   card.dataset.noteId = note.id;
   card.classList.toggle("is-focus-source", !focused && focusMode === "note" && focusedNoteId === note.id);
-  const editingThis = editingNote?.id === note.id;
+  // While enlarged, the annotation is edited there only (not also in the margin behind it).
+  const editingThis = editingNote?.id === note.id && (focused || focusMode !== "note" || focusedNoteId !== note.id);
   const collapsed = collapsedNotes.has(note.id) && !editingThis && !focused;
   card.classList.toggle("is-collapsed", collapsed);
   card.classList.toggle("editing-inline", editingThis);
@@ -416,11 +475,26 @@ function annotation(note, { focused = false } = {}) {
   const expand = button("↗", "focus-note", "note-expand");
   expand.title = "放大批注和追问";
   expand.setAttribute("aria-label", "放大批注和追问");
-  if (focused) commands.append(edit, ...(undo ? [undo] : []), remove, pin);
-  else commands.append(expand, collapse, edit, ...(undo ? [undo] : []), remove, pin);
+  // Into the chat as a note block (below the message it is on); dragging the ⠿ handle picks the place.
+  const toBlock = iconButton("toBlock", "note-to-block", "转为正文笔记块（也可拖动 ⠿ 到正文任意位置）");
+  if (focused) commands.append(edit, toBlock, ...(undo ? [undo] : []), remove, pin);
+  else commands.append(expand, collapse, edit, toBlock, ...(undo ? [undo] : []), remove, pin);
+  // The annotation's own text can be highlighted or underlined like any message (select it).
   const content = node("div", "markdown-content note-content");
-  renderMarkdown(content, note.text);
+  content.dataset.noteText = note.id;
+  renderMarkdown(content, note.text, { marks: (note.marks || []).flatMap((mark) => {
+    const start = findAnchor(note.text, mark);
+    return start === null ? [] : [{ start, end: start + mark.quote.length, style: mark.style }];
+  }) });
   const head = node("div", "annotation-head");
+  if (!focused && !editingThis) {
+    const grip = node("span", "note-drag-handle", "⠿");
+    grip.draggable = true;
+    grip.dataset.noteDrag = note.id;
+    grip.title = "拖到正文里，变成那个位置的笔记块";
+    grip.setAttribute("aria-label", "拖动批注到正文");
+    head.append(grip);
+  }
   head.append(node("strong", "author", note.author), commands);
   // Annotations stay out of the main chat unless chosen in 主对话上下文.
   if (choosingContext) {
@@ -460,6 +534,10 @@ function annotation(note, { focused = false } = {}) {
     const actions = node("div", "note-inline-actions");
     actions.append(button("取消", "cancel-note-edit"), button("保存", "save-note-edit", "primary"));
     card.append(actions);
+  } else if (focused) {
+    // Enlarged, the annotation's text is the first message of its chat below (everything a chat
+    // can do works on it there); this card only says where it hangs and holds its actions.
+    card.append(quote);
   } else {
     card.append(quote, content);
     if (note.attachments?.length) card.append(sentAttachments(note.attachments));
@@ -1073,20 +1151,26 @@ function renderDocument() {
     const pdfNote = kind === "note" && visible[0]?.noteType === "pdf" ? visible[0] : null;
     const mdNote = kind === "note" && visible[0]?.noteType === "md" ? visible[0] : null;
     const threadNote = kind === "note" && visible[0]?.noteType === "thread" ? visible[0] : null;
+    // In an annotation's chat: the message it hangs on, read from the chat it is in (context only).
+    const sourceNote = kind === "note" && visible[0]?.noteType === "source" ? visible[0] : null;
     const message = node("article", `paper-block is-${kind}${pdfNote ? " is-pdf-note" : ""}${mdNote ? " is-md-note" : ""}${threadNote ? " is-thread-note" : ""}`);
     if (editingThis) {
       message.classList.add("editing-inline");
       message.style.width = `${editingMessage.width || 600}px`;
     }
     const author = kind === "user" ? "你" : kind === "agent" ? speakerName(speaker) : image ? "图片笔记"
-      : pdfNote ? "PDF 笔记" : mdNote ? "Markdown 笔记" : threadNote ? `私聊记录 · ${speakerName(threadNote.source)}` : "笔记块";
+      : pdfNote ? "PDF 笔记" : mdNote ? "Markdown 笔记" : threadNote ? `私聊记录 · ${speakerName(threadNote.source)}`
+      : visible[0]?.noteType === "annotation" ? annotationTitle()
+      : sourceNote ? `原消息 · ${sourceNote.source?.kind === "question" ? "你" : sourceNote.source?.speaker || (sourceNote.source?.kind !== "paragraph" ? "回答" : ({ image: "图片笔记", pdf: "PDF 笔记", md: "Markdown 笔记" })[sourceNote.source?.noteType] || "笔记块")}` : "笔记块";
     const meta = node("div", "message-meta");
-    if (kind === "note") {
+    // Every message can be dragged: elsewhere in this chat, or into another window's chat.
+    if (sourceNote) message.classList.add("is-source-message");
+    if (!sourceNote) {
       const handle = node("span", "shared-drag-handle", "⠿");
       handle.draggable = !editingMessage;
       handle.dataset.sharedId = messageId;
-      handle.title = "拖动到任意位置";
-      handle.setAttribute("aria-label", "拖动笔记块");
+      handle.title = "拖动到任意位置（也可以拖进另一个窗口里的会话）";
+      handle.setAttribute("aria-label", "拖动消息");
       meta.append(handle);
     }
     meta.append(node("strong", "", author));
@@ -1095,7 +1179,11 @@ function renderDocument() {
       meta.append(node("span", `provider-badge is-${speaker.provider || "gpt"}`, providerName(speaker.provider)),
         node("span", "", [speaker.model, speaker.effort].filter(Boolean).join(" · ") || "默认模型"));
     }
-    if (kind === "note" && visible.length && !sharedNoteIncluded(visible[0])) {
+    if (sourceNote) {
+      meta.append(node("span", "source-context", `上下文 · ${({ branch: "侧边追问问的是", todo: "待办来自" })[state.parent?.kind] || "批注挂在"}「${sourceNote.source?.chatTitle || "原会话"}」的这条消息`));
+      const open = button("在原会话中查看", "open-source-message", "source-open");
+      meta.append(open);
+    } else if (kind === "note" && visible.length && !sharedNoteIncluded(visible[0])) {
       meta.append(node("span", "shared-context-off", "未用于 AI 上下文"));
     }
     if (threadNote) {
@@ -1115,9 +1203,11 @@ function renderDocument() {
     remove.dataset.messageId = messageId;
     const copyId = iconButton("copy", "copy-message-id", "复制消息 ID，用于跨会话挂批注");
     copyId.dataset.messageId = messageId;
-    meta.append(collapse, edit, remove, copyId);
+    // The original message is edited where it lives; here it is context (it can be folded).
+    if (sourceNote) meta.append(collapse);
+    else meta.append(collapse, edit, remove, copyId);
     // Any message can become a note block (questions too) or move out of the chat into an annotation.
-    if (visible.length) {
+    if (visible.length && !sourceNote) {
       if (kind !== "note") {
         const convert = iconButton("note", "convert-message", "转为笔记块");
         convert.dataset.messageId = messageId;
@@ -1150,6 +1240,8 @@ function renderDocument() {
         picture.src = `notebook://app/note-image/${image.id}`;
         picture.alt = visible[0].text || image.name;
         picture.loading = "lazy";
+        picture.dataset.blockId = visible[0].id;
+        picture.title = "点击放大查看或编辑";
         contentBody.append(picture);
       }
       for (const block of visible) {
@@ -1159,7 +1251,10 @@ function renderDocument() {
         const element = kind === "user" ? node("div", "body-text") :
           node("div", "body-text markdown-content");
         element.dataset.blockId = block.id;
-        markedText(element, block, attached.filter((note) => note.anchor.blockId === block.id));
+        // Shown as the original next to a side question: its passage is marked like an annotation's.
+        const focusBranch = mirror ? state.branches.find((item) => item.id === mirrorNote && item.anchor.blockId === block.id) : null;
+        markedText(element, block, [...attached.filter((note) => note.anchor.blockId === block.id),
+          ...(focusBranch ? [{ id: focusBranch.id, anchor: focusBranch.anchor }] : [])], mirrorNote);
         if (kind !== "note" && block.included === false) contentBody.append(node("span", "context-excluded", "仅显示"));
         if (!bareName) contentBody.append(element);
         if (block.attachments?.length && !image && block !== pdfNote) contentBody.append(sentAttachments(block.attachments));
@@ -1209,94 +1304,104 @@ function renderDocument() {
   renderNoteFocus();
   threadsUi.render();
   if (activeView === "document") document.title = `${state.title} · AI 笔记本`;
+  if (mirror && mirrorNote && mirrorScrolled !== mirrorNote) requestAnimationFrame(scrollToMirrorNote);
 }
 
-// One message of the chat as the annotation focus view shows it (read-only, with its marks).
-function focusMessage(group, note, source) {
-  const visible = group.blocks.filter((block) => !block.removed);
-  const kind = group.kind === "question" ? "user" : group.kind === "reply" ? "agent" : "note";
-  const first = visible[0];
-  const image = kind === "note" && first?.noteType === "image" ? first.attachments?.[0] : null;
-  const pdf = kind === "note" && first?.noteType === "pdf" ? first.attachments?.[0] : null;
-  const md = kind === "note" && first?.noteType === "md" ? first : null;
-  const speaker = kind === "agent" ? group.blocks[0].source ?? source : null;
-  const author = kind === "user" ? "你" : kind === "agent" ? speakerName(speaker) : image ? "图片笔记" : pdf ? "PDF 笔记" : md ? "Markdown 笔记"
-    : first?.noteType === "thread" ? `私聊记录 · ${speakerName(first.source)}` : "笔记块";
-  const holds = group.blocks.some((block) => block.id === note.anchor.blockId);
-  const row = node("div", `note-focus-row is-${kind}${holds ? " is-anchor" : ""}`);
-  const paper = node("article", `note-focus-paper is-${kind}`);
-  const meta = node("div", "message-meta");
-  meta.append(node("strong", "", author));
-  if (kind === "agent" && speaker) meta.append(node("span", "", [providerName(speaker.provider), speaker.model].filter(Boolean).join(" · ")));
-  paper.append(meta);
-  if (!visible.length) {
-    paper.append(node("p", "removed-block", "原消息已移除"));
-    if (holds) paper.append(node("blockquote", "note-focus-quote", anchorLabel(note.anchor)));
+// Scrolls this (embedded) page so the enlarged annotation's passage is in the middle. Only this
+// page's own scroller moves (scrollIntoView would also scroll the window around the frame).
+function scrollToMirrorNote() {
+  const target = get("blocks").querySelector(".focus-mark") ||
+    get("blocks").querySelector(`.annotation[data-note-id="${mirrorNote}"]`);
+  if (!target) return;
+  mirrorScrolled = mirrorNote;
+  let scroller = target.parentElement;
+  while (scroller && scroller !== document.body) {
+    const style = getComputedStyle(scroller);
+    if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight) break;
+    scroller = scroller.parentElement;
   }
-  if (image) {
-    const picture = node("img", "shared-image");
-    picture.src = `notebook://app/note-image/${image.id}`;
-    picture.alt = first.text || image.name;
-    paper.append(picture);
-  }
-  if (pdf) paper.append(attachmentChip(pdf));
-  if (md) paper.append(mdNoteCard(md));
-  for (const block of visible) {
-    if (block === first && !holds && ((image || pdf) && block.text === (image || pdf).name ||
-      md && block.text === md.text)) continue;
-    const element = node("div", kind === "user" ? "body-text" : "body-text markdown-content");
-    element.dataset.blockId = block.id;
-    markedText(element, block, state.notes.filter((item) => item.anchor.blockId === block.id), note.id);
-    paper.append(element);
-    if (block.attachments?.length && !image && !pdf) paper.append(sentAttachments(block.attachments));
-  }
-  if (kind === "agent") row.append(pixelAvatar(speakerAvatar(speaker), "idle", ""), paper);
-  else row.append(paper);
-  return row;
+  if (!scroller || scroller === document.body) scroller = document.scrollingElement;
+  const box = target.getBoundingClientRect();
+  const frame = scroller === document.scrollingElement ? { top: 0, height: innerHeight } : scroller.getBoundingClientRect();
+  scroller.scrollTop += box.top - frame.top - Math.max(40, (frame.height - box.height) / 2);
 }
 
-// The annotation focus view: on the left the whole chat, scrolled to the annotated passage;
-// on the right the annotation and its follow-up conversation. The divider between them drags.
+// The annotation focus view: on the left the chat itself (embedded as a full chat, so highlighting,
+// annotating, asking … all work there), scrolled to the annotated passage; on the right the
+// annotation and its follow-up conversation. The dividers drag.
 function renderNoteFocus() {
   const view = get("note-focus");
-  const note = focusMode === "note" && state.notes.find((item) => item.id === focusedNoteId);
-  view.hidden = !note;
-  if (!note) {
-    noteFocusScrolled = null;
-    const chatBox = get("note-focus-chat");
-    if (chatBox.dataset.noteId) {
-      delete chatBox.dataset.noteId;
+  const level = focusMode === "note" ? focusStack.at(-1) : null;
+  const here = level?.chatId === state.id;
+  const note = here && level.kind === "note" ? state.notes.find((item) => item.id === level.itemId) : null;
+  const branch = here && level.kind === "branch" ? state.branches.find((item) => item.id === level.itemId) : null;
+  const valid = Boolean(level && (!here || note || branch));
+  view.hidden = !valid;
+  const chatBox = get("note-focus-chat");
+  if (!valid) {
+    if (chatBox.dataset.key) {
+      delete chatBox.dataset.key;
       chatBox.replaceChildren();
     }
     return;
   }
+  const key = levelKey(level);
+  const kindName = level.kind === "note" ? "批注" : "侧边追问";
+  get("focus-level-back").hidden = focusStack.length < 2;
+  get("locate-focused-note").hidden = !here;
+  get("note-focus-eyebrow").textContent = focusStack.length > 1 ? `第 ${focusStack.length} 层 · 原文 · 完整对话` : "原文 · 完整对话";
+  get("note-focus-reference").textContent = `${(here ? state.title : level.title) || "会话"} · ${kindName}所在的消息`;
+  // Left: the chat the passage is in, as a full chat, scrolled to the passage. The frame stays while
+  // other passages of the same chat are shown; it is told which one.
   const source = get("note-focus-source");
-  const scroll = source.scrollTop;
-  let asked;
-  const rows = visibleGroups().map((group) => {
-    if (group.kind === "question") asked = group.blocks[0].source;
-    return focusMessage(group, note, asked);
-  });
-  const anchorGroup = messageGroups(state.blocks).find((item) => item.blocks.some((block) => block.id === note.anchor.blockId));
-  const where = anchorGroup?.kind === "question" ? "你的消息" : anchorGroup?.kind === "reply"
-    ? `${speakerName(anchorGroup.blocks[0].source)} 的回答` : "笔记块";
-  get("note-focus-reference").textContent = `${state.title} · 批注在${where}里`;
-  source.replaceChildren(...rows);
-  get("note-focus-note").replaceChildren(annotation(note, { focused: true }));
-  // The follow-up as a full chat; its frame stays put while the annotation above re-renders.
-  const chatBox = get("note-focus-chat");
-  if (chatBox.dataset.noteId !== note.id) {
-    chatBox.dataset.noteId = note.id;
-    const notebookId = state.id;
-    api.childChatId({ kind: "note", notebookId, itemId: note.id }).then((id) => {
-      if (chatBox.dataset.noteId === note.id) embedChat(chatBox, id, { label: "批注追问" });
+  const left = embedChat(source, level.chatId, { label: "原文", params: { mirror: "1", focus: level.itemId } });
+  if (source.dataset.key !== key) {
+    source.dataset.key = key;
+    left.contentWindow?.postMessage({ type: "ownsoft:mirror-focus", noteId: level.itemId }, location.origin);
+  }
+  // Right: what grew from the passage. An annotation of this chat shows its card (actions);
+  // otherwise a line saying what this level is.
+  if (note) get("note-focus-note").replaceChildren(annotation(note, { focused: true }));
+  else {
+    const head = node("div", "focus-level-head");
+    const quote = level.quote || (branch ? anchorLabel(branch.anchor) : "");
+    head.append(node("strong", "", kindName), node("span", "focus-level-quote", quote ? `「${quote}」` : ""));
+    get("note-focus-note").replaceChildren(head);
+  }
+  get("note-focus-chat-title").textContent = level.kind === "note" ? "批注会话 · 原消息、批注正文和追问" : "侧边追问 · 分支会话";
+  if (chatBox.dataset.key !== key) {
+    chatBox.dataset.key = key;
+    api.childChatId({ kind: level.kind, notebookId: level.chatId, itemId: level.itemId }).then((id) => {
+      if (chatBox.dataset.key === key) embedChat(chatBox, id, { label: kindName });
+      tryAnnotationEdit();
     }).catch((error) => say(error.message));
   }
-  if (noteFocusScrolled !== note.id) {
-    noteFocusScrolled = note.id;
-    requestAnimationFrame(() => (source.querySelector(".focus-mark") || source.querySelector(".is-anchor"))
-      ?.scrollIntoView({ block: "center" }));
-  } else source.scrollTop = scroll;
+  view.scrollTop = 0;
+}
+
+// Opens the enlarged view at these levels (the last one shown).
+function openFocusLevels(levels) {
+  if (["pdf", "md"].includes(focusMode)) focusReturnMode = focusMode;
+  focusStack = levels;
+  if (levels.at(-1)?.chatId === state.id && levels.at(-1).kind === "note") collapsedNotes.delete(levels.at(-1).itemId);
+  setFocus("note");
+  renderDocument();
+}
+
+// From any chat (this page, or one embedded in it at any depth): show an annotation or side question
+// as a level. From the chat on the right it goes one level down; from the one on the left it
+// replaces the current level; from anywhere else it starts over.
+function focusOn(level, { edit = false } = {}) {
+  if (embedId) {
+    window.top.postMessage({ type: "ownsoft:focus-open", ...level, edit }, location.origin);
+    return;
+  }
+  const top = focusMode === "note" ? focusStack.at(-1) : null;
+  const right = get("note-focus-chat").querySelector(":scope > iframe.embedded-chat")?.dataset.chatId;
+  const levels = top && level.chatId === right ? [...focusStack, level]
+    : top && level.chatId === top.chatId ? [...focusStack.slice(0, -1), level] : [level];
+  openFocusLevels(levels);
+  if (edit && level.kind === "note") editAnnotationText(levelKey(level));
 }
 
 // ---- Answers moved into private windows: folded cards in the chat ---------------------------------
@@ -1624,9 +1729,10 @@ function showNotes(visible) {
 function updateView() {
   document.body.dataset.view = activeView;
   document.title = `${activeView === "pdf" ? "PDF 审阅" : activeView === "md" ? mdReview.current()?.name || "Markdown 文档" :
-    activeView === "canvas" ? "关系图" : activeView === "apps" ? "应用与账户" : state?.title || "AI 笔记本"} · AI 笔记本`;
+    activeView === "canvas" ? "关系图" : activeView === "todos" ? "待办" : activeView === "apps" ? "应用与账户" : state?.title || "AI 笔记本"} · AI 笔记本`;
   get("document-view").hidden = activeView !== "document";
   get("canvas-view").hidden = activeView !== "canvas";
+  get("todo-view").hidden = activeView !== "todos";
   get("pdf-view").hidden = activeView !== "pdf";
   get("md-view").hidden = activeView !== "md";
   get("apps-view").hidden = activeView !== "apps";
@@ -1635,14 +1741,18 @@ function updateView() {
     else tab.removeAttribute("aria-current");
   }
   if (activeView === "canvas") renderCanvas();
+  if (activeView === "todos") void todoUi?.render();
   if (activeView === "pdf") pdfReview.activate();
   if (activeView === "apps") openApps().catch((error) => say(error.message));
   renderSelectionBar();
 }
 
 function setFocus(mode, noteId = null) {
+  if (mode === "note" && noteId) focusStack = [{ chatId: state.id, kind: "note", itemId: noteId, title: state.title }];
+  if (mode !== "note") focusStack = [];
   focusMode = mode;
-  focusedNoteId = noteId;
+  const level = focusStack.at(-1);
+  focusedNoteId = level?.kind === "note" && level.chatId === state.id ? level.itemId : null;
   // An enlarged branch is shown as its full chat.
   const branchBox = get("side-embedded");
   if (mode === "branch" && currentBranchId) {
@@ -1662,12 +1772,20 @@ function setFocus(mode, noteId = null) {
   if (mode) {
     get("focus-parent").textContent = state?.title || "主聊天";
     get("focus-title").textContent = mode === "pdf" ? "PDF 审阅" : mode === "md" ? "Markdown 文档" : mode === "branch" ?
-      branchTitle(currentBranch()) : "批注与追问";
+      branchTitle(currentBranch()) : focusStack.map((item) => item.kind === "note" ? "批注" : "侧边追问").join(" › ") || "批注与追问";
   }
   if (mode !== "note") renderNoteFocus();
 }
 
 function closeFocus() {
+  // Leaving the levels opened over a review goes back to that review.
+  if (focusMode === "note" && focusReturnMode) {
+    const mode = focusReturnMode;
+    focusReturnMode = null;
+    setFocus(mode);
+    renderNoteFocus();
+    return;
+  }
   if (focusMode === "md") {
     // Save, and offer to write unsaved edits back to the .md file, before returning to the chat.
     mdReview.leave().then(renderMdList).catch((error) => say(error.message));
@@ -1725,6 +1843,12 @@ function renderChat() {
 }
 
 function openChat(branchId) {
+  // A side question opens like an annotation: the passage on the left, its chat on the right.
+  const branch = state.branches.find((item) => item.id === branchId);
+  if (branch) {
+    focusOn({ chatId: state.id, kind: "branch", itemId: branchId, title: state.title, quote: anchorLabel(branch.anchor) });
+    return;
+  }
   currentBranchId = branchId;
   activeView = "document";
   updateView();
@@ -2193,9 +2317,8 @@ async function handleAction(control) {
       const id = control.dataset.messageId;
       const group = messageGroups(state.blocks).find((item) => item.blocks[0].id === id);
       const ids = group?.blocks.map((block) => block.id) || [id];
-      if (!window.confirm("移除这条消息？此操作会删除消息正文。")) break;
-      await change({ type: "edit-document", title: state.title,
-        messages: [{ ids, text: "", removed: true }] });
+      // Undoable (Ctrl+Z or the notice's 撤销), so no confirmation.
+      await structureUi.apply({ type: "remove", chat: state.id, ids });
       selectedMessages.delete(id);
       renderDocument();
       break;
@@ -2525,7 +2648,9 @@ async function handleAction(control) {
       break;
     case "open-attachment": {
       const extension = control.dataset.extension || storedAttachment(control.dataset.attachmentId)?.extension;
-      if (extension === ".pdf" && !control.dataset.external) {
+      if ([".png", ".jpg", ".jpeg", ".webp"].includes(extension) && !control.dataset.external) {
+        await viewImage({ attachmentId: control.dataset.attachmentId });
+      } else if (extension === ".pdf" && !control.dataset.external) {
         await openPdfAttachment(control.dataset.attachmentId);
       } else {
         await api.openAttachment(control.dataset.attachmentId);
@@ -2711,7 +2836,13 @@ async function handleAction(control) {
       break;
     case "highlight":
     case "underline":
-      await change({ type: "mark", style: action, anchor: anchor(true) });
+      if (selectedText?.noteId) {
+        await change({ type: "mark", style: action, noteId: selectedText.noteId,
+          anchor: { start: selectedText.start, quote: selectedText.quote } });
+        selectedText = null;
+        window.getSelection()?.removeAllRanges();
+        get("selection-tools").hidden = true;
+      } else await change({ type: "mark", style: action, anchor: anchor(true) });
       renderDocument();
       break;
     case "note": {
@@ -2738,9 +2869,7 @@ async function handleAction(control) {
       break;
     case "focus-note":
       if (!note) break;
-      if (collapsedNotes.has(note.id)) collapsedNotes.delete(note.id);
-      setFocus("note", note.id);
-      renderDocument();
+      focusOn({ chatId: state.id, kind: "note", itemId: note.id, title: state.title, quote: anchorLabel(note.anchor) });
       break;
     case "toggle-note":
       if (!note) break;
@@ -2750,9 +2879,35 @@ async function handleAction(control) {
       break;
     case "edit-note":
       if (!note) break;
-      editingNote = { id: note.id, text: note.text, preview: false };
-      renderDocument();
-      get("blocks").querySelector(`.annotation[data-note-id="${note.id}"] .note-inline-text`)?.focus();
+      // Annotations are edited enlarged: the passage on the left; on the right the annotation's
+      // text, a message of its own chat, opens for editing there.
+      if (focusMode === "note" && levelKey(focusStack.at(-1)) === levelKey({ chatId: state.id, kind: "note", itemId: note.id }) && !embedId) {
+        editAnnotationText(levelKey(focusStack.at(-1)));
+      } else focusOn({ chatId: state.id, kind: "note", itemId: note.id, title: state.title, quote: anchorLabel(note.anchor) }, { edit: true });
+      break;
+    case "focus-level-back":
+      if (focusStack.length > 1) openFocusLevels(focusStack.slice(0, -1));
+      else closeFocus();
+      break;
+    case "add-todo": {
+      // The selected words (or, with nothing selected, the current message) become a to-do; the
+      // message is its default context.
+      const selection = selectedText && (selectedText.blockId || selectedText.noteId) ? selectedText : null;
+      const fromNote = selection?.noteId ? state.notes.find((item) => item.id === selection.noteId) : null;
+      const blockId = selection?.blockId || fromNote?.anchor.blockId || activeMessage || null;
+      const quote = selection ? (selection.label || selection.quote || "").trim() : "";
+      get("selection-tools").hidden = true;
+      todoUi.openDialog({ chatId: state.id, chatTitle: state.title, blockId, quote, text: quote });
+      break;
+    }
+    case "open-source-message":
+      if (["note", "branch"].includes(state.parent?.kind)) await showAnnotation(state.parent.notebookId, state.parent.noteId || null);
+      break;
+    case "note-to-block":
+      if (!note) break;
+      if (editingNote?.id === note.id) throw new Error("请先保存或取消当前编辑。");
+      if (focusedNoteId === note.id) closeFocus();
+      await structureUi.apply({ type: "note-to-block", chat: state.id, noteId: note.id });
       break;
     case "note-edit-tab":
     case "note-preview-tab":
@@ -2774,9 +2929,10 @@ async function handleAction(control) {
     case "delete-note":
     case "undo-note-conversion":
       if (!note) return;
-      if (action === "delete-note" && !window.confirm("删除这条批注及其追问？")) break;
       if (action === "undo-note-conversion") accept(await api.undoChatAnnotation(state.id, note.id));
       else await change({ type: action, id: note.id });
+      // Deleting keeps the annotation (and its follow-up) aside, so it can be undone.
+      if (action === "delete-note") structureUi.notice("已删除批注。", true);
       if (action === "delete-note" || action === "undo-note-conversion") {
         if (focusedNoteId === note.id) closeFocus();
         commentChats.forget(`note:${state.id}:${note.id}`);
@@ -2858,7 +3014,10 @@ async function handleAction(control) {
       if (currentBranch()) setFocus("branch");
       break;
     case "note-focus-full":
-      if (focusedNoteId) await api.openChildChat({ kind: "note", notebookId: state.id, itemId: focusedNoteId });
+      if (focusStack.length) {
+        const level = focusStack.at(-1);
+        await api.openChildChat({ kind: level.kind, notebookId: level.chatId, itemId: level.itemId });
+      }
       break;
     case "branch-full":
       if (!currentBranchId) throw new Error("请先打开一条分支。");
@@ -2887,14 +3046,19 @@ get("side-turns").addEventListener("pointerup", (event) => {
   if (event.target.closest(".answer-text") && window.getSelection()?.isCollapsed) selectedAnswer = null;
 });
 document.addEventListener("click", async (event) => {
+  // Pictures open in the viewer (image notes can be edited there).
+  const shown = event.target.closest?.("img.shared-image[data-block-id]");
+  if (shown && !selectingMessages && window.getSelection()?.isCollapsed) {
+    viewImage({ blockId: shown.dataset.blockId }).catch((error) => say(error.message));
+    return;
+  }
   const link = event.target.closest("[data-markdown-link]");
   if (link) {
     event.preventDefault();
     const url = new URL(link.dataset.markdownLink);
     if (url.protocol === "ownsoft:") {
       const id = url.pathname.slice(1);
-      const open = url.hostname === "chat" ? (embedId ? api.openNotebookWindow(id) :
-        switchNotebook(() => api.openNotebook(id))) : url.hostname === "md" ?
+      const open = url.hostname === "chat" ? showAnnotation(id, null) : url.hostname === "md" ?
         showMd(() => mdReview.open(id)) : openSavedReview(id);
       Promise.resolve(open).catch((error) => say(error.message));
     } else api.openLink(link.dataset.markdownLink).catch((error) => say(error.message));
@@ -2962,16 +3126,22 @@ function dropSpot(target) {
 const clearDropMarks = () => {
   for (const item of document.querySelectorAll(".drop-target")) item.classList.remove("drop-target");
 };
+// Dragging a message (any kind) or a margin annotation; see structure-ui.mjs.
 get("blocks").addEventListener("dragstart", (event) => {
+  const grip = event.target.closest(".note-drag-handle");
+  if (grip && !editingNote) {
+    structureUi.dragNote(event, grip.dataset.noteDrag);
+    event.dataTransfer.setDragImage(grip.closest(".annotation"), 20, 20);
+    return;
+  }
   const handle = event.target.closest(".shared-drag-handle");
   if (!handle || editingMessage) return;
-  event.dataTransfer.setData("application/x-ai-note-block", handle.dataset.sharedId);
-  event.dataTransfer.effectAllowed = "move";
+  structureUi.dragMessage(event, handle.dataset.sharedId);
   event.dataTransfer.setDragImage(handle.closest(".chat-row"), 20, 20);
 });
 get("blocks").addEventListener("dragover", (event) => {
   const types = event.dataTransfer.types;
-  if (editingMessage || (!types.includes("Files") && !types.includes("application/x-ai-note-block"))) return;
+  if (editingMessage || (!types.includes("Files") && !structureUi.accepts(types))) return;
   const spot = dropSpot(event.target);
   if (!spot) return;
   event.preventDefault();
@@ -2994,11 +3164,9 @@ get("blocks").addEventListener("drop", (event) => {
     addNoteImages(event.dataTransfer.files, spot.afterId).catch((error) => say(error.message));
     return;
   }
-  const id = event.dataTransfer.getData("application/x-ai-note-block");
-  if (!id || id === spot.beforeId || id === spot.afterId) return;
+  if (!structureUi.accepts(event.dataTransfer.types)) return;
   event.preventDefault();
-  change({ type: "move-shared-block", id, beforeId: spot.beforeId })
-    .then(() => { activeMessage = id; renderDocument(); }).catch((error) => say(error.message));
+  structureUi.drop(event, spot).catch((error) => say(error.message));
 });
 
 // Images dropped elsewhere on the page (title, empty space) land below the active message or at the end.
@@ -3236,7 +3404,7 @@ async function refreshFromStore() {
     } else if ((next.revision || 0) > (state.revision || 0)) {
       accept(next);
       if (focusMode === "branch" && !currentBranch()) closeFocus();
-      if (focusMode === "note" && !state.notes.some((note) => note.id === focusedNoteId)) closeFocus();
+      if (focusMode === "note" && focusedNoteId && !state.notes.some((note) => note.id === focusedNoteId)) closeFocus();
       renderDocument();
       renderChat();
       if (activeView === "canvas") renderCanvas();
@@ -3287,8 +3455,105 @@ const threadsUi = setupThreads(api, {
   summarize: summarizeThreads,
   rendered: () => { if (activeView === "document") renderDocument(); }
 });
+splitter(get("md-layout-split"), { target: document.querySelector(".md-layout"), property: "--md-side", fromEnd: true,
+  min: 260, keep: 320, key: "md-side" });
+splitter(get("md-main-split"), { target: document.querySelector(".md-main"), property: "--md-source",
+  min: 200, keep: 200, key: "md-source" });
+splitter(get("md-side-split"), { target: document.querySelector(".md-side"), property: "--md-side-top", axis: "y",
+  min: 90, keep: 160, key: "md-side-top" });
+splitter(get("todo-split"), { target: document.querySelector(".todo-body"), property: "--todo-side", fromEnd: true,
+  min: 320, keep: 300, key: "todo-side" });
+splitter(get("relation-split"), { target: document.querySelector(".relation-body"), property: "--relation-side", fromEnd: true,
+  min: 300, keep: 260, key: "relation-side" });
 splitter(get("note-focus-split"), { target: get("note-focus"), property: "--note-focus-side", fromEnd: true,
   min: 340, keep: 320, key: "note-focus" });
+// An annotation's text as the first message of its own chat.
+const annotationTitle = () => "批注正文";
+
+// Editing an annotation = editing the first message of its chat, shown enlarged on the right.
+let pendingAnnotationEdit = null;
+function editAnnotationText(key) {
+  pendingAnnotationEdit = key;
+  tryAnnotationEdit();
+}
+function tryAnnotationEdit() {
+  const box = get("note-focus-chat");
+  const frame = box.querySelector(":scope > iframe.embedded-chat");
+  if (!pendingAnnotationEdit || box.dataset.key !== pendingAnnotationEdit || !frame ||
+    frame.dataset.ready !== frame.dataset.chatId) return;
+  pendingAnnotationEdit = null;
+  frame.contentWindow.postMessage({ type: "ownsoft:edit-head" }, location.origin);
+}
+
+// Every picture opens in one viewer (ui/image-viewer.mjs); an image note can be marked up there.
+// The marked-up picture is saved as a new file; the original and the shapes stay on the block.
+const imageViewer = setupImageViewer({ notify: say });
+async function viewImage({ blockId, attachmentId }) {
+  const block = blockId ? state.blocks.find((item) => item.id === blockId) : null;
+  const ref = block?.attachments?.[0] || storedAttachment(attachmentId) || (attachmentId ? { id: attachmentId } : null);
+  if (!ref) throw new Error("图片已不存在。");
+  const editable = Boolean(block && block.noteType === "image" && !block.removed);
+  const original = block?.imageEdit?.original;
+  await imageViewer.open({
+    src: `notebook://app/note-image/${ref.id}`, name: block?.text || ref.name, editable,
+    edit: original ? { src: `notebook://app/note-image/${original.id}`, name: original.name, shapes: block.imageEdit.shapes } : null,
+    onSave: async (file, drawing) => structureUi.report(await api.saveImageEdit(state.id, block.id, file, drawing)),
+    onRestore: () => structureUi.apply({ type: "edit-image", chat: state.id, blockId: block.id, restore: true }),
+    onExternal: () => api.openAttachment(ref.id).catch((error) => say(error.message))
+  });
+}
+
+// To-dos and their calendar (ui/todo-ui.mjs); each to-do's chat begins with the message it came from.
+const todoUi = setupTodos(api, {
+  notify: say,
+  members: () => members().map(({ id, name }) => ({ id, name })),
+  defaultMemberId: () => defaultMember()?.id,
+  showView: () => { if (focusMode) closeFocus(); activeView = "todos"; updateView(); },
+  // The message a to-do came from, in its chat.
+  openSource: async (todo) => {
+    await showAnnotation(todo.chatId, null);
+    if (todo.chatId !== state.id) return;
+    if (activeView !== "document") { activeView = "document"; updateView(); }
+    const row = get("blocks").querySelector(`.body-text[data-block-id="${todo.blockId}"]`)?.closest(".chat-row");
+    if (row) {
+      activeMessage = row.dataset.messageId;
+      renderDocument();
+      get("blocks").querySelector(`.chat-row[data-message-id="${activeMessage}"]`)?.scrollIntoView({ block: "center" });
+    }
+  }
+});
+
+// Moving and removing messages, annotations into note blocks, undo, the command line (Ctrl+K).
+const structureUi = setupStructure(api, {
+  chatId: () => state.id,
+  notify: say,
+  busy: () => editingMessage || editingNote ? "请先保存或取消当前编辑。" : "",
+  chats: () => libraryItems.filter((item) => item.kind !== "folder").map(({ id, title }) => ({ id, title: title || "" })),
+  activeMessage: () => activeMessage,
+  selectedMessages: () => [...selectedMessages],
+  refresh: async ({ chats, focus }) => {
+    if (chats.includes(state.id)) accept(await api.read(state.id));
+    if (focusMode === "note" && focusedNoteId && !state.notes.some((item) => item.id === focusedNoteId)) closeFocus();
+    if (focus?.chat === state.id && focus.messageId) activeMessage = focus.messageId;
+    renderDocument();
+    if (focus?.chat === state.id && focus.messageId) {
+      get("blocks").querySelector(`.chat-row[data-message-id="${focus.messageId}"]`)?.scrollIntoView({ block: "nearest" });
+    }
+  },
+  // Go to a chat (and a message or annotation in it) in this window.
+  go: async (chatId, { messageId, noteId } = {}) => {
+    if (noteId) return showAnnotation(chatId, noteId);
+    if (chatId !== state.id) await showAnnotation(chatId, null);
+    if (chatId !== state.id) return;
+    if (activeView !== "document") { activeView = "document"; updateView(); }
+    if (messageId) {
+      activeMessage = messageId;
+      renderDocument();
+      get("blocks").querySelector(`.chat-row[data-message-id="${messageId}"]`)?.scrollIntoView({ block: "center" });
+    }
+  }
+});
+
 relationView = setupRelationView(api, {
   rootId: () => state.id, notify: say,
   memberName: (id) => memberById(id)?.name,
@@ -3325,6 +3590,45 @@ const pdfReview = setupPdfReview(api, { edit: showEditor, notify: say, commentCh
     if (state) renderDocument();
   } });
 window.addEventListener("message", (event) => {
+  if (event.origin !== location.origin || event.data?.type !== "ownsoft:show-annotation") return;
+  const fromFrame = [...document.querySelectorAll("iframe.embedded-chat")].some((item) => item.contentWindow === event.source);
+  if (!fromFrame || typeof event.data.chatId !== "string") return;
+  const noteId = typeof event.data.noteId === "string" ? event.data.noteId : null;
+  showAnnotation(event.data.chatId, noteId).then(() => {
+    if (event.data.edit && noteId) editAnnotationText(noteId);
+  }).catch((error) => say(error.message));
+});
+// An annotation or side question opened in an embedded chat (any depth) becomes a level here.
+window.addEventListener("message", (event) => {
+  if (embedId || event.origin !== location.origin || event.data?.type !== "ownsoft:focus-open") return;
+  const { chatId, kind, itemId, title, quote, edit } = event.data;
+  if (typeof chatId !== "string" || typeof itemId !== "string" || !["note", "branch"].includes(kind)) return;
+  focusOn({ chatId, kind, itemId, title: String(title || ""), quote: String(quote || "") }, { edit: Boolean(edit) });
+});
+// An embedded chat says when it is ready (to be asked to edit its annotation text, see below).
+window.addEventListener("message", (event) => {
+  if (event.origin !== location.origin || event.data?.type !== "ownsoft:embed-ready") return;
+  const frame = [...document.querySelectorAll("iframe.embedded-chat")].find((item) => item.contentWindow === event.source);
+  if (!frame) return;
+  frame.dataset.ready = String(event.data.chatId || "");
+  tryAnnotationEdit();
+});
+// Inside an annotation's chat: open its first message (the annotation's text) for editing.
+window.addEventListener("message", (event) => {
+  if (!embedId || event.origin !== location.origin || event.source !== window.parent || event.data?.type !== "ownsoft:edit-head") return;
+  const head = state.blocks.find((block) => block.noteType === "annotation" && !block.removed);
+  if (!head) return;
+  activeMessage = head.id;
+  get("blocks").querySelector(`[data-action="edit-message"][data-message-id="${head.id}"]`)?.click();
+});
+window.addEventListener("message", (event) => {
+  if (!mirror || event.origin !== location.origin || event.source !== window.parent ||
+    event.data?.type !== "ownsoft:mirror-focus" || typeof event.data.noteId !== "string") return;
+  mirrorNote = event.data.noteId;
+  mirrorScrolled = null;
+  renderDocument();
+});
+window.addEventListener("message", (event) => {
   if (event.origin !== location.origin || event.data?.type !== "ownsoft:pdf-message-annotation") return;
   const { notebookId, hash, ids } = event.data;
   const frame = [...document.querySelectorAll("iframe.embedded-chat")].find((item) =>
@@ -3347,6 +3651,8 @@ try {
   renderDocument();
   updateView();
   renderPending();
+  // Embedded: tell the window around that this chat is ready (e.g. to open its annotation text for editing).
+  if (embedId && window.parent !== window) window.parent.postMessage({ type: "ownsoft:embed-ready", chatId: state.id }, location.origin);
   const mode = await api.windowMode();
   if (mode.review) {
     windowMode = "review";

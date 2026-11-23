@@ -42,6 +42,18 @@ const tools = [
     inputSchema: schema({ sourceId: str, messageIds: { type: "array", items: str, minItems: 1 }, targetId: str,
       anchor: schema({ blockId: str, start: num, quote: str }, ["blockId", "start", "quote"]) },
     ["sourceId", "messageIds", "targetId", "anchor"]), method: "moveMessageToAnnotation" },
+  { name: "list_todos", description: "List the user's to-dos (AI Notebook's todo list and calendar): text, due time, repeat, status (open, ran = done by AI and waiting for the user, done), source chat.",
+    inputSchema: schema({ status: { enum: ["open", "ran", "done"] }, limit: num }), method: "listTodos", readOnly: true },
+  { name: "add_todo", description: "Add a to-do, optionally at a time for the AI to do it then (it runs in the to-do's own chat, with the source message as context). Give either dueAt (local date-time like 2026-12-01T09:00) or after {amount, unit: minute|hour|day|week|month}. When working on a to-do and something should be looked at again later, add a follow-up with fromTodoId (it keeps the same source message), or reschedule the current one with update_todo.",
+    inputSchema: schema({ text: str, dueAt: str, after: schema({ amount: { type: "number", exclusiveMinimum: 0 },
+      unit: { enum: ["minute", "hour", "day", "week", "month"] } }, ["amount", "unit"]),
+      repeat: schema({ every: { type: "integer", minimum: 1, maximum: 365 }, unit: { enum: ["day", "week", "month"] } }, ["every", "unit"]),
+      notebookId: str, messageId: str, quote: str, fromTodoId: str, memberId: str, ai: { type: "boolean" } }, ["text"]), method: "addTodo" },
+  { name: "update_todo", description: "Change a to-do: reschedule it (dueAt or after; it becomes open again), reword it, change or clear its repeat (null), or mark it done / open. Use this when a to-do turns out to need another look later, instead of leaving it done.",
+    inputSchema: schema({ todoId: str, text: str, dueAt: str, after: schema({ amount: { type: "number", exclusiveMinimum: 0 },
+      unit: { enum: ["minute", "hour", "day", "week", "month"] } }, ["amount", "unit"]),
+      repeat: { anyOf: [schema({ every: { type: "integer", minimum: 1, maximum: 365 }, unit: { enum: ["day", "week", "month"] } }, ["every", "unit"]), { type: "null" }] },
+      status: { enum: ["open", "done"] }, ai: { type: "boolean" } }, ["todoId"]), method: "updateTodo" },
   { name: "undo_message_annotation", description: "Undo a message-to-annotation conversion and restore the source message. The annotation must have no follow-up chat turns.",
     inputSchema: schema({ targetId: str, noteId: str }, ["targetId", "noteId"]), method: "undoMessageAnnotation" }
 ];

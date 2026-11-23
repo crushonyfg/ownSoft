@@ -38,6 +38,7 @@
 /* ---- Annotation focus view: the source passage beside the annotation and its follow-ups ---- */
 .note-focus { position: fixed; z-index: 60; inset: 56px max(18px, 3vw) 18px max(18px, 3vw);
   display: grid; grid-template-columns: minmax(0, 1fr) 8px min(var(--note-focus-side, 42%), 70%);
+  grid-template-rows: minmax(0, 1fr);
   border-radius: 16px; overflow: hidden; background: var(--paper); box-shadow: 0 18px 70px #0005; }
 .note-focus-source { display: flex; flex-direction: column; min-height: 0; min-width: 0;
   background: var(--chat-bg, var(--surface)); border-right: 1px solid var(--line); }
@@ -286,3 +287,176 @@ body[data-focus="branch"] #side-chat .side-embedded { display: flex; flex-direct
   .relation-body { flex-direction: column; }
   .relation-detail { flex: 1 1 55%; min-width: 0; }
 }
+
+/* Structural edits (ui/structure-ui.mjs): drag handles, the undo notice, the command line. */
+.note-drag-handle { display: inline-grid; place-items: center; width: 16px; height: 20px; margin-right: 2px;
+  color: var(--muted); cursor: grab; user-select: none; font-size: 13px; }
+.note-drag-handle:active { cursor: grabbing; }
+.chat-row .shared-drag-handle { opacity: .35; transition: opacity .15s; }
+.chat-row:hover .shared-drag-handle, .chat-row.active .shared-drag-handle { opacity: 1; }
+.structure-toast { position: fixed; z-index: 90; left: 50%; bottom: 22px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 12px; max-width: min(640px, calc(100vw - 32px)); padding: 9px 10px 9px 16px;
+  border-radius: 10px; background: #1f2b33; color: #f4f7f6; box-shadow: 0 10px 30px #0004; font-size: 13px; }
+.structure-toast[hidden] { display: none; }
+.structure-toast button { min-height: 28px; padding: 3px 12px; border-radius: 7px; border: 1px solid #ffffff40;
+  background: transparent; color: #fff; font-weight: 650; }
+.structure-toast button:hover { background: #ffffff1c; }
+.command-dialog { width: min(760px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--paper); color: var(--text); box-shadow: 0 24px 80px #0006; margin-top: 12vh; }
+.command-dialog::backdrop { background: #0003; }
+.command-form { display: flex; flex-direction: column; }
+.command-input { border: 0; border-bottom: 1px solid var(--line); padding: 14px 16px; font: 15px ui-monospace, Consolas, monospace;
+  background: transparent; color: inherit; outline: none; }
+.command-output { max-height: 50vh; overflow: auto; padding: 6px 16px 12px; }
+.command-output:empty { display: none; }
+.command-line { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.55 ui-monospace, Consolas, monospace; }
+.command-line.is-echo { color: var(--muted); }
+.command-line.is-error { color: #b42318; }
+
+/* Every split can be dragged (ui/splitter.mjs); sizes are remembered on this computer. */
+.md-layout { grid-template-columns: minmax(0, 1fr) 8px var(--md-side, min(400px, 36%)); }
+#md-layout-split { border-left: 1px solid var(--line); }
+.md-side { border-left: 0; }
+#md-main-split { display: none; }
+.md-view[data-mode="split"] .md-main { grid-template-columns: var(--md-source, minmax(0, 1fr)) 8px minmax(0, 1fr); }
+.md-view[data-mode="split"] #md-main-split { display: block; }
+.md-view[data-mode="split"] .md-source { border-right: 0; }
+.md-side-top { flex: 0 0 var(--md-side-top, 42%); }
+.md-side-chat { flex: 1 1 0; border-top: 0; }
+#md-side-split, #note-focus-card-split { flex: none; border-top: 1px solid var(--line); }
+/* Enlarged annotation: a compact card (where it hangs, its actions); its text and follow-ups are its chat below. */
+.note-focus-note { flex: none; max-height: 30%; overflow: auto; }
+.note-focus-note .annotation.is-focus-card { padding-bottom: 6px; }
+/* Editing an annotation enlarged: the editor takes the whole upper part. */
+.note-focus-note:has(.editing-inline) { display: flex; flex-direction: column; overflow: hidden; }
+.note-focus-note .annotation.editing-inline { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.note-focus-note .annotation.editing-inline .note-inline-text { flex: 1; min-height: 80px; resize: none; }
+.note-focus-note .annotation.editing-inline .markdown-content { flex: 1; min-height: 0; overflow: auto; }
+.relation-body:has(.relation-detail:not([hidden])) #relation-split { display: block; }
+#relation-split { flex: none; width: 8px; display: none; }
+.relation-detail { flex: 0 0 var(--relation-side, min(460px, 42%)); }
+@media (max-width: 960px) {
+  .md-layout { grid-template-columns: minmax(0, 1fr); }
+  #md-layout-split { display: none; }
+}
+@media (max-width: 900px) { #relation-split { display: none !important; } }
+
+/* Picture viewer and editor (ui/image-viewer.mjs). */
+.shared-image[data-block-id] { cursor: zoom-in; }
+.image-viewer { position: fixed; inset: 0; z-index: 120; display: flex; flex-direction: column; background: #10161b; color: #eef2f1; }
+.image-viewer[hidden] { display: none; }
+.image-viewer button { min-height: 30px; padding: 3px 11px; border-radius: 7px; border: 1px solid #ffffff2e; background: #ffffff12;
+  color: #eef2f1; font-size: 13px; }
+.image-viewer button:hover:not(:disabled) { background: #ffffff26; }
+.image-viewer button:disabled { opacity: .4; }
+.image-viewer button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.image-viewer button[aria-pressed="true"] { background: #ffffffe6; color: #10161b; border-color: #fff; }
+.image-viewer-bar, .image-editor-bar { flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 8px 12px;
+  border-bottom: 1px solid #ffffff1a; }
+.image-editor-bar[hidden] { display: none; }
+.image-viewer-title { font-size: 14px; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-viewer-spacer { flex: 1; }
+.image-viewer-zoom { min-width: 62px; font-variant-numeric: tabular-nums; }
+.image-viewer-close { font-size: 18px !important; width: 34px; padding: 0 !important; }
+.image-editor-group { display: flex; align-items: center; gap: 4px; padding-right: 8px; margin-right: 2px; border-right: 1px solid #ffffff1a; }
+.image-editor-group:last-child { border-right: 0; }
+.image-viewer .image-swatch { width: 24px; min-height: 24px; height: 24px; padding: 0; border-radius: 50%; border: 2px solid #ffffff55; }
+.image-viewer .image-swatch[aria-pressed="true"] { outline: 2px solid #fff; outline-offset: 2px; border-color: #10161b; }
+.image-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; cursor: grab; touch-action: none;
+  background: repeating-conic-gradient(#1b232a 0 25%, #151c22 0 50%) 0 0 / 24px 24px; }
+.image-viewer.is-panning .image-stage { cursor: grabbing; }
+.image-viewer.is-editing .image-stage { cursor: crosshair; }
+.image-viewer.is-editing[data-tool="pan"] .image-stage { cursor: grab; }
+.image-viewer.is-editing[data-tool="select"] .image-stage { cursor: default; }
+.image-viewer.is-editing[data-tool="text"] .image-stage { cursor: text; }
+.image-canvas { position: absolute; left: 0; top: 0; transform-origin: 0 0; box-shadow: 0 8px 40px #0008; }
+.image-picture { display: block; max-width: none; user-select: none; -webkit-user-drag: none; }
+.image-layer { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+.image-viewer.is-editing[data-tool="select"] .image-layer .image-shape { pointer-events: visiblePainted; cursor: move; }
+.image-viewer.is-editing .image-layer .image-shape[data-index] text { pointer-events: auto; }
+.image-selection { fill: none; stroke: #0090ff; pointer-events: none; }
+.image-text-input { position: absolute; z-index: 2; min-width: 120px; padding: 0; margin: 0; border: 1px dashed #0090ff; background: #ffffffd9;
+  font-weight: 600; line-height: 1.25; font-family: system-ui, "Microsoft YaHei", sans-serif; resize: none; outline: none; overflow: hidden; }
+.image-viewer-hint { flex: none; padding: 6px 14px; font-size: 12px; color: #aab6b4; border-top: 1px solid #ffffff12; }
+
+/* Enlarged annotation: the original on the left is the chat itself, embedded (mirror mode). */
+#note-focus-source:has(> iframe.embedded-chat) { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+
+/* The floating bar for selected text also shows above the enlarged annotation; inside an
+   annotation's own text it offers just highlight and underline. */
+.selection-tools { z-index: 80; }
+.selection-tools.for-note .selection-block-only { display: none; }
+
+/* In an annotation's chat, the message it hangs on comes first as context (read from its chat). */
+.paper-block.is-source-message { border: 1px dashed var(--line); background: color-mix(in srgb, var(--paper) 80%, transparent); }
+.paper-block.is-source-message .message-meta strong { color: var(--muted); }
+.source-context { color: var(--muted); font-size: 11.5px; }
+.message-meta .source-open { min-height: 24px; padding: 1px 9px; font-size: 12px; }
+
+
+/* Levels of the enlarged view (annotations and side questions, nested). */
+#focus-level-back { flex: none; min-height: 28px; font-size: 12px; }
+.focus-level-head { display: flex; align-items: baseline; gap: 8px; padding: 12px 16px 6px; min-width: 0; }
+.focus-level-head strong { color: var(--accent); font-size: 14px; flex: none; }
+.focus-level-quote { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* To-dos and their calendar (ui/todo-ui.mjs). */
+.todo-badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 4px;
+  border-radius: 999px; background: #e5484d; color: #fff; font-size: 11px; font-weight: 700; }
+.todo-badge[hidden] { display: none; }
+.todo-view { height: calc(100vh - var(--ribbon-height)); display: flex; flex-direction: column; padding: 18px 24px; }
+.todo-header { flex: none; display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.todo-header h1 { margin: 0; }
+.todo-header #todo-count { margin: 4px 0 0; }
+.todo-tools { display: flex; align-items: center; gap: 8px; }
+.todo-body { flex: 1; min-height: 0; display: flex; }
+.todo-main { flex: 1; min-width: 0; overflow: auto; padding-right: 4px; }
+#todo-split[hidden] { display: none; }
+.todo-detail { flex: 0 0 var(--todo-side, min(520px, 46%)); min-width: 320px; display: flex; flex-direction: column; overflow: hidden;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px; }
+.todo-detail[hidden] { display: none; }
+.todo-detail-head { flex: none; padding: 12px 16px 10px; border-bottom: 1px solid var(--line); }
+.todo-detail-head h2 { margin: 2px 0 4px; font-size: 16px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 8em; overflow: auto; }
+.todo-detail-head p.muted { margin: 0 0 8px; font-size: 12.5px; }
+.todo-detail-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.todo-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.todo-group { margin: 16px 2px 6px; font-size: 13px; color: var(--muted); }
+.todo-group-toggle { margin: 14px 0 6px; font-size: 13px; }
+.todo-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin-bottom: 6px; cursor: pointer;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px; }
+.todo-item:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.todo-item.is-selected { border-color: var(--accent); background: var(--tint); }
+.todo-item.is-done .todo-item-text { text-decoration: line-through; color: var(--muted); }
+.todo-item.is-ran { border-left: 4px solid #30a46c; }
+.todo-item.is-running { border-left: 4px solid #f5a524; }
+.todo-item input { margin-top: 3px; }
+.todo-item-body { min-width: 0; }
+.todo-item-text { white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.todo-item-meta { margin-top: 4px; font-size: 12px; color: var(--muted); }
+.todo-empty { margin: 30px 4px; }
+.todo-calendar-head { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.todo-calendar-head strong { min-width: 120px; text-align: center; }
+.todo-calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.todo-weekday { text-align: center; font-size: 12px; color: var(--muted); padding: 2px 0; }
+.todo-day { min-height: 92px; padding: 4px; display: flex; flex-direction: column; gap: 3px; background: var(--paper);
+  border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.todo-day.is-other { opacity: .5; }
+.todo-day.is-today { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.todo-day-number { font-size: 12px; color: var(--muted); }
+.todo-chip { min-height: 0; padding: 1px 5px; font-size: 11.5px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-radius: 5px; background: color-mix(in srgb, var(--accent) 14%, transparent); border: 0; }
+.todo-chip.is-ran { background: color-mix(in srgb, #30a46c 22%, transparent); }
+.todo-chip.is-done { text-decoration: line-through; opacity: .6; }
+.todo-chip.is-selected { outline: 2px solid var(--accent); }
+.todo-hint { font-size: 12px; margin: 8px 2px; }
+.todo-dialog { width: min(560px, calc(100vw - 32px)); }
+.todo-form { display: flex; flex-direction: column; gap: 10px; }
+.todo-form h2 { margin: 0; }
+.todo-source { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
+.todo-text { width: 100%; resize: vertical; min-height: 90px; }
+.todo-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.todo-row > span:first-child { min-width: 64px; color: var(--muted); font-size: 13px; }
+.todo-inline { display: inline-flex; align-items: center; gap: 6px; }
+.todo-inline input[type="number"] { width: 64px; }
+.todo-inline[hidden] { display: none; }
+@media (max-width: 900px) { .todo-body { flex-direction: column; } .todo-detail { flex: 1 1 60%; min-width: 0; } #todo-split { display: none; } }

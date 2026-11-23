@@ -6,6 +6,26 @@ import { annotationOriginalKind, findAnchor, initialNotebook, messageGroups, sam
 import { validateComments, validateTurns } from "./pdf-review.mjs";
 import { mdTextLimit, reanchor } from "./md-document.mjs";
 import { appendTurn, chatTurns, childKey, childKinds, syncTurns } from "./child-chats.mjs";
+import { nextOccurrence, normalizeRepeat } from "./todos.mjs";
+import { blockToNote, noteToBlock, putMessages, removeMessages, removeNote, restoreMessages, restoreNote,
+  takeMessages } from "./structure.mjs";
+
+// How many structural edits (moves, removals, conversions) can be undone.
+const journalSize = 60;
+
+// An annotation is a node of the chat tree like any chat: its own chat starts with the annotation's
+// text as a note block (noteType "annotation"), followed by its follow-up conversation. So
+// everything a chat can do (side questions, branches, annotations on it, highlights …) works on the
+// annotation's text. The block is the text; the annotation in the margin shows it (see #fill).
+export const annotationHead = "annotation";
+const headOf = (chat) => chat?.blocks?.find((block) => block.noteType === annotationHead && !block.removed) ?? null;
+const headSignature = (note) => JSON.stringify([note.text, (note.marks || []).map(({ start, quote, style }) => [start, quote, style])]);
+function headBlock(note) {
+  const id = randomUUID();
+  return { id, kind: "paragraph", noteType: annotationHead, text: note.text || "", included: true,
+    marks: (note.marks || []).map(({ start, quote, style }) => ({ blockId: id, start, quote, style })),
+    ...(note.attachments?.length ? { attachments: note.attachments } : {}) };
+}
 
 // The conversation lists a chat shows from its child chats (see child-chats.mjs), as filled in on
 // read: a write only syncs the lists that changed since.
@@ -485,6 +505,20 @@ export function applyChange(state, action) {
       break;
     case "mark": {
       if (!["highlight", "underline"].includes(action.style)) throw new Error("未知的标记类型。");
+      // Inside an annotation's own text: the same marks, kept on the annotation.
+      if (action.noteId) {
+        const note = find(state.notes, action.noteId);
+        const quote = requireText(action.anchor?.quote);
+        const start = action.anchor?.start;
+        if (!Number.isInteger(start) || start < 0 || note.text.slice(start, start + quote.length) !== quote) {
+          throw new Error("选区已改变，请重新选中文字。");
+        }
+        note.marks ??= [];
+        const existing = note.marks.findIndex((mark) => mark.style === action.style && mark.start === start && mark.quote === quote);
+        if (existing >= 0) note.marks.splice(existing, 1);
+        else note.marks.push({ start, quote, style: action.style });
+        break;
+      }
       const anchor = checkedAnchor(state, action.anchor);
       const block = find(state.blocks, anchor.blockId);
       const existing = block.marks.findIndex((mark) =>
@@ -592,9 +626,23 @@ export function applyChange(state, action) {
   return state;
 }
 
+// What each chat object was read with (row data by id), so writing it back only touches the rows
+// that changed. Objects not read from rows (new chats, older documents) are written in full.
+const readRows = new WeakMap();
+
 export class NotebookStore {
+  #rows;
+  #docs;
+
   constructor(path) {
     this.db = new DatabaseSync(path);
+    // An earlier draft kept these tables as an index only (keyed by block id alone). Every chat still
+    // holds its messages in its document then, so they are dropped and refilled by moveToRows.
+    const draft = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chat_blocks'").get();
+    if (draft && !draft.sql.includes("PRIMARY KEY (chat_id, id)")) {
+      this.db.exec(`DROP VIEW IF EXISTS relations; DROP TABLE IF EXISTS chat_blocks; DROP TABLE IF EXISTS chat_notes;
+        DROP TABLE IF EXISTS attachment_uses; DROP TABLE IF EXISTS chat_links;`);
+    }
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS notebook (
@@ -628,6 +676,91 @@ export class NotebookStore {
         kind TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS child_chats_parent ON child_chats(parent_notebook);
+      CREATE TABLE IF NOT EXISTS structure_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        chats TEXT NOT NULL,
+        inverse TEXT NOT NULL
+      );
+      -- Every message block, annotation and attachment use as a row of its own (kept in step with
+      -- the chat documents on every write): where it lives, in what order, which message it is part of.
+      CREATE TABLE IF NOT EXISTS chat_blocks (
+        chat_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        message_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        note_type TEXT,
+        speaker TEXT,
+        removed INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (chat_id, id)
+      );
+      CREATE INDEX IF NOT EXISTS chat_blocks_chat ON chat_blocks(chat_id, position);
+      CREATE INDEX IF NOT EXISTS chat_blocks_id ON chat_blocks(id);
+      CREATE INDEX IF NOT EXISTS chat_blocks_message ON chat_blocks(chat_id, message_id);
+      CREATE TABLE IF NOT EXISTS chat_notes (
+        chat_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        block_id TEXT,
+        removed INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (chat_id, id)
+      );
+      CREATE INDEX IF NOT EXISTS chat_notes_block ON chat_notes(block_id);
+      CREATE TABLE IF NOT EXISTS attachment_uses (
+        attachment_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        owner_kind TEXT NOT NULL,
+        name TEXT,
+        extension TEXT,
+        PRIMARY KEY (chat_id, owner_id, attachment_id)
+      );
+      CREATE INDEX IF NOT EXISTS attachment_uses_attachment ON attachment_uses(attachment_id);
+      -- Internal links written in messages and notes (ownsoft://chat|md|pdf/<id>).
+      CREATE TABLE IF NOT EXISTS chat_links (
+        chat_id TEXT NOT NULL,
+        block_id TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        PRIMARY KEY (chat_id, block_id, target_kind, target_id)
+      );
+      CREATE INDEX IF NOT EXISTS chat_links_target ON chat_links(target_id);
+      -- Every relation in one place: what grew out of what, what hangs on what, what uses or links what.
+      DROP VIEW IF EXISTS relations;
+      CREATE VIEW relations AS
+        SELECT 'chat' AS from_kind, parent_notebook AS from_id, kind AS relation, 'chat' AS to_kind, notebook_id AS to_id
+          FROM child_chats WHERE parent_notebook IS NOT NULL
+        UNION ALL SELECT 'chat', chat_id, 'contains', 'block', id FROM chat_blocks
+        UNION ALL SELECT 'block', block_id, CASE removed WHEN 1 THEN 'removed-note' ELSE 'note' END, 'note', id FROM chat_notes
+        UNION ALL SELECT owner_kind, owner_id, 'uses', 'attachment', attachment_id FROM attachment_uses
+        UNION ALL SELECT 'block', block_id, 'links', target_kind, target_id FROM chat_links;
+      -- To-dos (todos.mjs): from a message of a chat (block_id, quote) or typed in; due_at and repeat
+      -- say when the AI works on it (ai = 1); its work goes into the to-do's chat ("todo:<id>").
+      CREATE TABLE IF NOT EXISTS todos (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT,
+        block_id TEXT,
+        quote TEXT NOT NULL DEFAULT '',
+        text TEXT NOT NULL,
+        due_at INTEGER,
+        repeat TEXT,
+        member_id TEXT,
+        ai INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'open',
+        runs INTEGER NOT NULL DEFAULT 0,
+        last_run_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS todos_due ON todos(status, ai, due_at);
+      CREATE INDEX IF NOT EXISTS todos_chat ON todos(chat_id);
       CREATE TABLE IF NOT EXISTS md_documents (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -644,8 +777,41 @@ export class NotebookStore {
       );
     `);
     this.select = this.db.prepare("SELECT snapshot FROM notebook_documents WHERE id = ?");
-    this.update = this.db.prepare("UPDATE notebook_documents SET snapshot = ?, updated = ? WHERE id = ?");
-    this.insert = this.db.prepare("INSERT INTO notebook_documents VALUES (?, ?, ?)");
+    // A chat is stored as rows: its messages in chat_blocks and its annotations in chat_notes (the
+    // data column holds each one in full), the rest (title, members, branches …) as a small JSON
+    // document in notebook_documents. Callers still hand over and get back a whole chat object.
+    const update = this.db.prepare("UPDATE notebook_documents SET snapshot = ?, updated = ? WHERE id = ?");
+    const insert = this.db.prepare("INSERT INTO notebook_documents VALUES (?, ?, ?)");
+    this.#docs = { update, insert };
+    this.update = { run: (json, at, id) => this.#atomically(() => {
+      const state = { ...JSON.parse(json), id };
+      update.run(this.#docJson(state), at, id);
+      this.#saveRows(state);
+    }) };
+    this.insert = { run: (id, json, at) => this.#atomically(() => {
+      const state = { ...JSON.parse(json), id };
+      insert.run(id, this.#docJson(state), at);
+      this.#saveRows(state);
+    }) };
+    this.#rows = {
+      blocksOf: this.db.prepare("SELECT id, position, message_id, data FROM chat_blocks WHERE chat_id = ? ORDER BY position"),
+      notesOf: this.db.prepare("SELECT id, removed, position, data FROM chat_notes WHERE chat_id = ? ORDER BY position"),
+      clearBlocks: this.db.prepare("DELETE FROM chat_blocks WHERE chat_id = ?"),
+      clearNotes: this.db.prepare("DELETE FROM chat_notes WHERE chat_id = ?"),
+      clearUses: this.db.prepare("DELETE FROM attachment_uses WHERE chat_id = ?"),
+      clearLinks: this.db.prepare("DELETE FROM chat_links WHERE chat_id = ?"),
+      block: this.db.prepare(`INSERT OR REPLACE INTO chat_blocks (id, chat_id, position, message_id, kind, note_type, speaker,
+        removed, text, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+      dropBlock: this.db.prepare("DELETE FROM chat_blocks WHERE chat_id = ? AND id = ?"),
+      note: this.db.prepare(`INSERT OR REPLACE INTO chat_notes (id, chat_id, block_id, removed, text, data, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`),
+      dropNote: this.db.prepare("DELETE FROM chat_notes WHERE chat_id = ? AND id = ?"),
+      use: this.db.prepare(`INSERT OR REPLACE INTO attachment_uses (attachment_id, chat_id, owner_id, owner_kind, name, extension)
+        VALUES (?, ?, ?, ?, ?, ?)`),
+      dropUses: this.db.prepare("DELETE FROM attachment_uses WHERE chat_id = ? AND owner_id = ?"),
+      link: this.db.prepare("INSERT OR IGNORE INTO chat_links (chat_id, block_id, target_kind, target_id) VALUES (?, ?, ?, ?)"),
+      dropLinks: this.db.prepare("DELETE FROM chat_links WHERE chat_id = ? AND block_id = ?")
+    };
     if (!this.db.prepare("SELECT active FROM notebook_library WHERE id = 1").get()) {
       const row = this.db.prepare("SELECT snapshot FROM notebook WHERE id = 1").get();
       const state = row ? JSON.parse(row.snapshot) : initialNotebook();
@@ -669,7 +835,123 @@ export class NotebookStore {
   read(id = this.activeId()) {
     const row = this.select.get(id);
     if (!row) throw new Error("找不到这本笔记。");
-    return this.#fill(JSON.parse(row.snapshot));
+    return this.#fill(this.#assemble(id, row.snapshot));
+  }
+
+  // A chat object from its document and rows. A document that still holds its messages (saved by
+  // an earlier version, before moveToRows) is used as it is.
+  #assemble(id, snapshot) {
+    const state = JSON.parse(snapshot);
+    state.id ??= id;
+    if (Array.isArray(state.blocks)) return state;
+    const known = { blocks: new Map(), notes: new Map() };
+    state.blocks = this.#rows.blocksOf.all(state.id).map((row) => {
+      known.blocks.set(row.id, { data: row.data, position: row.position, messageId: row.message_id });
+      return JSON.parse(row.data);
+    });
+    state.notes = [];
+    const removed = [];
+    for (const row of this.#rows.notesOf.all(state.id)) {
+      known.notes.set(row.id, { data: row.data, position: row.position, removed: row.removed });
+      (row.removed ? removed : state.notes).push(JSON.parse(row.data));
+    }
+    if (removed.length) state.removedNotes = removed;
+    readRows.set(state, known);
+    return state;
+  }
+
+  // The document part of a chat: everything but its messages and annotations (and lists' turns,
+  // which live in child chats).
+  #docJson(state) {
+    const { blocks, notes, removedNotes, inherited, ...rest } = state;
+    return JSON.stringify({ ...rest, branches: withoutTurns(rest.branches) ?? rest.branches,
+      ...(rest.threads ? { threads: withoutTurns(rest.threads) } : {}) });
+  }
+
+  // Writes a chat's messages and annotations as rows: only those that changed since the object was
+  // read (or all of them for an object that was not read from rows). A list missing from the
+  // object (e.g. a document-only update) is left as it is.
+  #saveRows(state) {
+    const rows = this.#rows;
+    const known = readRows.get(state);
+    const chat = state.id;
+    const fresh = { blocks: new Map(), notes: new Map() };
+    const dropOwner = (id) => { rows.dropUses.run(chat, id); rows.dropLinks.run(chat, id); };
+    const use = (ref, ownerId, kind) => {
+      if (ref?.id) rows.use.run(ref.id, chat, ownerId, kind, ref.name || null, ref.extension || null);
+    };
+    if (Array.isArray(state.blocks)) {
+      if (!known) {
+        rows.clearBlocks.run(chat);
+        rows.clearLinks.run(chat);
+        this.db.prepare("DELETE FROM attachment_uses WHERE chat_id = ? AND owner_kind = 'block'").run(chat);
+      }
+      let messageId = null;
+      let previous = null;
+      state.blocks.filter((block) => !block.virtual).forEach((block, position) => {
+        if (!messageId || !sameMessage(previous, block)) messageId = block.id;
+        previous = block;
+        const data = JSON.stringify(block);
+        fresh.blocks.set(block.id, { data, position, messageId });
+        const before = known?.blocks.get(block.id);
+        if (before && before.data === data && before.position === position && before.messageId === messageId) return;
+        rows.block.run(block.id, chat, position, messageId, block.kind, block.noteType || null,
+          block.source?.memberName || null, block.removed ? 1 : 0, block.text || "", data);
+        if (before?.data === data) return;
+        dropOwner(block.id);
+        for (const ref of block.attachments || []) use(ref, block.id, "block");
+        for (const [, kind, target] of String(block.text || "").matchAll(/ownsoft:\/\/(chat|md|pdf)\/([\w-]{1,80})/g)) {
+          rows.link.run(chat, block.id, kind, target);
+        }
+      });
+      for (const id of known?.blocks.keys() || []) {
+        if (fresh.blocks.has(id)) continue;
+        rows.dropBlock.run(chat, id);
+        dropOwner(id);
+      }
+    }
+    if (Array.isArray(state.notes)) {
+      if (!known) {
+        rows.clearNotes.run(chat);
+        this.db.prepare("DELETE FROM attachment_uses WHERE chat_id = ? AND owner_kind = 'note'").run(chat);
+      }
+      const all = [...state.notes.map((note) => [note, 0]), ...(state.removedNotes || []).map((note) => [note, 1])];
+      all.forEach(([note, removed], position) => {
+        const { turns, ...kept } = note;
+        const data = JSON.stringify(kept);
+        fresh.notes.set(note.id, { data, position, removed });
+        const before = known?.notes.get(note.id);
+        if (before && before.data === data && before.position === position && before.removed === removed) return;
+        rows.note.run(note.id, chat, note.anchor?.blockId || null, removed, note.text || "", data, position);
+        if (before?.data === data) return;
+        rows.dropUses.run(chat, note.id);
+        for (const ref of note.attachments || []) use(ref, note.id, "note");
+      });
+      for (const id of known?.notes.keys() || []) {
+        if (fresh.notes.has(id)) continue;
+        rows.dropNote.run(chat, id);
+        rows.dropUses.run(chat, id);
+      }
+    }
+    // The object now matches the rows: a later write of it again only touches what changes next.
+    if (Array.isArray(state.blocks) && Array.isArray(state.notes)) readRows.set(state, fresh);
+  }
+
+  // Chats saved by earlier versions keep their messages inside the document; this moves them into
+  // rows (main.mjs makes a backup first).
+  needsRowMove() {
+    return Boolean(this.db.prepare("SELECT 1 FROM notebook_documents WHERE json_type(snapshot, '$.blocks') IS NOT NULL LIMIT 1").get());
+  }
+
+  moveToRows() {
+    this.#atomically(() => {
+      for (const { id, snapshot } of this.db.prepare("SELECT id, snapshot FROM notebook_documents WHERE json_type(snapshot, '$.blocks') IS NOT NULL").all()) {
+        const state = { ...JSON.parse(snapshot), id };
+        state.notes ??= [];
+        this.#docs.update.run(this.#docJson(state), Date.now(), id);
+        this.#saveRows(state);
+      }
+    });
   }
 
   // ---- child chats --------------------------------------------------------------------------
@@ -690,9 +972,9 @@ export class NotebookStore {
   // Turns come from the child chat; a list still stored inline (older data) is kept and moved
   // into a child chat by the next write.
   #fill(state) {
-    const children = new Map(this.db.prepare(`SELECT c.key, d.snapshot FROM child_chats c
+    const children = new Map(this.db.prepare(`SELECT c.key, c.notebook_id, d.snapshot FROM child_chats c
       JOIN notebook_documents d ON d.id = c.notebook_id WHERE c.parent_notebook = ?`).all(state.id)
-      .map(({ key, snapshot }) => [key, JSON.parse(snapshot)]));
+      .map(({ key, notebook_id: id, snapshot }) => [key, this.#assemble(id, snapshot)]));
     // Windows refresh a chat when its revision grows; a reply in one of its child chats counts.
     for (const child of children.values()) state.revision = (state.revision || 0) + (child.revision || 0);
     const signatures = new Map();
@@ -701,14 +983,57 @@ export class NotebookStore {
       if (child) item.turns = chatTurns(child);
       else if (parent.kind !== "note") item.turns ??= [];
       signatures.set(key, !child && item.turns?.length ? "inline" : JSON.stringify(item.turns ?? []));
+      const head = parent.kind === "note" ? headOf(child) : null;
+      if (head) {
+        item.text = head.text;
+        item.marks = (head.marks || []).map(({ start, quote, style }) => ({ start, quote, style }));
+        signatures.set(`${key}#head`, headSignature(item));
+      }
     }
     filledLists.set(state, signatures);
+    this.#sourceMessage(state);
     // A chat without members of its own talks with those of the chat it grew from (for a review's
     // chats: the chat the review was last opened from). Not stored; see #stored.
     const inherited = state.members?.length ? null : this.#inheritedRoster(state);
     if (inherited) state.inherited = inherited;
     else delete state.inherited;
     return state;
+  }
+
+  // An annotation's chat begins with the message the annotation hangs on (context), then the
+  // annotation's text, then its follow-ups. That first message is the parent chat's own message,
+  // read from there each time (never stored here): a block marked virtual, with the annotated
+  // passage marked. Its id is fixed, so things anchored on it stay put.
+  #sourceMessage(state) {
+    if (!["note", "branch", "todo"].includes(state.parent?.kind) || !Array.isArray(state.blocks)) return;
+    state.blocks = state.blocks.filter((block) => !block.virtual);
+    // A side question's chat (a branch) begins the same way: the message it was asked about.
+    const { notebookId, noteId, branchId, todoId } = state.parent;
+    let anchor = null;
+    if (state.parent.kind === "todo") {
+      const todo = this.db.prepare("SELECT block_id, quote FROM todos WHERE id = ?").get(todoId);
+      anchor = todo?.block_id ? { blockId: todo.block_id, quote: todo.quote || "", start: 0 } : null;
+    } else if (state.parent.kind === "note") {
+      const row = this.db.prepare("SELECT data FROM chat_notes WHERE chat_id = ? AND id = ?").get(notebookId, noteId);
+      anchor = row ? JSON.parse(row.data).anchor : null;
+    } else {
+      const row = this.db.prepare("SELECT json_extract(snapshot, '$.branches') AS branches FROM notebook_documents WHERE id = ?").get(notebookId);
+      anchor = (row?.branches ? JSON.parse(row.branches) : []).find((item) => item.id === branchId)?.anchor ?? null;
+    }
+    const at = anchor && this.db.prepare("SELECT message_id FROM chat_blocks WHERE chat_id = ? AND id = ?").get(notebookId, anchor.blockId);
+    if (!at) return;
+    const parts = this.db.prepare(`SELECT data FROM chat_blocks WHERE chat_id = ? AND message_id = ? AND removed = 0
+      ORDER BY position`).all(notebookId, at.message_id).map((item) => JSON.parse(item.data));
+    if (!parts.length) return;
+    const text = parts.map((block) => block.text).join("\n\n");
+    const id = `source-${noteId || branchId || todoId}`;
+    const start = anchor.quote ? findAnchor(text, anchor) : null;
+    const title = this.db.prepare("SELECT json_extract(snapshot, '$.title') AS title FROM notebook_documents WHERE id = ?").get(notebookId)?.title;
+    state.blocks.unshift({ id, kind: "paragraph", noteType: "source", virtual: true, included: false, text,
+      marks: start === null ? [] : [{ blockId: id, start, quote: anchor.quote, style: "note" }],
+      ...(parts.some((block) => block.attachments?.length) ? { attachments: parts.flatMap((block) => block.attachments || []) } : {}),
+      source: { chatId: notebookId, messageId: at.message_id, kind: parts[0].kind, speaker: parts[0].source?.memberName || null, noteType: parts[0].noteType || null,
+        chatTitle: title || "" } });
   }
 
   #inheritedRoster(state) {
@@ -734,26 +1059,40 @@ export class NotebookStore {
     const kept = new Set();
     for (const [item, key, parent] of this.#conversations(state)) {
       kept.add(key);
+      const headKey = `${key}#head`;
+      if (parent.kind === "note" && signatures.has(headKey) && signatures.get(headKey) !== headSignature(item)) {
+        const chat = this.childChat(key);
+        const head = headOf(chat);
+        if (head) {
+          head.text = item.text;
+          head.marks = (item.marks || []).map(({ start, quote, style }) => ({ blockId: head.id, start, quote, style }));
+          this.write(chat);
+        }
+        signatures.set(headKey, headSignature(item));
+      }
       if (!Array.isArray(item.turns)) continue;
       const signature = JSON.stringify(item.turns);
       if (signatures.get(key) === signature) continue;
-      this.syncChildTurns(key, parent, item.turns, { prune: true });
+      this.syncChildTurns(key, parent, item.turns, { prune: true, head: parent.kind === "note" ? item : null });
       signatures.set(key, signature);
     }
     filledLists.set(state, signatures);
+    // An annotation turned into a note block, or deleted, keeps its follow-up chat while it can
+    // still be turned back (see structure.mjs).
+    for (const block of state.blocks || []) if (block.fromNote) kept.add(childKey.note(state.id, block.fromNote.id));
+    for (const note of state.removedNotes || []) kept.add(childKey.note(state.id, note.id));
+    for (const { id } of this.db.prepare("SELECT id FROM todos WHERE chat_id = ?").all(state.id)) kept.add(childKey.todo(id));
     for (const { key } of this.db.prepare("SELECT key FROM child_chats WHERE parent_notebook = ?").all(state.id)) {
       if (!kept.has(key)) this.deleteChildChat(key);
     }
   }
 
-  #stored(state) {
-    return JSON.stringify({ ...state, inherited: undefined, notes: withoutTurns(state.notes) ?? state.notes,
-      branches: withoutTurns(state.branches) ?? state.branches, ...(state.threads ? { threads: withoutTurns(state.threads) } : {}) });
-  }
-
   #insertChat(state) {
-    this.insert.run(state.id, this.#stored(state), Date.now());
-    this.#absorb(state);
+    this.#atomically(() => {
+      this.#docs.insert.run(state.id, this.#docJson(state), Date.now());
+      this.#saveRows(state);
+      this.#absorb(state);
+    });
   }
 
   childChat(key) {
@@ -764,16 +1103,22 @@ export class NotebookStore {
       this.db.prepare("DELETE FROM child_chats WHERE key = ?").run(key);
       return null;
     }
-    return this.#fill(JSON.parse(found.snapshot));
+    return this.#fill(this.#assemble(row.notebook_id, found.snapshot));
   }
 
   // parent: { kind, title, notebookId?, … } — where the conversation grew from.
-  ensureChildChat(key, parent) {
+  // note: for an annotation's chat, the annotation (its text becomes the first block); found from
+  // the parent chat's rows when not given.
+  ensureChildChat(key, parent, note = null) {
     const existing = this.childChat(key);
     if (existing) return existing;
     if (!childKinds[parent?.kind]) throw new Error("对话来源无效。");
+    if (parent.kind === "note" && !note) {
+      const row = this.db.prepare("SELECT data FROM chat_notes WHERE chat_id = ? AND id = ?").get(parent.notebookId, parent.noteId);
+      note = row ? JSON.parse(row.data) : null;
+    }
     const state = { id: randomUUID(), title: requireText(parent.title || childKinds[parent.kind], 160).trim(),
-      blocks: [], notes: [], branches: [], parent: { ...parent, key } };
+      blocks: note ? [headBlock(note)] : [], notes: [], branches: [], parent: { ...parent, key } };
     this.insert.run(state.id, JSON.stringify(state), Date.now());
     this.db.prepare("INSERT INTO child_chats VALUES (?, ?, ?, ?)").run(key, state.id, parent.notebookId || null, parent.kind);
     return this.#fill(state);
@@ -794,10 +1139,21 @@ export class NotebookStore {
   }
 
   #openChildChat({ kind, notebookId, itemId, hash, mdId, commentId }) {
+    if (kind === "todo") {
+      const todo = this.todo(itemId);
+      return this.ensureChildChat(childKey.todo(todo.id), { kind: "todo", notebookId: todo.chatId || undefined, todoId: todo.id,
+        title: `待办 · ${label(todo.text, 40)}` }).id;
+    }
     if (kind === "note" || kind === "branch" || kind === "thread") {
       const found = this.#conversations(this.read(notebookId)).find(([item, , parent]) => parent.kind === kind && item.id === itemId);
       if (!found) throw new Error("这段对话已不存在。");
-      return this.ensureChildChat(found[1], found[2]).id;
+      const chat = this.ensureChildChat(found[1], found[2], kind === "note" ? found[0] : null);
+      // Annotation chats made before the annotation's text was their first block get it now.
+      if (kind === "note" && !headOf(chat)) {
+        chat.blocks.unshift(headBlock(found[0]));
+        this.write(chat);
+      }
+      return chat.id;
     }
     const pdf = kind === "pdf-chat" || kind === "pdf-comment";
     const review = pdf ? this.pdfReview(hash) : this.mdDocument(mdId);
@@ -818,10 +1174,10 @@ export class NotebookStore {
     return chat ? chatTurns(chat) : null;
   }
 
-  syncChildTurns(key, parent, turns, { prune = false } = {}) {
+  syncChildTurns(key, parent, turns, { prune = false, head = null } = {}) {
     let chat = this.childChat(key);
     if (!chat && !turns?.length) return null;
-    chat ??= this.ensureChildChat(key, parent);
+    chat ??= this.ensureChildChat(key, parent, head);
     if (syncTurns(chat, turns || [], { prune })) this.write(chat);
     return chat;
   }
@@ -830,6 +1186,92 @@ export class NotebookStore {
     const chat = this.ensureChildChat(key, parent);
     appendTurn(chat, turn);
     return this.write(chat);
+  }
+
+  // ---- to-dos (todos.mjs) ------------------------------------------------------------------------
+  #todoRow(row) {
+    return row && { id: row.id, chatId: row.chat_id, blockId: row.block_id, quote: row.quote, text: row.text, dueAt: row.due_at,
+      repeat: row.repeat ? JSON.parse(row.repeat) : null, memberId: row.member_id, ai: Boolean(row.ai), status: row.status,
+      runs: row.runs, lastRunAt: row.last_run_at, lastError: row.last_error, createdAt: row.created_at, updatedAt: row.updated_at,
+      chatTitle: row.chat_id ? this.db.prepare("SELECT json_extract(snapshot, '$.title') AS title FROM notebook_documents WHERE id = ?")
+        .get(row.chat_id)?.title || "" : "" };
+  }
+
+  todo(id) {
+    const todo = this.#todoRow(this.db.prepare("SELECT * FROM todos WHERE id = ?").get(String(id || "")));
+    if (!todo) throw new Error("这条待办已不存在。");
+    return todo;
+  }
+
+  todos() {
+    return this.db.prepare("SELECT * FROM todos ORDER BY (due_at IS NULL), due_at, created_at").all().map((row) => this.#todoRow(row));
+  }
+
+  // fields: { text, chatId?, blockId?, quote?, dueAt?, repeat?, memberId?, ai? } (all but text optional when updating).
+  saveTodo(fields, id = null) {
+    const before = id ? this.todo(id) : null;
+    const text = requireText(fields.text ?? before?.text, 20_000).trim();
+    if (!text) throw new Error("请写下要做的事。");
+    const dueAt = fields.dueAt === undefined ? before?.dueAt ?? null
+      : fields.dueAt === null || fields.dueAt === "" ? null : Number(fields.dueAt);
+    if (dueAt !== null && !Number.isFinite(dueAt)) throw new Error("日期无效。");
+    const repeat = fields.repeat === undefined ? before?.repeat ?? null : normalizeRepeat(fields.repeat);
+    if (repeat && dueAt === null) throw new Error("重复的待办需要一个开始日期。");
+    const chatId = before ? before.chatId : typeof fields.chatId === "string" && this.select.get(fields.chatId) ? fields.chatId : null;
+    const blockId = before ? before.blockId : chatId && typeof fields.blockId === "string" ? fields.blockId.slice(0, 80) : null;
+    const quote = before ? before.quote : String(fields.quote || "").slice(0, 4000);
+    const memberId = fields.memberId === undefined ? before?.memberId ?? null : fields.memberId ? String(fields.memberId).slice(0, 80) : null;
+    const ai = fields.ai === undefined ? before?.ai ?? true : Boolean(fields.ai);
+    const now = Date.now();
+    if (before) {
+      // A new date (or reopening) puts it back on the list of things to do.
+      const status = fields.status && ["open", "ran", "done"].includes(fields.status) ? fields.status
+        : dueAt !== before.dueAt && before.status === "ran" ? "open" : before.status;
+      this.db.prepare(`UPDATE todos SET text = ?, due_at = ?, repeat = ?, member_id = ?, ai = ?, status = ?, updated_at = ?
+        WHERE id = ?`).run(text, dueAt, repeat ? JSON.stringify(repeat) : null, memberId, ai ? 1 : 0, status, now, id);
+      return this.todo(id);
+    }
+    const created = randomUUID();
+    this.db.prepare(`INSERT INTO todos (id, chat_id, block_id, quote, text, due_at, repeat, member_id, ai, status, runs,
+      created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, ?, ?)`)
+      .run(created, chatId, blockId, quote, text, dueAt, repeat ? JSON.stringify(repeat) : null, memberId, ai ? 1 : 0, now, now);
+    return this.todo(created);
+  }
+
+  deleteTodo(id) {
+    const todo = this.todo(id);
+    this.db.prepare("DELETE FROM todos WHERE id = ?").run(todo.id);
+    this.deleteChildChat(childKey.todo(todo.id));
+  }
+
+  // When the next of the AI's to-dos comes due (null: none waiting).
+  nextTodoDue() {
+    return this.db.prepare("SELECT MIN(due_at) AS at FROM todos WHERE status = 'open' AND ai = 1 AND due_at IS NOT NULL").get()?.at ?? null;
+  }
+
+  // The AI's to-dos whose time has come.
+  dueTodos(now = Date.now()) {
+    return this.db.prepare("SELECT * FROM todos WHERE status = 'open' AND ai = 1 AND due_at IS NOT NULL AND due_at <= ? ORDER BY due_at")
+      .all(now).map((row) => this.#todoRow(row));
+  }
+
+  // After the AI worked on it: a repeating to-do moves to its next time; a one-off waits for the
+  // user to look at the result. A failed run stays due (it is tried again next time the app checks)
+  // unless it repeats.
+  // dueAtStart: its time when the run began; if the AI gave it a later time meanwhile, that stands.
+  finishTodoRun(id, { ok, error = "", dueAtStart } = {}, now = Date.now()) {
+    const todo = this.todo(id);
+    if (ok && dueAtStart !== undefined && todo.dueAt !== dueAtStart && todo.dueAt > now) {
+      this.db.prepare("UPDATE todos SET status = 'open', runs = runs + 1, last_run_at = ?, last_error = NULL, updated_at = ? WHERE id = ?")
+        .run(now, now, id);
+      return this.todo(id);
+    }
+    const next = todo.repeat ? nextOccurrence(todo.dueAt, todo.repeat, now) : null;
+    const status = todo.repeat ? "open" : ok ? "ran" : "open";
+    const dueAt = todo.repeat ? next : ok ? todo.dueAt : now + 30 * 60_000;
+    this.db.prepare("UPDATE todos SET status = ?, due_at = ?, runs = runs + ?, last_run_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
+      .run(status, dueAt, ok ? 1 : 0, now, ok ? null : String(error).slice(0, 2000), now, id);
+    return this.todo(id);
   }
 
   // ---- relations: what grew out of a chat, as a tree (the graph / outline view) ------------------
@@ -882,7 +1324,13 @@ export class NotebookStore {
         pdfs.set(ref.id, { kind: "pdf", title: ref.name || block.text || "PDF", attachmentId: ref.id, blockId: block.id, attachment: ref, children: [] });
       }
     }
-    return [...nodes, ...pdfs.values()];
+    const todos = this.db.prepare("SELECT * FROM todos WHERE chat_id = ? ORDER BY created_at").all(state.id)
+      .map((row) => this.#todoRow(row)).map((todo) => this.#chatNode(childKey.todo(todo.id), {
+        kind: "todo", title: label(todo.text, 60), quote: label(todo.quote, 120),
+        text: todo.dueAt ? `${new Date(todo.dueAt).toLocaleString("zh-CN", { hour12: false })}` : "", turns: 0,
+        open: { kind: "todo", itemId: todo.id } }, level, depth, seen));
+    for (const node of todos) node.turns = node.chatId ? chatTurns(this.read(node.chatId)).length : 0;
+    return [...nodes, ...pdfs.values(), ...todos];
   }
 
   #chatNode(key, node, level, depth, seen) {
@@ -904,7 +1352,10 @@ export class NotebookStore {
     for (const { key } of this.db.prepare("SELECT key FROM child_chats WHERE parent_notebook = ?").all(notebookId)) {
       this.deleteChildChat(key);
     }
-    if (itself) this.db.prepare("DELETE FROM notebook_documents WHERE id = ?").run(notebookId);
+    if (itself) {
+      this.db.prepare("DELETE FROM notebook_documents WHERE id = ?").run(notebookId);
+      this.#unindexChat(notebookId);
+    }
   }
 
   #deleteChildrenByPrefix(prefix, keep = new Set()) {
@@ -936,7 +1387,7 @@ export class NotebookStore {
   }
 
   readAll() {
-    return this.db.prepare("SELECT snapshot FROM notebook_documents").all().map(({ snapshot }) => JSON.parse(snapshot));
+    return this.db.prepare("SELECT id, snapshot FROM notebook_documents").all().map(({ id, snapshot }) => this.#assemble(id, snapshot));
   }
 
   // Child chats are reached from where they grew, not listed among the sessions.
@@ -1020,6 +1471,7 @@ export class NotebookStore {
         this.insert.run(fresh.id, JSON.stringify(fresh), Date.now());
       }
       this.db.prepare("DELETE FROM notebook_documents WHERE id = ?").run(id);
+      this.#unindexChat(id);
       this.#deleteChildrenOf(id);
       if (this.activeId() === id) {
         const replacement = this.db.prepare(`SELECT id FROM notebook_documents WHERE json_extract(snapshot, '$.parent') IS NULL
@@ -1249,8 +1701,249 @@ export class NotebookStore {
   }
 
   change(action, id) {
+    // A deleted annotation is kept aside so the deletion can be undone.
+    if (action?.type === "delete-note") {
+      return this.structure({ type: "remove-note", chat: id ?? this.activeId(), noteId: action.id }).state;
+    }
     const state = applyChange(this.read(id), action);
-    return this.write(state);
+    const saved = this.write(state);
+    if (action?.type === "message-to-annotation") {
+      this.#journal("消息转为批注", [saved.id], { type: "undo-annotation", chat: saved.id, noteId: saved.notes.at(-1).id });
+    }
+    return saved;
+  }
+
+  // ---- structural edits (structure.mjs), each one undoable --------------------------------------
+  // op: { type: "move", from, ids, to, before }: whole messages (with their annotations, branches
+  //       and their follow-up chats) go before the message `before` (null: the end) of chat `to`
+  //     { type: "remove", chat, ids } / { type: "restore", chat, blocks }
+  //     { type: "note-to-block", chat, noteId, before? } / { type: "block-to-note", chat, blockId }
+  //     { type: "remove-note", chat, noteId } / { type: "restore-note", chat, noteId }
+  //     { type: "undo-annotation", chat, noteId }: a message turned into an annotation goes back
+  // Returns { label, chats (ids touched), state (of the chat it started in), focus? }.
+  structure(op, { journal = true } = {}) {
+    const result = this.#structure(op);
+    if (journal && result.inverse) this.#journal(result.label, result.chats, result.inverse);
+    return result;
+  }
+
+  undoStructure() {
+    const row = this.db.prepare("SELECT seq, label, inverse FROM structure_log ORDER BY seq DESC LIMIT 1").get();
+    if (!row) throw new Error("没有可以撤销的操作。");
+    this.db.prepare("DELETE FROM structure_log WHERE seq = ?").run(row.seq);
+    try {
+      return { ...this.#structure(JSON.parse(row.inverse)), label: row.label };
+    } catch (error) {
+      throw new Error(`无法撤销「${row.label}」：${error.message}`);
+    }
+  }
+
+  structureLog(limit = 20) {
+    return this.db.prepare("SELECT seq, at, label, chats FROM structure_log ORDER BY seq DESC LIMIT ?").all(limit)
+      .map((row) => ({ ...row, chats: JSON.parse(row.chats) }));
+  }
+
+  #journal(text, chats, inverse) {
+    this.db.prepare("INSERT INTO structure_log (at, label, chats, inverse) VALUES (?, ?, ?, ?)")
+      .run(Date.now(), text, JSON.stringify(chats), JSON.stringify(inverse));
+    this.db.prepare("DELETE FROM structure_log WHERE seq <= (SELECT MAX(seq) FROM structure_log) - ?").run(journalSize);
+  }
+
+  // The chat a block lives in now (it may have been moved since an operation named another). A chat
+  // made from selected messages keeps their ids, so an id can be in several chats: the hinted chat
+  // first, else the most recently changed one.
+  chatOfBlock(blockId, hint) {
+    if (typeof blockId !== "string" || !/^[\w-]{1,80}$/.test(blockId)) throw new Error("消息 ID 无效。");
+    if (hint && this.db.prepare("SELECT 1 FROM chat_blocks WHERE chat_id = ? AND id = ?").get(hint, blockId)) return hint;
+    const row = this.db.prepare(`SELECT b.chat_id FROM chat_blocks b JOIN notebook_documents d ON d.id = b.chat_id
+      WHERE b.id = ? ORDER BY d.updated DESC LIMIT 1`).get(blockId);
+    if (!row) throw new Error("找不到这条消息，可能已被删除。");
+    return row.chat_id;
+  }
+
+  // A message by any of its block ids: its chat, first block and blocks, from the rows.
+  findMessage(blockId, hint) {
+    const chatId = this.chatOfBlock(blockId, hint);
+    const { message_id: messageId } = this.db.prepare("SELECT message_id FROM chat_blocks WHERE chat_id = ? AND id = ?")
+      .get(chatId, blockId);
+    const blocks = this.db.prepare(`SELECT id, kind, note_type, speaker, removed, text, position FROM chat_blocks
+      WHERE chat_id = ? AND message_id = ? ORDER BY position`).all(chatId, messageId);
+    // The message that follows (to put something after this one), or null at the end.
+    const next = this.db.prepare("SELECT message_id FROM chat_blocks WHERE chat_id = ? AND position > ? AND message_id <> ? ORDER BY position LIMIT 1")
+      .get(chatId, blocks.at(-1).position, messageId)?.message_id ?? null;
+    return { chatId, messageId, blocks, next };
+  }
+
+  // Messages whose text contains a phrase, newest chats first (for the command line).
+  searchMessages(text, limit = 20) {
+    const phrase = String(text || "").trim();
+    if (!phrase) return [];
+    return this.db.prepare(`SELECT b.message_id AS messageId, b.chat_id AS chatId, b.kind, substr(b.text, 1, 120) AS preview,
+        json_extract(d.snapshot, '$.title') AS title
+      FROM chat_blocks b JOIN notebook_documents d ON d.id = b.chat_id
+      WHERE b.removed = 0 AND instr(b.text, ?) > 0 ORDER BY d.updated DESC, b.position LIMIT ?`).all(phrase, limit);
+  }
+
+  // Which chats and annotations use an attachment (for file cleanup and "where is this file").
+  attachmentUses(attachmentId) {
+    return this.db.prepare("SELECT chat_id AS chatId, owner_id AS ownerId, owner_kind AS ownerKind FROM attachment_uses WHERE attachment_id = ?")
+      .all(attachmentId);
+  }
+
+  #atomically(task) {
+    if (this.db.isTransaction) return task();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = task();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // Everything related to a chat, block, note or attachment, in both directions (relations view).
+  relationsOf(id) {
+    return this.db.prepare("SELECT from_kind AS fromKind, from_id AS fromId, relation, to_kind AS toKind, to_id AS toId " +
+      "FROM relations WHERE from_id = ? OR to_id = ? LIMIT 500").all(id, id);
+  }
+
+  #unindexChat(id) {
+    this.#rows.clearLinks.run(id);
+    this.#rows.clearBlocks.run(id);
+    this.#rows.clearNotes.run(id);
+    this.#rows.clearUses.run(id);
+  }
+
+  #saveAll(states) {
+    this.#atomically(() => { for (const state of states) this.write(state); });
+  }
+
+  // A follow-up chat (or branch chat) whose annotation moved to another chat goes with it.
+  #rekeyChild(oldKey, newKey, notebookId) {
+    const row = this.db.prepare("SELECT notebook_id FROM child_chats WHERE key = ?").get(oldKey);
+    if (!row || oldKey === newKey) return;
+    this.db.prepare("UPDATE child_chats SET key = ?, parent_notebook = ? WHERE key = ?").run(newKey, notebookId, oldKey);
+    const doc = this.select.get(row.notebook_id);
+    if (!doc) return;
+    const chat = JSON.parse(doc.snapshot);
+    chat.parent = { ...chat.parent, key: newKey, notebookId };
+    this.update.run(JSON.stringify(chat), Date.now(), row.notebook_id);
+  }
+
+  #structure(op) {
+    switch (op?.type) {
+      case "move": {
+        const ids = Array.isArray(op.ids) ? op.ids.filter((id) => typeof id === "string") : [];
+        if (!ids.length) throw new Error("请选择要移动的消息。");
+        const fromId = this.chatOfBlock(ids[0], op.from);
+        const toId = typeof op.to === "string" && op.to ? op.to : fromId;
+        const source = this.read(fromId);
+        const target = toId === fromId ? source : this.read(toId);
+        const taken = takeMessages(source, ids);
+        if (taken.blocks.some((block) => block.id === op.before)) throw new Error("不能放到它自己的位置上。");
+        const before = typeof op.before === "string" ? op.before : null;
+        if (toId !== fromId) {
+          for (const note of taken.notes) this.#rekeyChild(childKey.note(fromId, note.id), childKey.note(toId, note.id), toId);
+          for (const branch of taken.branches) {
+            this.#rekeyChild(childKey.branch(fromId, branch.id), childKey.branch(toId, branch.id), toId);
+          }
+          for (const block of taken.blocks.filter((item) => item.fromNote)) {
+            this.#rekeyChild(childKey.note(fromId, block.fromNote.id), childKey.note(toId, block.fromNote.id), toId);
+          }
+        }
+        putMessages(target, taken, before);
+        this.#saveAll(toId === fromId ? [source] : [target, source]);
+        const count = taken.starts.length;
+        return { label: toId === fromId ? `移动 ${count} 条消息` : `把 ${count} 条消息移到「${label(target.title, 24)}」`,
+          chats: [...new Set([fromId, toId])], state: source, focus: { chat: toId, messageId: taken.starts[0] },
+          inverse: { type: "move", from: toId, ids: taken.starts, to: fromId, before: taken.next } };
+      }
+      case "remove": {
+        const chatId = this.chatOfBlock(op.ids?.[0], op.chat);
+        const state = this.read(chatId);
+        const backup = removeMessages(state, op.ids);
+        this.#saveAll([state]);
+        return { label: "移除消息", chats: [chatId], state, inverse: { type: "restore", chat: chatId, blocks: backup } };
+      }
+      case "restore": {
+        const blocks = Array.isArray(op.blocks) ? op.blocks : [];
+        const chatId = this.chatOfBlock(blocks[0]?.id, op.chat);
+        const state = this.read(chatId);
+        restoreMessages(state, blocks);
+        this.#saveAll([state]);
+        return { label: "恢复消息", chats: [chatId], state, focus: { chat: chatId, messageId: blocks[0].id },
+          inverse: { type: "remove", chat: chatId, ids: blocks.map((block) => block.id) } };
+      }
+      case "note-to-block": {
+        const state = this.read(op.chat);
+        const block = noteToBlock(state, op.noteId, typeof op.before === "string" || op.before === null ? op.before : undefined);
+        this.#saveAll([state]);
+        return { label: "批注转为笔记块", chats: [state.id], state, focus: { chat: state.id, messageId: block.id },
+          inverse: { type: "block-to-note", chat: state.id, blockId: block.id } };
+      }
+      case "block-to-note": {
+        const chatId = this.chatOfBlock(op.blockId, op.chat);
+        const state = this.read(chatId);
+        const note = blockToNote(state, op.blockId);
+        this.#saveAll([state]);
+        return { label: "笔记块转回批注", chats: [chatId], state, focus: { chat: chatId, noteId: note.id },
+          inverse: { type: "note-to-block", chat: chatId, noteId: note.id } };
+      }
+      case "remove-note": {
+        const state = this.read(op.chat);
+        removeNote(state, op.noteId);
+        this.#saveAll([state]);
+        return { label: "删除批注", chats: [state.id], state,
+          inverse: { type: "restore-note", chat: state.id, noteId: op.noteId } };
+      }
+      case "restore-note": {
+        const state = this.read(op.chat);
+        restoreNote(state, op.noteId);
+        this.#saveAll([state]);
+        return { label: "恢复批注", chats: [state.id], state, focus: { chat: state.id, noteId: op.noteId },
+          inverse: { type: "remove-note", chat: state.id, noteId: op.noteId } };
+      }
+      // An image note's picture: the edited one (shapes drawn over the original, flattened into a new
+      // file `ref`, so models see the marks), or back to the original (restore). The original and the
+      // shapes are kept on the block to edit again.
+      case "edit-image": {
+        const chatId = this.chatOfBlock(op.blockId, op.chat);
+        const state = this.read(chatId);
+        const block = find(state.blocks, op.blockId);
+        if (block.noteType !== "image" || !block.attachments?.[0]) throw new Error("这不是图片笔记。");
+        const before = { ref: block.attachments[0], edit: block.imageEdit || null };
+        const original = block.imageEdit?.original || block.attachments[0];
+        let ref = op.ref;
+        let edit = null;
+        if (op.restore) {
+          if (!block.imageEdit) throw new Error("这张图还没有编辑过。");
+          ref = original;
+        } else if (op.edit === null) {
+          edit = null;
+        } else {
+          const shapes = Array.isArray(op.edit?.shapes) ? op.edit.shapes : [];
+          if (shapes.length > 2000 || JSON.stringify(shapes).length > 1_000_000) throw new Error("图上的标注太多了。");
+          edit = { original: op.edit?.original || original, shapes,
+            width: Number(op.edit?.width) || 0, height: Number(op.edit?.height) || 0 };
+        }
+        if (!ref?.id || !/^\.(png|jpe?g|webp)$/.test(ref.extension || "")) throw new Error("图片文件无效。");
+        block.attachments = [ref];
+        if (edit) block.imageEdit = edit;
+        else delete block.imageEdit;
+        this.#saveAll([state]);
+        return { label: op.restore ? "恢复原图" : op.edit === null ? "撤销图片编辑" : "编辑图片", chats: [chatId], state,
+          focus: { chat: chatId, messageId: block.id },
+          inverse: { type: "edit-image", chat: chatId, blockId: block.id, ref: before.ref, edit: before.edit } };
+      }
+      case "undo-annotation": {
+        const state = this.undoChatAnnotation(op.chat, op.noteId);
+        return { label: "撤销转批注", chats: [op.chat], state };
+      }
+      default:
+        throw new Error("未知的结构操作。");
+    }
   }
 
   annotationTargets() {
@@ -1321,6 +2014,8 @@ export class NotebookStore {
       this.write(target);
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    this.#journal(`消息转为「${label(target.title, 24)}」里的批注`, [sourceId, targetId],
+      { type: "undo-annotation", chat: targetId, noteId: note.id });
     return { sourceId, targetId, noteId: note.id };
   }
 
@@ -1366,7 +2061,7 @@ export class NotebookStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.write(state);
-      this.savePdfReview(hash, review.name, { ...review, comments: [...review.comments, comment] });
+      this.savePdfReview(hash, review.name, { ...review, comments: [...review.comments, comment], chat: [] });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return { comment, notebookId, hash };
@@ -1383,7 +2078,7 @@ export class NotebookStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.write(state);
-      this.savePdfReview(hash, review.name, { ...review, comments: review.comments.filter((item) => item.id !== commentId) });
+      this.savePdfReview(hash, review.name, { ...review, comments: review.comments.filter((item) => item.id !== commentId), chat: [] });
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return { notebookId: state.id, hash, commentId };
@@ -1462,10 +2157,14 @@ export class NotebookStore {
     return this.write(state);
   }
 
+  // Saves a chat object: its document, and the message and annotation rows that changed.
   write(state) {
     state.revision = (state.revision || 0) + 1;
-    this.#absorb(state);
-    this.update.run(this.#stored(state), Date.now(), state.id);
+    this.#atomically(() => {
+      this.#absorb(state);
+      this.#docs.update.run(this.#docJson(state), Date.now(), state.id);
+      this.#saveRows(state);
+    });
     return state;
   }
 

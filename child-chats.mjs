@@ -131,10 +131,11 @@ export const childKey = {
   pdfChat: (hash) => `pdf-chat:${hash}`,
   pdfComment: (hash, commentId) => `pdf-comment:${hash}:${commentId}`,
   mdChat: (id) => `md-chat:${id}`,
-  mdComment: (id, commentId) => `md-comment:${id}:${commentId}`
+  mdComment: (id, commentId) => `md-comment:${id}:${commentId}`,
+  todo: (id) => `todo:${id}`
 };
 
 export const childKinds = {
   note: "批注追问", branch: "分支", thread: "私聊", "pdf-chat": "PDF 全文对话", "pdf-comment": "PDF 批注追问",
-  "md-chat": "文档全文对话", "md-comment": "文档批注追问"
+  "md-chat": "文档全文对话", "md-comment": "文档批注追问", todo: "待办"
 };

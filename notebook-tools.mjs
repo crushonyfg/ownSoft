@@ -5,6 +5,35 @@ import { NotebookStore, requireText } from "./store.mjs";
 import { messageGroups } from "./notebook.mjs";
 import { validateComments } from "./pdf-review.mjs";
 import { childKey } from "./child-chats.mjs";
+import { repeatLabel } from "./todos.mjs";
+
+// A time for a to-do: an absolute date ("2026-12-01T09:00", local time unless it says otherwise) or
+// one relative to now ({ amount, unit: minute | hour | day | week | month }).
+export function todoTime({ dueAt, after } = {}, now = Date.now()) {
+  if (after && typeof after === "object") {
+    const amount = Number(after.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error("after.amount 需要是正数。");
+    const date = new Date(now);
+    if (after.unit === "minute") date.setMinutes(date.getMinutes() + amount);
+    else if (after.unit === "hour") date.setHours(date.getHours() + amount);
+    else if (after.unit === "day") date.setDate(date.getDate() + amount);
+    else if (after.unit === "week") date.setDate(date.getDate() + 7 * amount);
+    else if (after.unit === "month") date.setMonth(date.getMonth() + amount);
+    else throw new Error("after.unit 只能是 minute、hour、day、week 或 month。");
+    return date.getTime();
+  }
+  if (dueAt === null) return null;
+  if (dueAt === undefined || dueAt === "") return undefined;
+  const time = Date.parse(String(dueAt).trim().replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, "$1T$2"));
+  if (!Number.isFinite(time)) throw new Error("dueAt 需要是日期时间，例如 2026-12-01T09:00。");
+  return time;
+}
+const todoView = (todo) => ({ id: todo.id, text: todo.text, status: todo.status,
+  dueAt: todo.dueAt ? new Date(todo.dueAt).toISOString() : null,
+  dueLocal: todo.dueAt ? new Date(todo.dueAt).toLocaleString("zh-CN", { hour12: false }) : null,
+  repeat: todo.repeat ? repeatLabel(todo.repeat) : null, ai: todo.ai, memberId: todo.memberId,
+  notebookId: todo.chatId, chatTitle: todo.chatTitle, messageId: todo.blockId, quote: todo.quote, runs: todo.runs,
+  lastRunAt: todo.lastRunAt ? new Date(todo.lastRunAt).toISOString() : null, lastError: todo.lastError });
 
 const limitNumber = (value, fallback, max) => Math.max(0, Math.min(max, Number.isInteger(value) ? value : fallback));
 const excerpt = (value, max = 320) => String(value || "").replace(/\s+/g, " ").slice(0, max);
@@ -206,6 +235,39 @@ export class NotebookTools {
       return { id: comment.id, hash, page, note: "文字批注已添加；没有页面下划线坐标。" };
     }
     throw new Error("批注类型无效。");
+  }
+
+  // ---- to-dos: the AI can plan its own next steps (see todos.mjs) --------------------------------
+  listTodos({ status = "", limit = 50 } = {}) {
+    return this.store.todos().filter((todo) => !status || todo.status === status)
+      .slice(0, limitNumber(limit, 50, 200)).map(todoView);
+  }
+
+  // fromTodoId: take the source (chat, message, quoted words) of that to-do, e.g. the one being done now.
+  addTodo({ text, dueAt, after, repeat, notebookId, messageId, quote, fromTodoId, memberId, ai = true } = {}) {
+    const from = fromTodoId ? this.store.todo(fromTodoId) : null;
+    const time = todoTime({ dueAt, after });
+    const todo = this.store.saveTodo({ text, dueAt: time ?? null, repeat: repeat || null,
+      chatId: from ? from.chatId : notebookId, blockId: from ? from.blockId : messageId, quote: from ? from.quote : quote || "",
+      memberId: memberId ?? from?.memberId ?? null, ai });
+    return todoView(todo);
+  }
+
+  // Reschedule (dueAt / after), reword, change the repeat, or mark done / open again.
+  updateTodo({ todoId, text, dueAt, after, repeat, status, ai } = {}) {
+    const time = todoTime({ dueAt, after });
+    const fields = {};
+    if (text !== undefined) fields.text = text;
+    if (time !== undefined) fields.dueAt = time;
+    if (repeat !== undefined) fields.repeat = repeat;
+    if (status !== undefined) {
+      if (!["open", "done"].includes(status)) throw new Error("status 只能是 open 或 done。");
+      fields.status = status;
+    }
+    if (ai !== undefined) fields.ai = ai;
+    // A new time puts it back on the list.
+    if (time && status === undefined) fields.status = "open";
+    return todoView(this.store.saveTodo(fields, todoId));
   }
 
   editAnnotation({ kind = "chat", notebookId, mdId, hash, annotationId, text } = {}) {

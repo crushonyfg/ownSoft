@@ -6,7 +6,7 @@ import { embedChat } from "./embedded-chat.mjs";
 
 const kindLabels = {
   chat: "会话", note: "批注", branch: "分支", thread: "私聊", pdf: "PDF", "pdf-chat": "全文对话",
-  "pdf-comment": "PDF 批注", md: "文档", "md-chat": "全文对话", "md-comment": "文档批注"
+  "pdf-comment": "PDF 批注", md: "文档", "md-chat": "全文对话", "md-comment": "文档批注", todo: "待办"
 };
 const nodeWidth = 232;
 const nodeHeight = 72;

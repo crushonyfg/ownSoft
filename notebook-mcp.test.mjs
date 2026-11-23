@@ -36,6 +36,8 @@ test("MCP stdio exposes the notebook read and write tools", async () => {
     assert(rows[1].result.tools.some((tool) => tool.name === "import_markdown"));
     assert(rows[1].result.tools.some((tool) => tool.name === "move_message_to_annotation"));
     assert(rows[1].result.tools.some((tool) => tool.name === "undo_message_annotation"));
+    // The AI can plan its own next look at things: to-dos.
+    for (const name of ["list_todos", "add_todo", "update_todo"]) assert(rows[1].result.tools.some((tool) => tool.name === name), name);
     assert.equal(JSON.parse(rows[2].result.content[0].text)[0].title, "我的工作笔记");
   } finally {
     child.kill();
