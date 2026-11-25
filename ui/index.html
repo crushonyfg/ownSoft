@@ -188,11 +188,18 @@
       </div>
       <button type="button" id="md-ask" disabled title="就选中的文字提问">问所选</button>
       <button type="button" id="md-annotate" disabled title="给选中的文字写批注">批注所选</button>
+      <button type="button" id="md-highlight" disabled>高亮</button>
+      <button type="button" id="md-underline" disabled>下划线</button>
+      <button type="button" id="md-history-toggle" aria-pressed="true">会话历史</button>
+      <button type="button" id="md-version-history">文件版本</button>
       <button type="button" id="md-save" class="primary" title="写回 .md 文件（Ctrl+S）">保存到文件</button>
       <button type="button" id="md-save-as" title="保存为另一个 .md 文件（Ctrl+Shift+S）">另存为…</button>
       <button type="button" id="md-reveal" title="在资源管理器中显示文件">打开所在文件夹</button>
     </div>
+    <div id="md-sync-warning" class="md-sync-warning" hidden><span></span><button type="button" id="md-conflict-open">对照并处理</button></div>
     <div class="md-layout">
+      <aside id="md-history" class="document-history" aria-label="Markdown 会话历史"></aside>
+      <div class="splitter is-columns document-history-split" id="md-history-split" aria-label="调整会话历史宽度"></div>
       <div class="md-main">
         <textarea id="md-source" class="md-source" spellcheck="false" aria-label="Markdown 源码"></textarea>
         <div class="splitter is-columns" id="md-main-split" aria-label="调整源码和预览的宽度"></div>
@@ -223,6 +230,8 @@
     <div id="md-tools" class="selection-tools" role="group" aria-label="对选中文字操作" hidden>
       <button type="button" class="primary" id="md-tools-ask">问 AI</button>
       <button type="button" id="md-tools-note">批注</button>
+      <button type="button" id="md-tools-highlight">高亮</button>
+      <button type="button" id="md-tools-underline">下划线</button>
     </div>
   </main>
 
@@ -248,12 +257,15 @@
       <button type="button" id="review-popout" data-action="pop-out-review" hidden title="把这份 PDF 放到单独的窗口，可以拖到另一块屏幕，会话留在这里">在新窗口打开</button>
       <button type="button" id="review-export" hidden title="把这个 PDF 和它的批注、对话另存为 .aipdf 文件">导出 .aipdf</button>
       <button type="button" id="review-save" hidden disabled>已自动保存</button>
+      <button type="button" id="review-history-toggle" aria-pressed="true">会话历史</button>
     </div>
     <div class="review-empty" id="review-empty">
       <h1>打开 PDF 开始审阅</h1>
       <p>点「打开」选择 PDF 或 .aipdf。也可以在聊天里右键任何 PDF，选「审阅」。</p>
     </div>
     <div id="review-layout" class="review-layout" hidden>
+      <aside id="review-history" class="document-history" aria-label="PDF 会话历史"></aside>
+      <div class="splitter is-columns document-history-split" id="review-history-split" aria-label="调整会话历史宽度"></div>
       <div id="review-scroll" class="review-scroll" aria-label="PDF 页面">
         <div id="review-page-stack" class="review-page-stack">
         <div id="review-page-sheet" class="review-page-sheet">
@@ -498,6 +510,24 @@
         <button type="submit" class="primary">保存</button>
       </div>
     </form>
+  </dialog>
+  <dialog id="md-file-conflict" class="md-file-conflict" aria-labelledby="md-file-conflict-title">
+    <h2 id="md-file-conflict-title">文件和应用都有改动</h2>
+    <p>对照右侧文件，把需要保留的内容合并到左侧。处理前的版本会保存在「文件版本」中。</p>
+    <div class="md-conflict-panes">
+      <label>应用草稿／合并结果（可编辑）<textarea id="md-conflict-local" spellcheck="false"></textarea></label>
+      <div class="splitter is-columns" id="md-conflict-split" aria-label="调整版本对照宽度"></div>
+      <label>磁盘当前版本<textarea id="md-conflict-disk" readonly spellcheck="false"></textarea></label>
+    </div>
+    <div class="dialog-actions"><button type="button" id="md-conflict-later">稍后处理</button>
+      <button type="button" id="md-conflict-use-disk">使用磁盘版本</button>
+      <button type="button" id="md-conflict-save" class="primary">保存左侧合并结果</button></div>
+  </dialog>
+  <dialog id="md-file-versions" class="md-file-versions" aria-label="文件版本历史">
+    <h2>文件版本历史</h2><div id="md-version-list"></div>
+    <textarea id="md-version-preview" readonly aria-label="所选版本内容"></textarea>
+    <div class="dialog-actions"><button type="button" id="md-version-close">关闭</button>
+      <button type="button" id="md-version-restore" disabled>恢复为应用草稿</button></div>
   </dialog>
   <script type="module" src="app.mjs"></script>
 </body>

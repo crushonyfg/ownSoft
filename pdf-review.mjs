@@ -49,7 +49,13 @@ export function validateTurns(turns) {
     const origin = source && ["gpt", "claude", "gemini"].includes(source.provider)
       ? { provider: source.provider, model: text(source.model, 100), effort: text(source.effort, 20),
         ...(source.memberId ? { memberId: text(source.memberId, 80), memberName: text(source.memberName, 24),
-          avatar: text(source.avatar, 30) } : {}) }
+          avatar: text(source.avatar, 30) } : {}),
+        ...(Array.isArray(source.thinking) && source.thinking.length ? {
+          thinking: source.thinking.slice(0, 1000).filter((step) =>
+            step && typeof step.id === "string" && typeof step.text === "string" &&
+            ["commentary", "summary"].includes(step.kind)).map((step) => ({
+            id: text(step.id, 200), text: text(step.text, 20_000), kind: step.kind
+          })) } : {}) }
       : undefined;
     const log = Array.isArray(tools) ? tools.slice(0, 80).map((tool) => ({
       id: text(tool?.id, 200), title: text(tool?.title, 100), detail: text(tool?.detail, 1200),
@@ -84,6 +90,7 @@ export function validateComments(comments) {
       throw new Error("批注的来源消息无效。");
     }
     return { id, page, rects, title, text, quote, priority,
+      ...(Number.isInteger(comment.bodyRevision) ? { bodyRevision: comment.bodyRevision } : {}),
       ...(turns !== undefined ? { turns: validateTurns(turns) } : {}),
       ...(movedFrom ? { movedFrom: { notebookId: movedFrom.notebookId, messageId: movedFrom.messageId } } : {}) };
   });

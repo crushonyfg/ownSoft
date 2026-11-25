@@ -21,6 +21,8 @@ PDF 审阅的全文对话、批注追问、侧边分支、私聊小窗，最早�
 - **主会话加了功能，所有嵌入处自动就有。** 如果某个功能在嵌入时需要不同表现，就在会话组件里按嵌入模式分支处理，不要去宿主页面里补一份。
 - **新结构只做「容器」。** 图、树、画布、新的文档类型等，只负责布局和关系：节点指向已有的会话或文档，点开时嵌入或打开同一个会话组件。不要在节点里自己渲染消息或另存一份对话数据。
 - **数据只存一份。** 新功能需要对话数据时，从 child chat 读；要兼容旧字段，就在 store 的读写层统一转换（参考 `#fill` / `#absorb`），不要在界面里两边同步。
+- **选区提问也用完整会话。** MD/PDF 选区对应 `md-selection` / `pdf-selection`，选区锚点保存在 `parent.selection`，复用审阅下方的 `embedChat` 容器。不要再用内存 `turns` 数组或 `commentChats.mount` 开临时问答。回答转批注走 `selection-to-annotation` 结构操作，保留会话 ID 并支持撤销。
+- **批注默认收起，可放大。** MD/PDF 共用 `ui/annotation-card.mjs` 的卡片容器；普通批注使用完整会话的放大视图。批注正文是子会话里的 `annotation` 笔记块，页边只展示它，不能再复制出一套正文和问答。
 - **动手前先搜一下有没有现成的模块。** 消息渲染看 `ui/markdown-dom.mjs` 和 `markdown.mjs`，公式看 `math.mjs`，输入框看 `ui/chat-composer.mjs`，图片查看和标注看 `ui/image-viewer.mjs`（所有图片共用，标注保存走 `image:edit` → `store.structure` 的 `edit-image`），选区和锚点看 `md-document.mjs` 与 `pdf-review.mjs`。能扩展现有模块，就不要另起一份。
 - **评审时自查一句：** 「主会话以后再加一个功能，这里会不会自动有？」答案是否，就说明在堆叠，要改成复用。
 
@@ -44,6 +46,14 @@ PDF 审阅的全文对话、批注追问、侧边分支、私聊小窗，最早�
 - **批注的会话**：批注也是会话树的节点。它的子会话（`note:<会话>:<批注>`）依次是：原消息（`noteType: "source"`、`virtual: true`，读取时由 `#sourceMessage` 从父会话实时拼出，不存储，`#saveRows` 会跳过它）、批注正文（`noteType: "annotation"` 的笔记块，是批注文字和标记的唯一来源，`#fill` 拉到页边的批注，`#absorb` 把页边的修改推回去）、追问。不要再给批注正文单独实现功能，它就是一条消息。
 - **关系**：`child_chats` 是派生关系（父会话 → 批注追问、分支、私聊、审阅对话）。视图 `relations` 把派生、包含、挂载、引用、链接合在一起，用 `store.relationsOf(id)` 查。
 - **结构操作**：移动消息、移除和恢复、批注与笔记块互转、删除和恢复批注、消息转批注。纯函数在 `structure.mjs`，通过 `store.structure(op)` 执行：同一事务里保存涉及的会话，把跟着走的追问、分支会话改挂到新会话，并把逆操作记进 `structure_log`（最近 60 条，`store.undoStructure()` 撤销）。新增这类操作时，在 `#structure` 里加一个 case，并给出它的逆操作；界面统一用 `ui/structure-ui.mjs` 的 `apply`，不要直接改 state。
+
+## MD 编辑与文件同步
+
+- 文件 I/O 统一走 `md-files.mjs` 的 `MarkdownFiles`，不要从 UI 或工具绕过版本检查直接覆盖已绑定文件。应用草稿和磁盘文件以 `fileText`/`fileHash` 为基础进行三方核对；冲突保留两份，手工选择后才能写回。已有文档通过 `save_markdown` 更新必须传 `expectedVersion`。
+- 文本差异、合并和锚点复用 `text-edits.mjs`、`text-anchors.mjs`、`md-document.mjs`；`saveMdDocument` 的 `expectedVersion` 检查和保存处于同一数据库事务。
+- MD/PDF 会话历史只索引已有 child chat（`reviewHistory`），不能把问答再复制到一张临时历史表。删除页边批注保留已有问答。
+- 文档批注的放大复用 `focusStack`，`md-comment`/`pdf-comment` 的左侧移动实际文档组件，使用 `moveBefore` 保留 iframe 状态；不要再创建独立只读原文或把「放大」实现为新窗口。
+- 前端静态资源通过 `ui-assets.mjs` 在启动时固定，与当前后端保持一致；源文件修改在下次启动生效，不能让新开的子会话混用不同版本。
 
 ## 开发与测试
 

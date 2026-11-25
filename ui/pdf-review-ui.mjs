@@ -1,6 +1,8 @@
 import { renderMarkdown } from "./markdown-dom.mjs";
 import { splitter } from "./splitter.mjs";
-import { embedChat } from "./embedded-chat.mjs";
+import { embedChat, openingChat } from "./embedded-chat.mjs";
+import { setupReviewHistory } from "./review-history.mjs";
+import { annotationCard } from "./annotation-card.mjs";
 
 const get = (id) => document.getElementById(id);
 const byPage = (left, right) => left.page - right.page ||
@@ -17,7 +19,7 @@ const make = (tag, className, text) => {
 // a file on disk, the same PDF shows the same annotations and conversation, saved as they change.
 // onSaved(): a review was saved (the sidebar list and PDF note cards can update);
 // onPick(): a PDF was chosen with the 打开 button (the app shows the review).
-export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () => {}, onPick = () => {} }) {
+export function setupPdfReview(api, { edit, notify, commentChats, focus, onSaved = () => {}, onPick = () => {} }) {
   const view = get("pdf-view");
   const sheet = get("review-page-sheet");
   const scroll = get("review-scroll");
@@ -37,6 +39,9 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
   let selection;
   let pendingMessageConversion = null;
   let selectionKey;
+  const history = setupReviewHistory(api, { host: get("review-history"), kind: "pdf", current: () => state?.hash,
+    toggle: get("review-history-toggle"), layout: get("review-layout"),
+    open: (item) => showReviewChat(true, item.commentId, { chatId: item.id, title: item.title }), notify });
   let boxDrag;
   let renderedPage;
   let dirty = false;
@@ -84,13 +89,19 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
   // The lower pane is a full chat (the app's chat page embedded): the whole-PDF conversation, or an
   // annotation's follow-up when one is picked. Everything the main chat can do works there.
   let chatTarget = null;
-  get("review-chat-back").addEventListener("click", () => mountDocumentChat(true, null));
-  function mountDocumentChat(focus = false, commentId = chatTarget) {
-    showReviewChat(focus, commentId).catch((error) => notify(error.message));
+  let chatSelection = null;
+  let chatVersion = 0;
+  get("review-chat-back").addEventListener("click", () => mountDocumentChat(true, null, null));
+  function mountDocumentChat(focus = false, commentId = chatTarget, selected = chatSelection) {
+    showReviewChat(focus, commentId, selected).catch((error) => notify(error.message));
   }
 
-  async function showReviewChat(focus, commentId) {
+  async function showReviewChat(focus, commentId, selected = null) {
+    const version = ++chatVersion;
+    chatSelection = selected;
     const pane = get("review-document-conversation");
+    const cancelOpening = openingChat(pane);
+    try {
     if (!state) {
       chatTarget = null;
       return pane.replaceChildren();
@@ -98,22 +109,41 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
     const review = state;
     const comment = commentId ? review.comments.find((item) => item.id === commentId) : null;
     chatTarget = comment?.id || null;
-    get("review-chat-title").textContent = comment ? `批注追问 · ${comment.title || "批注"}` : "全文对话";
-    get("review-chat-back").hidden = !comment;
+    get("review-chat-title").textContent = selected ? (selected.title || `第 ${selected.selection.page} 页 · 选区对话`) : comment ? `批注追问 · ${comment.title || "批注"}` : "全文对话";
+    get("review-chat-back").hidden = !comment && !selected;
     get("review-chat-count").textContent = "";
-    get("review-chat-hint").textContent = comment
+    get("review-chat-hint").textContent = selected ? "只针对选区提问，使用完整会话的全部功能。" : comment
       ? "针对这条批注继续讨论：批注、它标注的原文和 PDF 会一起发给回答的成员。"
       : "和群聊成员讨论整份 PDF：PDF 正文和已有批注会一起发给回答的成员。";
     for (const card of document.querySelectorAll("[data-review-comment]")) {
       card.classList.toggle("is-chatting", card.dataset.reviewComment === chatTarget);
     }
     if (comment && dirty) await save();
-    const spec = comment ? { kind: "pdf-comment", reviewId: review.id, commentId: comment.id } : { kind: "pdf-chat", reviewId: review.id };
-    const id = await api.childChatId(spec);
-    if (review !== state) return;
+    const spec = selected || (comment ? { kind: "pdf-comment", reviewId: review.id, commentId: comment.id } : { kind: "pdf-chat", reviewId: review.id });
+    const id = selected?.chatId || await api.childChatId(spec);
+    if (review !== state || version !== chatVersion) return;
     embedChat(pane, id, { label: get("review-chat-title").textContent });
-    get("review-chat-full").onclick = () => api.openChildChat(spec).catch((error) => notify(error.message));
+    try { localStorage.setItem(`ai-notebook:pdf-chat:${review.hash}`, JSON.stringify({ chatId: id, commentId: comment?.id, title: get("review-chat-title").textContent })); } catch {}
+    void history.select(id);
+    get("review-chat-full").onclick = () => api.openNotebookWindow(id).catch((error) => notify(error.message));
     if (focus) pane.scrollIntoView({ block: "nearest" });
+    } catch (error) { cancelOpening(); throw error; }
+  }
+
+  async function restoreChat() {
+    const review = state;
+    try {
+      const saved = JSON.parse(localStorage.getItem(`ai-notebook:pdf-chat:${review.hash}`) || "null");
+      if (saved?.chatId) {
+        const chat = await api.read(saved.chatId);
+        if (review !== state) return;
+        if (chat.parent?.hash === review.hash) {
+          const comment = state.comments.find((item) => item.id === chat.parent.commentId);
+          return showReviewChat(false, comment?.id || null, comment ? null : chat.parent.kind === "pdf-selection" ? saved : null);
+        }
+      }
+    } catch {}
+    if (review === state) mountDocumentChat(false, null, null);
   }
 
   function refreshToolbar() {
@@ -155,6 +185,10 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       jump.append(item.title || "批注");
       jump.addEventListener("click", () => attempt(() => selectComment(item, false)));
       card.append(jump);
+      annotationCard(card, { key, text: item.text, open: () => attempt(async () => {
+        if (dirty) await save();
+        await focus({ kind: "pdf-comment", docId: state.hash, itemId: item.id, title: state.name, quote: item.quote });
+      }) });
       if (item.quote) card.append(make("blockquote", "review-quote", item.quote));
       const body = make("div", "review-body markdown-content");
       renderMarkdown(body, item.text);
@@ -206,7 +240,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       const follow = make("button", "review-follow", item.turns?.length ? `追问 · ${item.turns.length} 轮` : "追问");
       follow.type = "button";
       follow.title = "在下方以完整会话继续讨论这条批注";
-      follow.addEventListener("click", () => mountDocumentChat(true, item.id));
+      follow.addEventListener("click", () => mountDocumentChat(true, item.id, null));
       actions.prepend(follow);
       if (item.id === chatTarget) card.classList.add("is-chatting");
       list.append(card);
@@ -226,6 +260,16 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       });
     }
   }
+
+  api.onLibraryChanged(() => {
+    if (!state || dirty || saving) return;
+    const owner = state;
+    api.reviewState("pdf", owner.hash).then((next) => {
+      if (!next || state !== owner || dirty || saving || JSON.stringify(next.comments) === JSON.stringify(state.comments)) return;
+      state.comments = next.comments;
+      refreshComments();
+    }).catch((error) => notify(error.message));
+  });
 
   function pageWidth(originalWidth) {
     const zoom = Number(get("review-zoom").value);
@@ -454,58 +498,18 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
     refreshToolbar();
   }
 
-  function canReplaceSelectionChat() {
-    if (!selectionKey || !commentChats.pending(selectionKey)) return true;
-    notify("请先完成或停止当前的选区提问。");
-    return false;
-  }
+  function canReplaceSelectionChat() { return true; }
 
   function closeSelectionChat() {
-    if (selectionKey) commentChats.forget(selectionKey);
     selectionKey = undefined;
+    chatSelection = null;
     selectionChat.hidden = true;
-    get("review-selection-preview").replaceChildren();
-    get("review-selection-conversation").replaceChildren();
   }
 
   function openSelectionChat(source, screenshot) {
-    if (!canReplaceSelectionChat()) return;
-    closeSelectionChat();
-    const reviewId = state.id;
-    const review = state;
-    selectionKey = `pdf:${reviewId}:selection:${crypto.randomUUID()}`;
-    const turns = [];
-    get("review-selection-title").textContent = `第 ${source.page} 页 · ${screenshot ? "框选截图" : "所选文字"}`;
-    get("review-selection-preview").append(screenshot || make("blockquote", "review-quote", source.quote));
-    // A useful answer about selected text can stay on the page as an annotation, with its conversation.
-    const keep = (turn) => {
-      if (!source.rects?.length) return [];
-      const control = make("button", "comment-turn-action", "存为批注");
-      control.type = "button";
-      control.title = "把这条回答作为批注挂在所选文字上，追问记录一起保留";
-      control.addEventListener("click", () => {
-        if (review !== state) return;
-        const item = { id: crypto.randomUUID(), page: source.page, rects: source.rects.slice(0, 70),
-          quote: source.quote.slice(0, 8000), title: `${turn.source?.memberName || "成员"} 的回答`.slice(0, 160),
-          text: turn.answer.slice(0, 9000), priority: "", turns: turns.slice(0, turns.indexOf(turn) + 1) };
-        state.comments.push(item);
-        markDirty();
-        showTab("comments");
-        attempt(() => selectComment(item, false));
-        notify("已存为本页批注，追问记录也一起保留。");
-      });
-      return [control];
-    };
-    const focus = commentChats.mount(get("review-selection-conversation"), {
-      key: selectionKey, embedded: true, forkable: false,
-      target: () => ({ reviewId, selection: { page: source.page, quote: source.quote, image: source.image }, history: turns }),
-      turns: () => turns,
-      receive: ({ turn }) => { turns.push(turn); },
-      turnActions: keep
-    });
-    selectionChat.hidden = false;
-    selectionChat.scrollIntoView({ block: "nearest" });
-    focus();
+    selectionKey = crypto.randomUUID();
+    return attempt(() => showReviewChat(true, null, { kind: "pdf-selection", reviewId: state.id,
+      selection: { ...source, id: selectionKey } }));
   }
 
   function askText() {
@@ -560,7 +564,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
     const image = Uint8Array.from(atob(screenshot.toDataURL().split(",")[1]), (character) => character.charCodeAt(0));
     setBoxMode(false);
     showTab("comments");
-    openSelectionChat({ page: pageNumber, image }, screenshot);
+    openSelectionChat({ page: pageNumber, image, rects: [[left, top, left + width, top + height]] }, screenshot);
   }
 
   function newComment() {
@@ -666,7 +670,7 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       closeSelectionChat();
       setBoxMode(false);
       dirty = false;
-      mountDocumentChat();
+      await restoreChat();
       get("review-name").textContent = opened.name;
       get("review-name").title = opened.name;
       get("review-total").textContent = `/ ${pdf.numPages}`;
@@ -700,6 +704,13 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
       const result = await api.saveReview({ id: review.id, ...JSON.parse(snapshot) });
       if (result) {
         if (review === state) dirty = snapshot !== JSON.stringify({ comments: review.comments, chat: review.chat });
+        if (review === state && !dirty) {
+          const saved = await api.reviewState("pdf", review.hash);
+          if (review === state && snapshot === JSON.stringify({ comments: review.comments, chat: review.chat })) {
+            review.comments = saved.comments;
+            refreshComments();
+          }
+        }
         onSaved(result);
       }
     } finally {
@@ -802,6 +813,14 @@ export function setupPdfReview(api, { edit, notify, commentChats, onSaved = () =
 
   // Call these before showing the review view, then await: pages are laid out once it is visible.
   return {
+    locateComment: (id) => { const item = state?.comments.find((item) => item.id === id); if (item) attempt(() => selectComment(item, true)); },
+    acceptAnnotation: (result) => {
+      if (result.kind !== "pdf" || result.id !== state?.hash) return;
+      if (!state.comments.some((item) => item.id === result.comment.id)) state.comments.push(result.comment);
+      activeId = result.comment.id;
+      refreshComments();
+      mountDocumentChat(true, result.comment.id, null);
+    },
     openAttachment: async (attachmentId, options) => {
       await whileOpening(() => load({ attachmentId }));
       arrive(options);

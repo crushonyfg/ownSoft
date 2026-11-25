@@ -4,6 +4,7 @@
 import { renderMarkdown } from "./markdown-dom.mjs";
 import { createComposer, providerLabel } from "./chat-composer.mjs";
 import { pixelAvatar } from "./pixel-avatars.mjs";
+import { collapseWorkProgress, workProgress, updateThinking } from "./work-progress.mjs";
 
 const create = (tag, className, text) => {
   const element = document.createElement(tag);
@@ -18,29 +19,7 @@ const button = (text, className = "") => {
   return control;
 };
 
-export function toolDetails(items = []) {
-  if (!items.length) return null;
-  const details = create("details", "tool-details");
-  details.append(create("summary", "", `工具调用 · ${items.length} 项`));
-  const list = create("div", "tool-list");
-  for (const item of items) {
-    const row = create("div", "tool-item");
-    row.append(create("span", `tool-status is-${item.status || "done"}`,
-      item.status === "running" ? "◌" : item.status === "failed" ? "!" : "✓"),
-    create("strong", "", item.title || "工具调用"));
-    if (item.detail) row.append(create("span", "tool-detail", item.detail));
-    if (item.result) {
-      const result = create("details", "tool-result");
-      const body = create("pre");
-      result.append(create("summary", "", "工具返回"), body);
-      result.addEventListener("toggle", () => { body.textContent = result.open ? item.result : ""; });
-      row.append(result);
-    }
-    list.append(row);
-  }
-  details.append(list);
-  return details;
-}
+export const toolDetails = workProgress;
 
 const isImage = (ref) => [".png", ".jpg", ".jpeg", ".webp"].includes(ref.extension);
 
@@ -82,7 +61,7 @@ export function chatTurn(turn, { speaker, openAttachment, actions = [] }) {
   const body = create("div", "markdown-content");
   renderMarkdown(body, turn.answer);
   reply.append(meta);
-  const tools = toolDetails(turn.tools);
+  const tools = toolDetails(turn.tools, turn.source?.thinking);
   if (tools) reply.append(tools);
   reply.append(body);
   item.append(asked, reply);
@@ -105,11 +84,12 @@ export function setupCommentChats(api, { members, defaultMember, describe, speak
       thread.paintProgress?.();
     });
   });
-  api.onActivity(({ requestId, text }) => {
+  api.onActivity(({ requestId, text, thinking }) => {
     const thread = running.get(requestId);
     if (!thread?.pending) return;
     thread.pending.activity = text;
-    thread.paintProgress?.();
+    if (thinking) updateThinking(thread.pending.thinking ??= [], thinking);
+    thread.paintProgress?.(true);
   });
   api.onTool(({ requestId, tool }) => {
     const thread = running.get(requestId);
@@ -210,14 +190,15 @@ export function setupCommentChats(api, { members, defaultMember, describe, speak
       if (label) label.textContent = `${pending.member.name}${pending.total > 1 ? `（${pending.index + 1}/${pending.total}）` : ""} ${pending.activity || "正在回答"}`;
       const avatar = progress.querySelector(".pixel-avatar");
       if (avatar) avatar.dataset.state = pending.activity?.includes("搜索") ? "searching" : pending.text ? "typing" : "thinking";
-      if (withTools) {
+      if (withTools || pending.thinking?.length) {
         const slot = progress.querySelector(".comment-progress-tools");
-        const details = toolDetails(pending.tools);
+        const details = toolDetails(pending.tools, pending.thinking, { running: !pending.text, key: pending.id });
         slot?.replaceChildren(...(details ? [details] : []));
       }
       const output = progress.querySelector(".comment-progress-output");
       if (output) {
         renderMarkdown(output, pending.text);
+        if (pending.text) collapseWorkProgress(progress);
         if (!pending.text) output.append(create("span", "typing-dots", "● ● ●"));
       }
     }

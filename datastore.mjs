@@ -9,7 +9,7 @@ import { unzipSync, zipSync } from "fflate";
 
 export const databaseName = "notebook.sqlite";
 // Folders that belong to the notebook data (Electron caches are deliberately left out).
-const dataFolders = ["attachments", "attachments-trash", "profiles", "model-work", "backups"];
+const dataFolders = ["attachments", "attachments-trash", "reviews", "profiles", "model-work", "backups"];
 const backupPattern = /^(auto|manual|before-restore|before-move)-(\d{8})-(\d{6})(?:-(\d+))?\.sqlite$/;
 export const autoBackupsKept = 30;
 const archiveFormat = "ai-notebook-backup";
@@ -174,7 +174,7 @@ export function exportArchive(db, dataDir, file, now = new Date()) {
       "manifest.json": new TextEncoder().encode(JSON.stringify({ format: archiveFormat, version: 1, created: now.toISOString() })),
       [databaseName]: readFileSync(temp)
     };
-    for (const folder of ["attachments", "attachments-trash"]) {
+    for (const folder of ["attachments", "attachments-trash", "reviews"]) {
       const dir = join(dataDir, folder);
       if (!existsSync(dir)) continue;
       for (const name of readdirSync(dir)) {
@@ -200,7 +200,7 @@ export function importArchive(file, dataDir) {
   const manifest = entries["manifest.json"] && JSON.parse(new TextDecoder().decode(entries["manifest.json"]));
   if (manifest?.format !== archiveFormat || !entries[databaseName]) throw new Error("这不是 AI 笔记本导出的备份。");
   for (const [name, data] of Object.entries(entries)) {
-    const match = /^(attachments|attachments-trash)\/([\w.-]+)$/.exec(name);
+    const match = /^(attachments|attachments-trash|reviews)\/([\w.-]+)$/.exec(name);
     if (!match) continue;
     const dir = join(dataDir, match[1]);
     mkdirSync(dir, { recursive: true });

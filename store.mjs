@@ -4,8 +4,9 @@ import { applyMemberChange } from "./members.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { annotationOriginalKind, findAnchor, initialNotebook, messageGroups, sameMessage, splitReply } from "./notebook.mjs";
 import { validateComments, validateTurns } from "./pdf-review.mjs";
-import { mdTextLimit, reanchor } from "./md-document.mjs";
+import { mdTextLimit, paragraphAround, reanchor } from "./md-document.mjs";
 import { appendTurn, chatTurns, childKey, childKinds, syncTurns } from "./child-chats.mjs";
+import { anchoredText, toggleTextMark, moveAnchors } from "./text-anchors.mjs";
 import { nextOccurrence, normalizeRepeat } from "./todos.mjs";
 import { blockToNote, noteToBlock, putMessages, removeMessages, removeNote, restoreMessages, restoreNote,
   takeMessages } from "./structure.mjs";
@@ -50,7 +51,11 @@ export function validateMdComments(comments, text) {
       throw new Error("一条文档批注的内容或位置无效。");
     }
     ids.add(id);
-    const item = { id, start, quote, title, text: note, ...(turns?.length ? { turns: validateTurns(turns) } : {}),
+    const item = { id, start, quote, title, text: note,
+      ...Object.fromEntries(["prefix", "suffix", "originalQuote", "lostReason"].filter((key) => typeof comment[key] === "string")
+        .map((key) => [key, comment[key].slice(0, key === "originalQuote" ? 8000 : 200)])),
+      ...(Number.isInteger(comment.bodyRevision) ? { bodyRevision: comment.bodyRevision } : {}),
+      ...(turns?.length ? { turns: validateTurns(turns) } : {}),
       ...(lost ? { lost: true } : {}) };
     return reanchor(text, item);
   });
@@ -101,6 +106,8 @@ function appendReplyBlocks(state, turn) {
   const turnId = randomUUID();
   for (const [index, paragraph] of splitReply(turn.answer).entries()) {
     state.blocks.push({ id: randomUUID(), kind: "reply", turnId, text: paragraph, marks: [],
+      ...(turn.interrupted ? { included: false } : {}),
+      ...(index === 0 && turn.interrupted ? { interrupted: turn.interrupted } : {}),
       ...(index === 0 && turn.source ? { source: turn.source } : {}),
       ...(index === 0 && turn.tools?.length ? { tools: turn.tools } : {}) });
   }
@@ -514,17 +521,12 @@ export function applyChange(state, action) {
           throw new Error("选区已改变，请重新选中文字。");
         }
         note.marks ??= [];
-        const existing = note.marks.findIndex((mark) => mark.style === action.style && mark.start === start && mark.quote === quote);
-        if (existing >= 0) note.marks.splice(existing, 1);
-        else note.marks.push({ start, quote, style: action.style });
+        toggleTextMark(note.text, note.marks, { start, quote }, action.style);
         break;
       }
       const anchor = checkedAnchor(state, action.anchor);
       const block = find(state.blocks, anchor.blockId);
-      const existing = block.marks.findIndex((mark) =>
-        mark.style === action.style && mark.start === anchor.start && mark.quote === anchor.quote);
-      if (existing >= 0) block.marks.splice(existing, 1);
-      else block.marks.push({ ...anchor, style: action.style });
+      toggleTextMark(block.text, block.marks, anchor, action.style);
       break;
     }
     case "add-note": {
@@ -769,6 +771,11 @@ export class NotebookStore {
         data TEXT NOT NULL,
         updated INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS md_versions (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, md_id TEXT NOT NULL, at INTEGER NOT NULL,
+        reason TEXT NOT NULL, text TEXT NOT NULL, file_hash TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS md_versions_document ON md_versions(md_id, seq);
       CREATE TABLE IF NOT EXISTS recent_pdf_review (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         path TEXT NOT NULL,
@@ -1126,8 +1133,8 @@ export class NotebookStore {
 
   // The child chat of a conversation, made (empty) if it has none yet; returns its id.
   // rosterId: the chat a review was opened from; its chats talk with that chat's members.
-  openChildChat({ kind, notebookId, itemId, hash, mdId, commentId, rosterId }) {
-    const id = this.#openChildChat({ kind, notebookId, itemId, hash, mdId, commentId });
+  openChildChat({ kind, notebookId, itemId, hash, mdId, commentId, rosterId, selection }) {
+    const id = this.#openChildChat({ kind, notebookId, itemId, hash, mdId, commentId, selection });
     if (!kind.startsWith("pdf-") && !kind.startsWith("md-")) return id;
     const chat = this.read(id);
     if (typeof rosterId === "string" && rosterId !== id && rosterId !== chat.parent.rosterNotebookId &&
@@ -1138,7 +1145,7 @@ export class NotebookStore {
     return id;
   }
 
-  #openChildChat({ kind, notebookId, itemId, hash, mdId, commentId }) {
+  #openChildChat({ kind, notebookId, itemId, hash, mdId, commentId, selection }) {
     if (kind === "todo") {
       const todo = this.todo(itemId);
       return this.ensureChildChat(childKey.todo(todo.id), { kind: "todo", notebookId: todo.chatId || undefined, todoId: todo.id,
@@ -1155,18 +1162,41 @@ export class NotebookStore {
       }
       return chat.id;
     }
-    const pdf = kind === "pdf-chat" || kind === "pdf-comment";
+    if (!childKinds[kind]) throw new Error("对话来源无效。");
+    const pdf = kind.startsWith("pdf-");
     const review = pdf ? this.pdfReview(hash) : this.mdDocument(mdId);
     if (!review) throw new Error("找不到这份审阅。");
     const id = pdf ? hash : mdId;
     const keys = this.#reviewKeys(pdf ? "pdf" : "md", id);
+    if (kind.endsWith("-selection")) {
+      if (!selection || !/^[\w-]{1,100}$/.test(selection.id || "")) throw new Error("选区无效。");
+      const quote = String(selection.quote || "");
+      if (quote.length > 20_000 || (!quote && !selection.imageRef)) throw new Error("请选择文字或框选截图。");
+      let picked;
+      if (pdf) {
+        if (!Number.isInteger(selection.page) || selection.page < 1) throw new Error("选区页码无效。");
+        const anchor = validateComments([{ id: "selection", page: selection.page, quote: quote.slice(0, 8000) || "框选截图",
+          rects: selection.rects, text: "选区", title: "选区" }])[0];
+        picked = { id: selection.id, page: anchor.page, quote, rects: anchor.rects,
+          ...(selection.imageRef ? { imageRef: selection.imageRef } : {}) };
+      } else {
+        if (!Number.isInteger(selection.start) || selection.start < 0 ||
+            review.text.slice(selection.start, selection.start + quote.length) !== quote) throw new Error("选区原文已改变，请重新选择。");
+        picked = { id: selection.id, ...anchoredText(review.text, selection.start, quote),
+          paragraph: paragraphAround(review.text, selection.start, selection.start + quote.length) };
+      }
+      return this.ensureChildChat(childKey.selection(kind, id, picked.id), { kind, ...keys.parent, selection: picked,
+        title: `选区对话 · ${label(quote || `第 ${picked.page} 页截图`, 45)}` }).id;
+    }
     if (kind.endsWith("-chat")) {
       return this.ensureChildChat(keys.chat, { kind, ...keys.parent, title: `全文对话 · ${label(review.name, 60)}` }).id;
     }
     const comment = review.comments.find((item) => item.id === commentId);
     if (!comment) throw new Error("这条批注还没保存或已被删除。");
-    return this.ensureChildChat(keys.comment(comment.id), { kind, ...keys.parent, commentId: comment.id,
-      title: `${pdf ? "PDF" : "文档"}批注追问 · ${label(comment.title || comment.quote)}` }).id;
+    const chat = this.ensureChildChat(keys.comment(comment.id), { kind, ...keys.parent, commentId: comment.id,
+      title: `${pdf ? "PDF" : "文档"}批注追问 · ${label(comment.title || comment.quote)}` }, comment);
+    if (!headOf(chat)) { chat.blocks.unshift(headBlock(comment)); this.write(chat); }
+    return chat.id;
   }
 
   childTurns(key) {
@@ -1299,7 +1329,14 @@ export class NotebookStore {
         ...review.comments.map((comment) => this.#chatNode(keys.comment(comment.id), {
           kind: `${kind}-comment`, title: plain(comment.title || comment.text, 60) || "批注", quote: label(comment.quote, 120),
           text: plain(comment.text, 200), page: comment.page, turns: comment.turns?.length || 0,
-          open: { kind: `${kind}-comment`, ...where, commentId: comment.id } }, 1, depth, seen))
+          open: { kind: `${kind}-comment`, ...where, commentId: comment.id } }, 1, depth, seen)),
+        ...this.db.prepare("SELECT key, notebook_id FROM child_chats WHERE kind = ?").all(`${kind}-selection`)
+          .flatMap(({ key, notebook_id: chatId }) => {
+            const chat = this.read(chatId);
+            if (pdf ? chat.parent.hash !== id : chat.parent.mdId !== id) return [];
+            return [this.#chatNode(key, { kind: `${kind}-selection`, title: chat.title, quote: label(chat.parent.selection.quote, 120),
+              turns: chatTurns(chat).length, open: { kind: `${kind}-selection`, ...where, selection: chat.parent.selection } }, 1, depth, seen)];
+          })
       ]
     };
   }
@@ -1504,8 +1541,11 @@ export class NotebookStore {
     const keys = this.#reviewKeys(kind, id);
     return {
       comments: comments.map((comment) => {
-        const turns = this.childTurns(keys.comment(comment.id));
-        return turns ? { ...comment, turns } : comment;
+        const child = this.childChat(keys.comment(comment.id));
+        if (!child) return comment;
+        const head = headOf(child);
+        return { ...comment, turns: chatTurns(child),
+          ...(head ? { text: head.text, bodyRevision: child.revision || 0 } : {}) };
       }),
       chat: this.childTurns(keys.chat) ?? chat
     };
@@ -1515,12 +1555,43 @@ export class NotebookStore {
     const keys = this.#reviewKeys(kind, id);
     const word = kind === "pdf" ? "PDF" : "文档";
     for (const comment of comments) {
+      const child = this.childChat(keys.comment(comment.id));
+      const head = headOf(child);
+      if (head && comment.text !== head.text && comment.bodyRevision === (child.revision || 0)) {
+        head.text = comment.text;
+        head.marks = [];
+        this.write(child);
+      }
       if (!comment.turns?.length) continue;
       this.syncChildTurns(keys.comment(comment.id), { kind: `${kind}-comment`, ...keys.parent, commentId: comment.id,
         title: `${word}批注追问 · ${label(comment.title || comment.quote)}` }, comment.turns);
     }
     if (chat?.length) this.syncChildTurns(keys.chat, { kind: `${kind}-chat`, ...keys.parent, title: `全文对话 · ${label(name, 60)}` }, chat);
-    this.#deleteChildrenByPrefix(keys.prefix, new Set(comments.map((comment) => keys.comment(comment.id))));
+    const kept = new Set(comments.map((comment) => keys.comment(comment.id)));
+    for (const { key } of this.db.prepare("SELECT key FROM child_chats WHERE substr(key, 1, ?) = ?").all(keys.prefix.length, keys.prefix)) {
+      if (kept.has(key)) continue;
+      const child = this.childChat(key);
+      if (child?.blocks.some((block) => block.kind === "question" || block.kind === "reply")) {
+        // Removing a margin annotation must not remove the independent conversation behind it.
+        const original = child.selectionAnnotation?.parent;
+        const oldReview = kind === "pdf" ? this.pdfReview(id) : this.mdDocument(id);
+        const old = oldReview?.comments.find((item) => item.id === child.parent.commentId);
+        const selection = original?.selection || (old && { id: `history-${old.id}`, quote: old.quote,
+          ...(kind === "pdf" ? { page: old.page, rects: old.rects } : { start: old.start, prefix: old.prefix, suffix: old.suffix }) });
+        if (selection) {
+          const nextKey = childKey.selection(`${kind}-selection`, id, selection.id);
+          child.parent = original || { ...child.parent, kind: `${kind}-selection`, selection, key: nextKey };
+          delete child.parent.commentId;
+          const head = headOf(child);
+          if (head) head.noteType = "retained-annotation";
+          delete child.selectionAnnotation;
+          this.write(child);
+          this.db.prepare("UPDATE child_chats SET key = ?, kind = ? WHERE notebook_id = ?").run(nextKey, `${kind}-selection`, child.id);
+          continue;
+        }
+      }
+      this.deleteChildChat(key);
+    }
     return { comments: withoutTurns(comments), chat: [] };
   }
 
@@ -1572,6 +1643,7 @@ export class NotebookStore {
     this.db.prepare("DELETE FROM pdf_reviews WHERE hash = ?").run(hash);
     this.deleteChildChat(childKey.pdfChat(hash));
     this.#deleteChildrenByPrefix(`pdf-comment:${hash}:`);
+    this.#deleteChildrenByPrefix(`pdf-selection:${hash}:`);
   }
 
   // ---- Markdown documents --------------------------------------------------------------------
@@ -1582,9 +1654,10 @@ export class NotebookStore {
     const row = this.db.prepare("SELECT name, path, text, data, updated FROM md_documents WHERE id = ?").get(id);
     if (!row) return null;
     const data = JSON.parse(row.data);
-    const { fileHash = "", unsynced = false, mode = "preview" } = data;
+    const { fileHash = "", unsynced = false, mode = "preview", marks = [], version = 0, fileConflict = null } = data;
     const { comments, chat } = this.#reviewChats("md", id, data);
-    return { id, name: row.name, path: row.path || "", text: row.text, comments, chat, fileHash, unsynced, mode,
+    return { id, name: row.name, path: row.path || "", text: row.text, comments, chat, fileHash, unsynced, mode, marks, version, fileConflict,
+      fileText: data.fileText ?? (unsynced ? null : row.text),
       updated: row.updated };
   }
 
@@ -1593,19 +1666,72 @@ export class NotebookStore {
     return row ? this.mdDocument(row.id) : null;
   }
 
-  saveMdDocument(id, { name, path = "", text, comments = [], chat = [], fileHash = "", unsynced = false, mode = "preview" }) {
+  saveMdDocument(id, { name, path = "", text, comments = [], chat = [], fileHash = "", unsynced = false, mode = "preview",
+    marks = [], fileText, fileConflict = null, expectedVersion }) {
+    return this.#atomically(() => {
     if (!mdId.test(id || "")) throw new Error("文档记录无效。");
     if (typeof text !== "string" || text.length > mdTextLimit) throw new Error("文档太大（上限 5 MB）。");
     if (typeof path !== "string" || path.length > 2000 || (path && !isAbsolute(path))) throw new Error("文件路径无效。");
     const title = requireText(name, 250).trim();
+    if (!Array.isArray(marks) || marks.length > 5000 || marks.some((mark) => !["highlight", "underline"].includes(mark.style) ||
+        !Number.isInteger(mark.start) || mark.start < 0 || typeof mark.quote !== "string" || !mark.quote || mark.quote.length > 20_000)) {
+      throw new Error("文档标记无效。");
+    }
+    if (fileText != null && (typeof fileText !== "string" || fileText.length > mdTextLimit)) throw new Error("文件基础版本无效。");
+    if (fileConflict && (typeof fileConflict.text !== "string" || fileConflict.text.length > mdTextLimit)) throw new Error("冲突版本无效。");
+    const previous = this.mdDocument(id);
+    if (expectedVersion !== undefined && expectedVersion !== (previous?.version || 0)) throw new Error("文档版本已变化，请重新读取后保存。");
     const kept = this.#absorbReview("md", id, title, validateMdComments(comments, text), validateTurns(chat));
     const data = { ...kept, fileHash: String(fileHash).slice(0, 64),
+      version: (previous?.version || 0) + 1, fileText: fileText ?? (unsynced ? previous?.fileText ?? null : text),
+      marks: marks.map((mark) => reanchor(text, mark)), fileConflict,
       unsynced: Boolean(unsynced), mode: ["preview", "split", "source"].includes(mode) ? mode : "preview" };
     this.db.prepare(`INSERT INTO md_documents VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name = excluded.name, path = excluded.path, text = excluded.text,
         data = excluded.data, updated = excluded.updated`)
       .run(id, requireText(name, 250).trim(), path || null, text, JSON.stringify(data), Date.now());
+    if (previous && previous.text !== text) {
+      for (const row of this.db.prepare(`SELECT c.notebook_id FROM child_chats c JOIN notebook_documents d ON d.id = c.notebook_id
+        WHERE c.kind = 'md-selection' AND json_extract(d.snapshot, '$.parent.mdId') = ?`).all(id)) {
+        const chat = this.read(row.notebook_id);
+        chat.parent.selection = moveAnchors(previous.text, text, [chat.parent.selection])[0];
+        this.write(chat);
+      }
+    }
     return this.mdDocument(id);
+    });
+  }
+
+  mdVersion(id, text, reason, fileHash = "") {
+    if (typeof text !== "string" || text.length > mdTextLimit) throw new Error("历史版本过大。");
+    const last = this.db.prepare("SELECT text, reason FROM md_versions WHERE md_id = ? ORDER BY seq DESC LIMIT 1").get(id);
+    if (last?.text === text && last.reason === reason) return;
+    this.db.prepare("INSERT INTO md_versions (md_id, at, reason, text, file_hash) VALUES (?, ?, ?, ?, ?)")
+      .run(id, Date.now(), String(reason).slice(0, 80), text, String(fileHash).slice(0, 64));
+    this.db.prepare("DELETE FROM md_versions WHERE md_id = ? AND seq NOT IN (SELECT seq FROM md_versions WHERE md_id = ? ORDER BY seq DESC LIMIT 60)")
+      .run(id, id);
+  }
+
+  mdVersions(id) {
+    return this.db.prepare("SELECT seq, at, reason, length(text) AS length FROM md_versions WHERE md_id = ? ORDER BY seq DESC").all(id);
+  }
+
+  mdVersionText(id, seq) {
+    return this.db.prepare("SELECT text, reason, at FROM md_versions WHERE md_id = ? AND seq = ?").get(id, seq) || null;
+  }
+
+  reviewHistory(kind, id) {
+    const pdf = kind === "pdf";
+    return this.db.prepare(`SELECT c.notebook_id AS id, d.snapshot, d.updated FROM child_chats c
+      JOIN notebook_documents d ON d.id = c.notebook_id
+      WHERE c.kind IN (?, ?, ?) AND json_extract(d.snapshot, ?) = ? ORDER BY d.updated DESC`)
+      .all(`${kind}-chat`, `${kind}-selection`, `${kind}-comment`, pdf ? "$.parent.hash" : "$.parent.mdId", id)
+      .map(({ id: chatId, snapshot, updated }) => {
+        const chat = JSON.parse(snapshot);
+        const count = this.db.prepare("SELECT count(DISTINCT message_id) AS count FROM chat_blocks WHERE chat_id = ? AND (kind = 'reply' OR json_extract(data, '$.noteType') IN ('annotation','retained-annotation')) AND removed = 0").get(chatId).count;
+        return { id: chatId, title: chat.title, kind: chat.parent.kind, updated, replies: count,
+          quote: chat.parent.selection?.quote || "", commentId: chat.parent.commentId || null };
+      });
   }
 
   mdDocuments() {
@@ -1630,6 +1756,7 @@ export class NotebookStore {
     this.db.prepare("DELETE FROM md_documents WHERE id = ?").run(id);
     this.deleteChildChat(childKey.mdChat(id));
     this.#deleteChildrenByPrefix(`md-comment:${id}:`);
+    this.#deleteChildrenByPrefix(`md-selection:${id}:`);
   }
 
   open(id) {
@@ -1834,6 +1961,48 @@ export class NotebookStore {
 
   #structure(op) {
     switch (op?.type) {
+      case "selection-to-annotation": {
+        const before = this.read(op.chat);
+        const result = this.saveSelectionAnnotation(op.chat, op.ids);
+        if (result.existing) return { label: "已存为批注", chats: [op.chat], reviewAnnotation: result };
+        const chat = this.read(op.chat);
+        const head = headOf(chat);
+        const review = result.kind === "pdf" ? this.pdfReview(result.id) : this.mdDocument(result.id);
+        return { label: "选区回答转为页边批注", chats: [op.chat], reviewAnnotation: { ...result,
+          comment: review.comments.find((item) => item.id === result.commentId) },
+          inverse: { type: "undo-selection-annotation", chat: op.chat, parent: before.parent, commentId: result.commentId,
+            headId: head.id, text: head.text, messageId: op.ids[0],
+            anchors: [...before.notes, ...before.branches].filter((item) => op.ids.includes(item.anchor.blockId))
+              .map((item) => ({ id: item.id, anchor: item.anchor })) } };
+      }
+      case "undo-selection-annotation": {
+        const chat = this.read(op.chat);
+        const head = headOf(chat);
+        const anchors = new Map((op.anchors || []).map((item) => [item.id, item.anchor]));
+        if (chat.parent?.commentId !== op.commentId || head?.id !== op.headId || head.text !== op.text ||
+            [...chat.notes, ...chat.branches].some((item) => item.anchor.blockId === head.id && !anchors.has(item.id))) {
+          throw new Error("批注正文或派生关系已改变，请先处理这些改动。");
+        }
+        const pdf = op.parent.kind === "pdf-selection";
+        const review = pdf ? this.pdfReview(op.parent.hash) : this.mdDocument(op.parent.mdId);
+        if (!review?.comments.some((item) => item.id === op.commentId)) throw new Error("批注已不存在。");
+        restoreConvertedMessage(chat, op.messageId);
+        chat.blocks = chat.blocks.filter((block) => block.id !== head.id);
+        for (const item of [...chat.notes, ...chat.branches]) if (anchors.has(item.id)) item.anchor = anchors.get(item.id);
+        chat.parent = op.parent;
+        delete chat.selectionAnnotation;
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          this.write(chat);
+          this.db.prepare("UPDATE child_chats SET key = ?, kind = ? WHERE notebook_id = ?")
+            .run(op.parent.key, op.parent.kind, chat.id);
+          const comments = review.comments.filter((item) => item.id !== op.commentId);
+          if (pdf) this.savePdfReview(op.parent.hash, review.name, { ...review, comments });
+          else this.saveMdDocument(op.parent.mdId, { ...review, comments });
+          this.db.exec("COMMIT");
+        } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+        return { label: "选区回答转为页边批注", chats: [op.chat], focus: { chat: op.chat, messageId: op.messageId } };
+      }
       case "move": {
         const ids = Array.isArray(op.ids) ? op.ids.filter((id) => typeof id === "string") : [];
         if (!ids.length) throw new Error("请选择要移动的消息。");
@@ -1958,8 +2127,8 @@ export class NotebookStore {
       .map((chat) => [chat.parent.mdId, chat.id]));
     const ids = new Set(chats.map((chat) => chat.id));
     return chats.map(({ id, title, parent, updated }) => {
-      const parentId = parent?.notebookId || (parent?.kind === "pdf-comment" ? pdfChats.get(parent.hash) : null) ||
-        (parent?.kind === "md-comment" ? mdChats.get(parent.mdId) : null) || parent?.rosterNotebookId || null;
+      const parentId = parent?.notebookId || (["pdf-comment", "pdf-selection"].includes(parent?.kind) ? pdfChats.get(parent.hash) : null) ||
+        (["md-comment", "md-selection"].includes(parent?.kind) ? mdChats.get(parent.mdId) : null) || parent?.rosterNotebookId || null;
       return { id, title, kind: parent?.kind || "chat", parentId: parentId !== id && ids.has(parentId) ? parentId : null, updated };
     });
   }
@@ -2049,6 +2218,53 @@ export class NotebookStore {
     return this.write(state);
   }
 
+  // Keep the same full conversation when a selection's answer becomes a margin annotation.
+  // The converted message has the usual restoration backup; no turns are copied into the document.
+  saveSelectionAnnotation(notebookId, ids) {
+    const chat = this.read(notebookId);
+    const saved = chat.selectionAnnotation;
+    if (saved && Array.isArray(ids) && ids.length === saved.messageIds.length &&
+        ids.every((id) => saved.messageIds.includes(id))) {
+      const review = saved.kind === "pdf" ? this.pdfReview(saved.id) : this.mdDocument(saved.id);
+      const comment = review?.comments.find((item) => item.id === saved.commentId);
+      if (comment) return { notebookId, ...saved, comment, existing: true };
+    }
+    const parent = chat.parent;
+    if (!["md-selection", "pdf-selection"].includes(parent?.kind)) throw new Error("这不是选区对话。");
+    const pdf = parent.kind === "pdf-selection";
+    const review = pdf ? this.pdfReview(parent.hash) : this.mdDocument(parent.mdId);
+    if (!review) throw new Error("来源文档已不存在。");
+    const { text, author, sourceMessageId } = convertedMessage(chat, messageBlocks(chat, ids));
+    const { id: selectionId, imageRef, ...anchor } = parent.selection;
+    const comment = { id: randomUUID(), ...anchor, quote: anchor.quote?.slice(0, 8000) || "框选截图", title: author,
+      text: requireText(text, pdf ? 9000 : 20_000), priority: "",
+    };
+    // Validate before mutating the database (including Markdown anchors that moved meanwhile).
+    const checked = pdf ? validateComments([comment])[0] : validateMdComments([reanchor(review.text, comment)], review.text)[0];
+    const keys = this.#reviewKeys(pdf ? "pdf" : "md", pdf ? parent.hash : parent.mdId);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const nextParent = { ...parent, kind: pdf ? "pdf-comment" : "md-comment", commentId: comment.id, key: keys.comment(comment.id) };
+      delete nextParent.selection;
+      chat.parent = nextParent;
+      chat.selectionAnnotation = { messageIds: [...ids], commentId: comment.id, kind: pdf ? "pdf" : "md", parent,
+        id: pdf ? parent.hash : parent.mdId };
+      const head = headBlock({ ...checked, ...(imageRef ? { attachments: [imageRef] } : {}) });
+      chat.blocks.unshift(head);
+      for (const item of [...chat.notes, ...chat.branches]) if (ids.includes(item.anchor.blockId)) {
+        const start = findAnchor(head.text, item.anchor);
+        item.anchor = { ...item.anchor, blockId: head.id, ...(start !== null ? { start } : {}) };
+      }
+      this.write(chat);
+      this.db.prepare("UPDATE child_chats SET key = ?, kind = ? WHERE notebook_id = ?")
+        .run(nextParent.key, nextParent.kind, chat.id);
+      if (pdf) this.savePdfReview(parent.hash, review.name, { ...review, comments: [...review.comments, checked] });
+      else this.saveMdDocument(parent.mdId, { ...review, comments: [...review.comments, checked] });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return { notebookId, commentId: comment.id, kind: pdf ? "pdf" : "md", id: pdf ? parent.hash : parent.mdId };
+  }
+
   moveMessageToPdfAnnotation(notebookId, ids, hash, anchor) {
     const state = this.read(notebookId);
     if (state.parent?.kind !== "pdf-chat" || state.parent.hash !== hash) throw new Error("只能把这份 PDF 全文对话里的消息挂到该 PDF 上。");
@@ -2129,9 +2345,10 @@ export class NotebookStore {
 
   // continueTurn: another group member answering the question that was just asked.
   // recentMember: the member the question asked for (with @); later questions go to them by default.
-  saveReply(branchId, question, answer, source, attachments = [], id, tools = [], { continueTurn = false, recentMember } = {}) {
+  saveReply(branchId, question, answer, source, attachments = [], id, tools = [], { continueTurn = false, recentMember, interrupted } = {}) {
     const state = this.read(id);
     const turn = { id: randomUUID(), question, answer, source, ...(tools.length ? { tools } : {}) };
+    if (interrupted) turn.interrupted = interrupted;
     if (attachments.length) turn.attachments = attachments;
     if (branchId) {
       find(state.branches, branchId).turns.push(turn);

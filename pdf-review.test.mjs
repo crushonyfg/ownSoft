@@ -20,7 +20,8 @@ test("an aipdf round trip preserves the original PDF bytes and comment coordinat
 test("comment conversations travel with the PDF review", () => {
   const pdf = Buffer.from("%PDF-1.4\nexample\n%%EOF");
   const comment = { id: "test-1", page: 1, rects: [], title: "批注", text: "建议扩写。", quote: "原句", priority: "",
-    turns: [{ id: "turn-1", question: "如何扩写？", answer: "加一个例子。", source: { provider: "claude", model: "sonnet", effort: "high" } }] };
+    turns: [{ id: "turn-1", question: "如何扩写？", answer: "加一个例子。", source: { provider: "claude", model: "sonnet", effort: "high",
+      thinking: [{ id: "step-1", kind: "commentary", text: "正在核对原句。" }] } }] };
   assert.deepEqual(decodeReview(encodeReview(pdf, "原稿.pdf", [comment])).comments, [comment]);
   assert.throws(() => encodeReview(pdf, "原稿.pdf", [{ ...comment, turns: null }]), /批注对话记录无效/);
 });

@@ -6,6 +6,31 @@ import { test } from "node:test";
 import { commentInput, findAnchor, mainHistory, messageGroups, noteOrigin, sharedNoteBlocks, threadInput, turnInput } from "./notebook.mjs";
 import { NotebookStore } from "./store.mjs";
 import { Profiles } from "./profiles.mjs";
+
+test("an interrupted answer retains partial text, tool evidence and its error after reopening", () => {
+  const directory = mkdtempSync(join(tmpdir(), "notebook-interrupted-"));
+  const path = join(directory, "notebook.sqlite");
+  const store = new NotebookStore(path);
+  const interrupted = { message: "连接中断", stopped: false };
+  const tools = [{ id: "tool-1", title: "运行命令", detail: "演示命令", result: "演示结果", status: "done" }];
+  const saved = store.saveReply(null, "演示问题", "已完成的第一段。\n\n尚未完成的第二段。", undefined,
+    [], undefined, tools, { interrupted });
+  const replies = saved.blocks.filter((block) => block.kind === "reply");
+  assert.deepEqual(replies[0].interrupted, interrupted);
+  assert.deepEqual(replies[0].tools, tools);
+  assert.ok(replies.every((block) => block.included === false));
+  assert.equal(mainHistory(saved).at(-1).answer, "");
+  store.close();
+  const reopened = new NotebookStore(path);
+  try {
+    const kept = reopened.read().blocks.filter((block) => block.kind === "reply");
+    assert.equal(kept.at(-1).text, "尚未完成的第二段。");
+    assert.deepEqual(kept[0].interrupted, interrupted);
+    assert.deepEqual(kept[0].tools, tools);
+  } finally {
+    reopened.close();
+  }
+});
 import { allAttachmentRefs } from "./attachments.mjs";
 import { buildPrompt } from "./codex.mjs";
 

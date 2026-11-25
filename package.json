@@ -7,7 +7,10 @@
   "main": "main.mjs",
   "scripts": {
     "start": "electron .",
-    "test": "node --test"
+    "test": "node --test",
+    "test:md-ui": "node scripts/md-ui-smoke.mjs",
+    "testbed:prepare": "node scripts/testbed.mjs prepare",
+    "testbed:start": "node scripts/testbed.mjs start"
   },
   "devDependencies": {
     "electron": "45.3.1"

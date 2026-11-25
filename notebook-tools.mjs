@@ -5,6 +5,7 @@ import { NotebookStore, requireText } from "./store.mjs";
 import { messageGroups } from "./notebook.mjs";
 import { validateComments } from "./pdf-review.mjs";
 import { childKey } from "./child-chats.mjs";
+import { shiftAnnotations } from "./md-document.mjs";
 import { repeatLabel } from "./todos.mjs";
 
 // A time for a to-do: an absolute date ("2026-12-01T09:00", local time unless it says otherwise) or
@@ -107,7 +108,8 @@ export class NotebookTools {
     if (!doc) throw new Error("Markdown 文档不存在。");
     const start = limitNumber(offset, 0, doc.text.length);
     const size = Math.max(1, limitNumber(limit, 12000, 30000));
-    return { id: doc.id, name: doc.name, path: doc.path, text: doc.text.slice(start, start + size),
+    return { id: doc.id, name: doc.name, path: doc.path, version: doc.version, unsynced: doc.unsynced,
+      fileConflict: Boolean(doc.fileConflict), text: doc.text.slice(start, start + size),
       totalChars: doc.text.length, nextOffset: start + size < doc.text.length ? start + size : null,
       annotationCount: doc.comments.length,
       annotations: doc.comments.filter((item) => item.start >= start && item.start < start + size).slice(0, 30)
@@ -144,15 +146,22 @@ export class NotebookTools {
     return { ...annotation, chatId: chat?.id || null, chatMessages: chat?.blocks.length || turns?.length || 0 };
   }
 
-  saveMarkdown({ mdId, name, text, notebookId, afterId } = {}) {
+  saveMarkdown({ mdId, name, text, notebookId, afterId, expectedVersion } = {}) {
     const old = mdId ? this.store.mdDocument(mdId) : null;
     if (mdId && !old) throw new Error("Markdown 文档不存在。");
+    if (old && expectedVersion !== old.version) {
+      if (typeof text === "string") this.store.mdVersion(old.id, text, "Agent 未合并的修改草稿");
+      throw new Error("文档可能已在应用中修改。请先 read_markdown，再把返回的 version 作为 expectedVersion 传入更新，不能直接覆盖现有草稿。");
+    }
+    if (old) this.store.mdVersion(old.id, old.text, "Agent 修改前的应用版本", old.fileHash);
     const next = this.store.saveMdDocument(old?.id || randomUUID(), {
       ...old, name: requireText(name || old?.name, 250).trim(), text: typeof text === "string" ? text : old?.text,
-      comments: old?.comments || [], chat: old?.chat || [], unsynced: true
+      comments: old ? shiftAnnotations(old.text, typeof text === "string" ? text : old.text, old.comments) : [],
+      marks: old ? shiftAnnotations(old.text, typeof text === "string" ? text : old.text, old.marks || []) : [],
+      chat: old?.chat || [], unsynced: true, ...(old ? { expectedVersion } : {})
     });
     const state = notebookId ? this.store.addMarkdownBlock(notebookId, next.id, afterId) : null;
-    return { id: next.id, name: next.name, notebookId: state?.id || null,
+    return { id: next.id, name: next.name, version: next.version, notebookId: state?.id || null,
       link: `[${next.name}](ownsoft://md/${next.id})` };
   }
 
@@ -167,7 +176,8 @@ export class NotebookTools {
     if (old?.unsynced && old.text !== text) throw new Error("应用内文档已有未写回的修改，请先处理冲突。");
     const doc = this.store.saveMdDocument(old?.id || randomUUID(), {
       ...old, name: basename(path), path, text, comments: old?.comments || [], chat: old?.chat || [],
-      fileHash: createHash("sha256").update(bytes).digest("hex"), unsynced: false
+      fileHash: createHash("sha256").update(bytes).digest("hex"), fileText: text, unsynced: false,
+      marks: old ? shiftAnnotations(old.text, text, old.marks || []) : [], ...(old ? { expectedVersion: old.version } : {})
     });
     const state = notebookId ? this.store.addMarkdownBlock(notebookId, doc.id, afterId) : null;
     return { id: doc.id, name: doc.name, notebookId: state?.id || null,

@@ -1,8 +1,11 @@
 // Markdown documents: preview, edit the source, ask about a passage, annotate, and discuss the
 // whole document. The text is saved in the app as you type; 保存到文件 writes the .md file.
 import { renderMarkdown, selectionSource, sourceRange } from "./markdown-dom.mjs";
-import { shiftAnnotations } from "./md-document.mjs";
-import { embedChat } from "./embedded-chat.mjs";
+import { anchoredText, toggleTextMark } from "./text-anchors.mjs";
+import { setupReviewHistory } from "./review-history.mjs";
+import { shiftAnnotations, mergeDocumentDraft } from "./md-document.mjs";
+import { embedChat, openingChat } from "./embedded-chat.mjs";
+import { annotationCard } from "./annotation-card.mjs";
 import { attachSlashLinks } from "./internal-links.mjs";
 
 const make = (tag, className = "", text = "") => {
@@ -17,7 +20,7 @@ const control = (text, className = "") => {
   return element;
 };
 
- export function setupMdReview(api, { edit, notify, commentChats, onSaved = () => {} }) {
+ export function setupMdReview(api, { edit, notify, commentChats, focus, onSaved = () => {} }) {
   const get = (id) => document.getElementById(id);
   const view = get("md-view");
   const source = get("md-source");
@@ -37,14 +40,21 @@ const control = (text, className = "") => {
   let saving = Promise.resolve();
   let previewTimer;
   let selectionKey;
+  let pendingSave = false;
+  let serverBase = null;
+  let previewSignature = "";
+  const history = setupReviewHistory(api, { host: get("md-history"), kind: "md", current: () => doc?.id,
+    toggle: get("md-history-toggle"), layout: view.querySelector(".md-layout"),
+    open: (item) => showDocumentChat(item.commentId, { chatId: item.id, title: item.title }), notify });
   const attempt = (work) => Promise.resolve().then(work).catch((error) => notify(error.message));
 
   // ---- header and modes ---------------------------------------------------------------------
   function paintHeader() {
+    view.dataset.mdId = doc?.id || "";
     get("md-name").textContent = doc?.name || "Markdown 文档";
     get("md-path").textContent = doc?.path || "（还没有对应的文件）";
     get("md-path").title = doc?.path || "";
-    get("md-status").textContent = !doc ? "" : doc.unsynced ? (doc.path ? "改动已存在应用里，未写回文件" : "未保存为文件") : "已与文件一致";
+    get("md-status").textContent = !doc ? "" : pendingSave ? "草稿尚未完成保存" : doc.unsynced ? (doc.path ? "改动已存在应用里，未写回文件" : "未保存为文件") : "已与文件一致";
     get("md-status").classList.toggle("is-unsynced", Boolean(doc?.unsynced));
     get("md-reveal").disabled = !doc?.path;
     for (const button of view.querySelectorAll("[data-md-mode]")) {
@@ -64,56 +74,89 @@ const control = (text, className = "") => {
 
   // ---- preview with annotation marks --------------------------------------------------------
   function marks() {
-    return doc.comments.filter((item) => !item.lost).map((item) => ({ start: item.start,
-      end: item.start + item.quote.length, style: item.id === activeId ? "focus" : "note" }));
+    return [...(doc.marks || []).filter((item) => !item.lost).map((item) => ({ start: item.start, end: item.start + item.quote.length, style: item.style })), ...doc.comments.filter((item) => !item.lost).map((item) => ({ start: item.start,
+      end: item.start + item.quote.length, style: item.id === activeId ? "focus" : "note" }))];
   }
 
   function renderPreview() {
     if (!doc) return preview.replaceChildren();
+    const annotations = marks();
+    const signature = JSON.stringify([doc.id, doc.text, annotations]);
+    if (signature === previewSignature) return;
+    previewSignature = signature;
     const top = preview.scrollTop;
-    renderMarkdown(preview, doc.text, { marks: marks() });
+    renderMarkdown(preview, doc.text, { marks: annotations });
     preview.scrollTop = top;
   }
 
   // ---- saving --------------------------------------------------------------------------------
   function scheduleSave() {
+    pendingSave = true;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => attempt(flush), 700);
   }
 
+  function baseOf(value) { return structuredClone({ text: value.text, comments: value.comments, marks: value.marks || [], version: value.version }); }
+  function paintSync() {
+    const warning = get("md-sync-warning");
+    warning.hidden = !doc?.fileConflict;
+    warning.querySelector("span").textContent = doc?.fileConflict?.missing ? "原文件已不存在；应用草稿和批注仍保留。" : "磁盘文件和应用草稿有重叠改动，尚未写回文件。";
+  }
+  function adopt(saved, { redraw = true } = {}) {
+    const beforeText = doc?.text;
+    if (doc?.id === saved.id) Object.assign(doc, saved);
+    else doc = saved;
+    serverBase = baseOf(saved);
+    pendingSave = false;
+    if (source.value === beforeText || beforeText === undefined) source.value = saved.text;
+    paintHeader(); paintSync();
+    if (redraw) { renderPreview(); refreshComments(); }
+  }
   async function flush() {
     clearTimeout(saveTimer);
     if (!doc) return;
-    const current = doc;
-    saving = saving.then(async () => {
-      const saved = await api.mdSave({ id: current.id, text: current.text, comments: current.comments,
-        chat: current.chat, mode: current.mode });
-      if (current === doc) {
-        doc.unsynced = saved.unsynced;
-        doc.comments = mergeAnchors(doc.comments, saved.comments);
-        paintHeader();
+    pendingSave = true;
+    const owner = doc;
+    const snapshot = baseOf(owner);
+    const base = structuredClone(serverBase || snapshot);
+    const run = async () => {
+      const saved = await api.mdSave({ id: owner.id, ...snapshot, base, mode: owner.mode });
+      if (doc !== owner) return;
+      if (JSON.stringify(snapshot) === JSON.stringify(baseOf(owner))) adopt(saved);
+      else {
+        const merged = mergeDocumentDraft(snapshot, baseOf(owner), saved);
+        if (!merged.clean) throw new Error("保存期间同一处又有了修改。草稿仍在编辑器中，请先对照文件版本。");
+        const { clean, ...content } = merged;
+        const mode = owner.mode;
+        adopt({ ...saved, ...content, mode, unsynced: true });
+        serverBase = baseOf(saved);
+        source.value = doc.text;
+        scheduleSave();
       }
-    });
+    };
+    saving = saving.then(run, run);
     await saving;
   }
-
-  // The main process re-checks anchors; keep its verdict for annotations that did not change since.
-  function mergeAnchors(mine, theirs) {
-    const byId = new Map(theirs.map((item) => [item.id, item]));
-    return mine.map((item) => (byId.get(item.id)?.lost && !item.lost && item.quote === byId.get(item.id).quote
-      ? { ...item, lost: true } : item));
+  async function refreshRemote() {
+    if (!doc || pendingSave) return;
+    const owner = doc;
+    const next = await api.mdRefresh(owner.id);
+    if (doc !== owner || pendingSave || (next.version === owner.version && JSON.stringify(next.comments) === JSON.stringify(owner.comments))) return;
+    adopt(next);
   }
+  api.onLibraryChanged(() => refreshRemote().catch((error) => notify(error.message)));
+  window.addEventListener("focus", () => refreshRemote().catch((error) => notify(error.message)));
 
   async function saveToFile(saveAs = false) {
     if (!doc) return;
     await flush();
-    const saved = await api.mdSave({ id: doc.id, text: doc.text, comments: doc.comments, chat: doc.chat,
-      mode: doc.mode, toFile: true, saveAs });
-    Object.assign(doc, { path: saved.path, name: saved.name, unsynced: saved.unsynced });
-    paintHeader();
+    const saved = await api.mdSave({ id: doc.id, toFile: true, saveAs });
+    adopt(saved);
     onSaved();
-    if (!saved.unsynced) notify(`已保存到 ${saved.path}`);
+    if (saved.fileConflict) showConflict();
+    else if (!saved.unsynced) notify(`已保存到 ${saved.path}`);
   }
+
 
   // ---- editing -------------------------------------------------------------------------------
   source.addEventListener("input", () => {
@@ -121,6 +164,7 @@ const control = (text, className = "") => {
     const before = doc.text;
     doc.text = source.value;
     doc.comments = shiftAnnotations(before, doc.text, doc.comments);
+    doc.marks = shiftAnnotations(before, doc.text, doc.marks || []);
     doc.unsynced = true;
     paintHeader();
     scheduleSave();
@@ -181,6 +225,7 @@ const control = (text, className = "") => {
     const usable = Boolean(selection?.quote.trim()) && selection.quote.length <= 20_000;
     get("md-ask").disabled = !usable;
     get("md-annotate").disabled = !usable;
+    get("md-highlight").disabled = get("md-underline").disabled = !usable;
   }
 
   document.addEventListener("selectionchange", () => { if (!view.hidden) captureSelection(); });
@@ -198,9 +243,13 @@ const control = (text, className = "") => {
   // ---- annotations ---------------------------------------------------------------------------
   function annotate() {
     const { start, quote } = takeSelection();
+    const ownerId = doc.id, original = doc.text;
+    const anchor = anchoredText(original, start, quote);
     edit({ heading: "新建批注", reference: quote.slice(0, 600), limit: 20_000, save: (text) => {
       if (!text.trim()) throw new Error("请输入批注。");
-      const item = { id: crypto.randomUUID(), start, quote, title: "我的批注", text: text.trim() };
+      if (doc?.id !== ownerId) throw new Error("文档已切换，请回到原文档保存这条批注。");
+      const moved = shiftAnnotations(original, doc.text, [anchor])[0];
+      const item = { id: crypto.randomUUID(), ...moved, originalQuote: quote, title: "我的批注", text: text.trim() };
       doc.comments.push(item);
       activeId = item.id;
       renderAll();
@@ -241,7 +290,12 @@ const control = (text, className = "") => {
       const jump = control(item.title || "批注", "review-card-jump");
       jump.addEventListener("click", () => locate(item));
       card.append(jump);
-      if (item.lost) card.append(make("p", "md-lost", "原文已改动，找不到这段文字"));
+      annotationCard(card, { key, text: item.text,
+        open: () => attempt(async () => {
+          await flush();
+          await focus({ kind: "md-comment", docId: doc.id, itemId: item.id, title: doc.name, quote: item.quote });
+        }) });
+      if (item.lost) card.append(make("p", "md-lost", item.lostReason || "原文已改动，批注保留，等待重新关联"));
       card.append(make("blockquote", "review-quote", item.quote.slice(0, 400)));
       const body = make("div", "review-body markdown-content");
       renderMarkdown(body, item.text);
@@ -265,7 +319,16 @@ const control = (text, className = "") => {
         scheduleSave();
         if (chatTarget === item.id) mountDocumentChat(null);
       });
-      actions.append(revise, remove);
+      const reattach = control("关联到所选文字");
+      reattach.title = "先选中文档中的正确位置，再点此按钮";
+      reattach.addEventListener("pointerdown", (event) => event.preventDefault());
+      reattach.addEventListener("click", () => attempt(async () => {
+        const picked = takeSelection();
+        Object.assign(item, anchoredText(doc.text, picked.start, picked.quote));
+        delete item.lost; delete item.lostReason;
+        await flush(); renderAll();
+      }));
+      actions.append(revise, ...(item.lost ? [reattach] : []), remove);
       card.append(actions);
       // The follow-up is a full chat, shown in the lower part of the side panel.
       const follow = control(item.turns?.length ? `追问 · ${item.turns.length} 轮` : "追问", "review-follow");
@@ -296,63 +359,36 @@ const control = (text, className = "") => {
 
   // ---- asking about a passage ---------------------------------------------------------------
   function closeSelectionChat() {
-    if (selectionKey && commentChats.pending(selectionKey)) return notify("请先完成或停止当前的选区提问。");
-    if (selectionKey) commentChats.forget(selectionKey);
     selectionKey = undefined;
+    chatSelection = null;
     get("md-selection-chat").hidden = true;
-    get("md-selection-preview").replaceChildren();
-    get("md-selection-conversation").replaceChildren();
   }
 
   async function ask() {
     const { start, quote } = takeSelection();
-    if (selectionKey && commentChats.pending(selectionKey)) return notify("请先完成或停止当前的选区提问。");
-    closeSelectionChat();
-    await flush();
-    const owner = doc;
-    const turns = [];
-    selectionKey = `md:${owner.id}:selection:${crypto.randomUUID()}`;
-    get("md-selection-preview").append(make("blockquote", "review-quote", quote.slice(0, 600)));
-    // A useful answer can stay on the passage as an annotation, with its conversation.
-    const keep = (turn) => {
-      const save = control("存为批注", "comment-turn-action");
-      save.title = "把这条回答作为批注挂在所选文字上，追问记录一起保留";
-      save.addEventListener("click", () => {
-        if (owner !== doc) return;
-        const item = { id: crypto.randomUUID(), start, quote, title: `${turn.source?.memberName || "成员"} 的回答`.slice(0, 160),
-          text: turn.answer.slice(0, 20_000), turns: turns.slice(0, turns.indexOf(turn) + 1) };
-        doc.comments.push(item);
-        activeId = item.id;
-        renderAll();
-        scheduleSave();
-        notify("已存为批注，追问记录也一起保留。");
-      });
-      return [save];
-    };
-    const focus = commentChats.mount(get("md-selection-conversation"), {
-      key: selectionKey, embedded: true, forkable: false,
-      placeholder: "针对选中的这段提问；@ 成员可让多位依次回答",
-      target: () => ({ mdId: owner.id, selection: { start, quote }, history: turns }),
-      turns: () => turns,
-      receive: ({ turn }) => { turns.push(turn); },
-      turnActions: keep
-    });
-    get("md-selection-chat").hidden = false;
-    get("md-selection-chat").scrollIntoView({ block: "nearest" });
-    focus();
+    selectionKey = crypto.randomUUID();
+    await showDocumentChat(null, { kind: "md-selection", mdId: doc.id,
+      selection: { id: selectionKey, start, quote } });
+    get("md-document-conversation").scrollIntoView({ block: "nearest" });
   }
 
   // ---- whole-document conversation ----------------------------------------------------------
   // The lower part of the side panel is a full chat (the app's chat page embedded): the whole-document
   // conversation, or an annotation's follow-up when one is picked.
   let chatTarget = null;
+  let chatSelection = null;
+  let chatVersion = 0;
   get("md-chat-back").addEventListener("click", () => mountDocumentChat(null));
-  function mountDocumentChat(commentId = chatTarget) {
-    showDocumentChat(commentId).catch((error) => notify(error.message));
+  function mountDocumentChat(commentId = chatTarget, selected = null) {
+    showDocumentChat(commentId, selected).catch((error) => notify(error.message));
   }
 
-  async function showDocumentChat(commentId) {
+  async function showDocumentChat(commentId, selected = null) {
+    const version = ++chatVersion;
+    chatSelection = selected;
     const pane = get("md-document-conversation");
+    const cancelOpening = openingChat(pane);
+    try {
     if (!doc) {
       chatTarget = null;
       return pane.replaceChildren();
@@ -360,18 +396,37 @@ const control = (text, className = "") => {
     const owner = doc;
     const comment = commentId ? owner.comments.find((item) => item.id === commentId) : null;
     chatTarget = comment?.id || null;
-    get("md-chat-title").textContent = comment ? `批注追问 · ${comment.title || "批注"}` : "全文对话";
-    get("md-chat-back").hidden = !comment;
+    get("md-chat-title").textContent = selected ? (selected.title || "选区对话") : comment ? `批注追问 · ${comment.title || "批注"}` : "全文对话";
+    get("md-chat-back").hidden = !comment && !selected;
     get("md-chat-count").textContent = "";
     for (const card of document.querySelectorAll("[data-md-comment]")) {
       card.classList.toggle("is-chatting", card.dataset.mdComment === chatTarget);
     }
     await flush();
-    const spec = comment ? { kind: "md-comment", mdId: owner.id, commentId: comment.id } : { kind: "md-chat", mdId: owner.id };
-    const id = await api.childChatId(spec);
-    if (owner !== doc) return;
+    const spec = selected || (comment ? { kind: "md-comment", mdId: owner.id, commentId: comment.id } : { kind: "md-chat", mdId: owner.id });
+    const id = selected?.chatId || await api.childChatId(spec);
+    if (owner !== doc || version !== chatVersion) return;
     embedChat(pane, id, { label: get("md-chat-title").textContent });
-    get("md-chat-full").onclick = () => api.openChildChat(spec).catch((error) => notify(error.message));
+    try { localStorage.setItem(`ai-notebook:md-chat:${owner.id}`, JSON.stringify({ chatId: id, commentId: comment?.id, title: get("md-chat-title").textContent })); } catch {}
+    void history.select(id);
+    get("md-chat-full").onclick = () => api.openNotebookWindow(id).catch((error) => notify(error.message));
+    } catch (error) { cancelOpening(); throw error; }
+  }
+
+  async function restoreChat() {
+    const owner = doc;
+    try {
+      const saved = JSON.parse(localStorage.getItem(`ai-notebook:md-chat:${owner.id}`) || "null");
+      if (saved?.chatId) {
+        const chat = await api.read(saved.chatId);
+        if (owner !== doc) return;
+        if (chat.parent?.mdId === owner.id) {
+          const comment = doc.comments.find((item) => item.id === chat.parent.commentId);
+          return showDocumentChat(comment?.id || null, comment ? null : chat.parent.kind === "md-selection" ? saved : null);
+        }
+      }
+    } catch {}
+    if (owner === doc) mountDocumentChat(null);
   }
 
   function renderAll() {
@@ -387,25 +442,89 @@ const control = (text, className = "") => {
     if (doc?.id !== result.doc.id) {
       if (selectionKey) closeSelectionChat();
       doc = result.doc;
+      serverBase = baseOf(doc);
+      pendingSave = false;
       activeId = undefined;
       source.value = doc.text;
-      mountDocumentChat();
-    }
+      await restoreChat();
+    } else if (!pendingSave) adopt(result.doc);
     renderAll();
+    paintSync();
+    await history.refresh();
     if (result.notice) notify(result.notice);
     onSaved();
     return true;
   }
 
-  // Before closing: save, and offer to write unsaved edits back to the original file.
+  // Closing saves the application draft; writing the file remains an explicit action.
   async function leave() {
     if (!doc) return;
     await flush();
-    if (doc.unsynced && doc.path && window.confirm(`「${doc.name}」有改动还没写回原文件，现在保存到文件吗？\n（不保存的话，改动仍留在应用里。）`)) {
-      await saveToFile();
-    }
   }
 
+  function mark(style) {
+    const selected = takeSelection();
+    doc.marks ||= [];
+    toggleTextMark(doc.text, doc.marks, selected, style);
+    renderPreview();
+    scheduleSave();
+  }
+  for (const style of ["highlight", "underline"]) for (const id of [`md-${style}`, `md-tools-${style}`]) {
+    get(id).addEventListener("pointerdown", (event) => event.preventDefault());
+    get(id).addEventListener("click", () => attempt(() => mark(style)));
+  }
+  function showConflict(keepDraft) {
+    if (!doc?.fileConflict) return;
+    get("md-conflict-local").value = keepDraft ?? doc.text;
+    get("md-conflict-disk").value = doc.fileConflict.text;
+    get("md-conflict-use-disk").disabled = Boolean(doc.fileConflict.missing);
+    get("md-file-conflict").dataset.hash = doc.fileConflict.hash;
+    if (!get("md-file-conflict").open) get("md-file-conflict").showModal();
+  }
+  get("md-conflict-open").addEventListener("click", () => showConflict());
+  get("md-conflict-later").addEventListener("click", () => get("md-file-conflict").close());
+  for (const [id, useDisk] of [["md-conflict-use-disk", true], ["md-conflict-save", false]]) {
+    get(id).addEventListener("click", () => attempt(async () => {
+      const draft = get("md-conflict-local").value;
+      const saved = await api.mdResolve({ id: doc.id, hash: get("md-file-conflict").dataset.hash, text: draft, useDisk });
+      source.value = saved.text;
+      adopt(saved);
+      if (saved.fileConflict) { showConflict(draft); notify("文件又有了新改动，请重新对照；你的合并草稿仍保留。 "); }
+      else get("md-file-conflict").close();
+    }));
+  }
+  let versionText;
+  get("md-version-history").addEventListener("click", () => attempt(async () => {
+    await flush();
+    const items = await api.mdVersions(doc.id);
+    const list = get("md-version-list"); list.replaceChildren();
+    get("md-version-preview").value = ""; get("md-version-restore").disabled = true;
+    for (const item of items) {
+      const row = control(`${new Date(item.at).toLocaleString()} · ${item.reason} · ${item.length} 字符`);
+      row.addEventListener("click", () => attempt(async () => {
+        const snapshot = await api.mdVersionText(doc.id, item.seq);
+        versionText = snapshot.text;
+        get("md-version-preview").value = versionText;
+        get("md-version-restore").disabled = false;
+      })); list.append(row);
+    }
+    if (!items.length) list.append(make("p", "muted", "写回文件或检测到外部改动后，会在这里保留版本。"));
+    get("md-file-versions").showModal();
+  }));
+  get("md-version-close").addEventListener("click", () => get("md-file-versions").close());
+  get("md-version-restore").addEventListener("click", () => attempt(async () => {
+    const before = doc.text;
+    doc.text = versionText;
+    doc.comments = shiftAnnotations(before, doc.text, doc.comments);
+    doc.marks = shiftAnnotations(before, doc.text, doc.marks || []);
+    doc.unsynced = true; source.value = doc.text;
+    await flush(); renderAll(); get("md-file-versions").close();
+    notify("已恢复为应用草稿，尚未覆盖磁盘文件。");
+  }));
+
+  window.addEventListener("beforeunload", (event) => {
+    if (pendingSave) { event.preventDefault(); event.returnValue = false; }
+  });
   get("md-save").addEventListener("click", () => attempt(() => saveToFile(false)));
   get("md-save-as").addEventListener("click", () => attempt(() => saveToFile(true)));
   get("md-reveal").addEventListener("click", () => attempt(() => api.mdReveal(doc.id)));
@@ -420,6 +539,15 @@ const control = (text, className = "") => {
 
   return {
     current: () => doc,
+    perform: (action) => action === "highlight" || action === "underline" ? mark(action) : action === "note" ? annotate() : ask(),
+    locateComment: (id) => { const item = doc?.comments.find((item) => item.id === id); if (item) locate(item); },
+    acceptAnnotation: (result) => {
+      if (result.kind !== "md" || result.id !== doc?.id) return;
+      if (!doc.comments.some((item) => item.id === result.comment.id)) doc.comments.push(result.comment);
+      activeId = result.comment.id;
+      renderAll();
+      mountDocumentChat(result.comment.id);
+    },
     open: async (id) => show(await api.mdOpen(id)),
     openFile: async () => show(await api.mdOpenFile()),
     openDropped: async (file) => show(await api.mdOpenDropped(file)),

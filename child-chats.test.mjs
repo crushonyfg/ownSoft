@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { appendTurn, chatTurns, childKey } from "./child-chats.mjs";
 import { mainHistory } from "./notebook.mjs";
@@ -242,4 +245,112 @@ test("a side question's chat begins with the message it was asked about, like an
   } finally {
     store.close();
   }
+});
+
+
+test("Markdown selections use one persistent full chat; converting an answer keeps its descendants and makes the annotation editable", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const mdId = "11111111-1111-4111-8111-111111111111";
+    store.saveMdDocument(mdId, { name: "研究.md", text: "# 研究\n\n需要讨论的段落。" });
+    const spec = { kind: "md-selection", mdId, selection: { id: "picked", start: 6, quote: "需要讨论" } };
+    const id = store.openChildChat(spec);
+    assert.equal(store.openChildChat(spec), id);
+    let chat = store.saveReply(null, "如何理解？", "解释这段文字。", claude, [], id);
+    const answer = chat.blocks.find((b) => b.kind === "reply");
+    chat = store.change({ type: "add-note", anchor: { blockId: answer.id, start: 0, quote: "解释" }, text: "嵌套批注" }, id);
+    const nestedId = store.openChildChat({ kind: "note", notebookId: id, itemId: chat.notes[0].id });
+    const { reviewAnnotation: converted } = store.structure({ type: "selection-to-annotation", chat: id, ids: [answer.id] });
+    const comment = store.mdDocument(mdId).comments[0];
+    assert.equal(comment.text, "解释这段文字。");
+    assert.equal(comment.quote, "需要讨论");
+    assert.equal(store.openChildChat({ kind: "md-comment", mdId, commentId: comment.id }), id);
+    assert.equal(store.read(nestedId).parent.notebookId, id);
+    assert.equal(store.read(id).notes[0].anchor.blockId, store.read(id).blocks.find((b) => b.noteType === "annotation").id);
+    assert.equal(store.read(id).parent.kind, "md-comment");
+    assert.equal(store.read(id).blocks.find((b) => b.id === answer.id).removed, true);
+    const old = store.mdDocument(mdId);
+    const full = store.read(id);
+    const head = full.blocks.find((b) => b.noteType === "annotation");
+    head.text = "在完整聊天中编辑后的批注";
+    store.write(full);
+    assert.equal(store.mdDocument(mdId).comments[0].text, head.text);
+    store.saveMdDocument(mdId, old);
+    assert.equal(store.mdDocument(mdId).comments[0].text, head.text, "stale document saves do not overwrite chat edits");
+    const latest = store.mdDocument(mdId);
+    latest.comments[0].text = "从页边编辑";
+    store.saveMdDocument(mdId, latest);
+    assert.equal(store.read(id).blocks.find((b) => b.noteType === "annotation").text, "从页边编辑");
+    assert.equal(converted.notebookId, id);
+  } finally { store.close(); }
+});
+
+test("PDF selection chats retain page, rectangle and image when becoming annotations", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const hash = "d".repeat(64);
+    store.savePdfReview(hash, "论文.pdf", {});
+    const imageRef = { id: "22222222-2222-4222-8222-222222222222", name: "选区.png", extension: ".png", size: 128 };
+    const id = store.openChildChat({ kind: "pdf-selection", hash,
+      selection: { id: "screenshot", page: 3, quote: "", rects: [[.1,.2,.7,.4]], imageRef } });
+    const reply = store.saveReply(null, "这张图的含义？", "图中的解释", claude, [], id);
+    store.saveSelectionAnnotation(id, [reply.blocks.find((b) => b.kind === "reply").id]);
+    const review = store.pdfReview(hash);
+    assert.deepEqual(review.comments[0].rects, [[.1,.2,.7,.4]]);
+    assert.equal(review.comments[0].page, 3);
+    assert.deepEqual(store.read(id).blocks.find((b) => b.noteType === "annotation").attachments, [imageRef]);
+    const old = store.pdfReview(hash);
+    const full = store.read(id);
+    full.blocks.find((b) => b.noteType === "annotation").text = "更准确的图示解释";
+    store.write(full);
+    store.savePdfReview(hash, "论文.pdf", old);
+    assert.equal(store.pdfReview(hash).comments[0].text, "更准确的图示解释");
+    store.removePdfReview(hash);
+    assert.equal(store.childChat(childKey.pdfComment(hash, review.comments[0].id)), null);
+  } finally { store.close(); }
+});
+
+test("selection validation rejects changed Markdown and invalid PDF geometry without creating chats", () => {
+  const store = new NotebookStore(":memory:");
+  try {
+    const mdId = "33333333-3333-4333-8333-333333333333";
+    store.saveMdDocument(mdId, { name: "test.md", text: "原文" });
+    assert.throws(() => store.openChildChat({ kind: "md-selection", mdId, selection: { id: "bad", start: 0, quote: "别的" } }), /原文已改变/);
+    const hash = "e".repeat(64);
+    store.savePdfReview(hash, "test.pdf", {});
+    assert.throws(() => store.openChildChat({ kind: "pdf-selection", hash,
+      selection: { id: "bad", page: 1, quote: "原文", rects: [[.9,.2,.1,.3]] } }), /位置无效/);
+    assert.equal(store.childChat(childKey.selection("md-selection", mdId, "bad")), null);
+  } finally { store.close(); }
+});
+
+
+test("selection chats survive a database reopen and their conversion can be undone with the same chat id", () => {
+  const folder = mkdtempSync(join(tmpdir(), "ownsoft-selection-test-"));
+  const path = join(folder, "notebook.sqlite");
+  const mdId = "44444444-4444-4444-8444-444444444444";
+  const spec = { kind: "md-selection", mdId, selection: { id: "persistent", start: 0, quote: "原文" } };
+  let store = new NotebookStore(path);
+  let chatId, answerId;
+  try {
+    store.saveMdDocument(mdId, { name: "test.md", text: "原文与段落。" });
+    chatId = store.openChildChat(spec);
+    const chat = store.saveReply(null, "解释", "完整回答", claude, [], chatId);
+    answerId = chat.blocks.find((b) => b.kind === "reply").id;
+    assert.equal(store.reviewTree("md", mdId).children.find((node) => node.kind === "md-selection").chatId, chatId);
+  } finally { store.close(); }
+  store = new NotebookStore(path);
+  try {
+    assert.equal(store.openChildChat(spec), chatId);
+    assert.equal(store.read(chatId).blocks.find((b) => b.id === answerId).text, "完整回答");
+    store.structure({ type: "selection-to-annotation", chat: chatId, ids: [answerId] });
+    assert.equal(store.mdDocument(mdId).comments.length, 1);
+    store.undoStructure();
+    assert.equal(store.mdDocument(mdId).comments.length, 0);
+    assert.equal(store.openChildChat(spec), chatId);
+    assert.equal(store.read(chatId).blocks.find((b) => b.id === answerId).text, "完整回答");
+    assert.equal(store.read(chatId).blocks.some((b) => b.noteType === "annotation"), false);
+    store.removeMdDocument(mdId);
+    assert.equal(store.childChat(childKey.selection("md-selection", mdId, "persistent")), null);
+  } finally { store.close(); }
 });

@@ -5,6 +5,22 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { NotebookTools } from "./notebook-tools.mjs";
 
+test("agent updates require the read document version and retain concurrent application drafts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ownsoft-tool-version-")), tools = new NotebookTools(dir);
+  try {
+    const created = tools.saveMarkdown({ name: "versioned.md", text: "原文" });
+    const read = tools.readMarkdown({ mdId: created.id });
+    assert.throws(() => tools.saveMarkdown({ mdId: read.id, text: "Agent 改动" }), /expectedVersion/);
+    tools.store.saveMdDocument(read.id, { ...tools.store.mdDocument(read.id), text: "应用里的新草稿", unsynced: true });
+    assert.throws(() => tools.saveMarkdown({ mdId: read.id, text: "Agent 改动", expectedVersion: read.version }), /expectedVersion/);
+    assert.equal(tools.readMarkdown({ mdId: read.id }).text, "应用里的新草稿");
+    const latest = tools.readMarkdown({ mdId: read.id });
+    const updated = tools.saveMarkdown({ mdId: read.id, text: "保留应用修改后的 Agent 更新", expectedVersion: latest.version });
+    assert.ok(updated.version > latest.version);
+    assert.ok(tools.store.mdVersions(read.id).some((v) => v.reason.includes("Agent")));
+  } finally { tools.close(); }
+});
+
 test("model tools search and trace chat, save Markdown, and edit annotations", () => {
   const dir = mkdtempSync(join(tmpdir(), "ownsoft-tools-"));
   const tools = new NotebookTools(dir);

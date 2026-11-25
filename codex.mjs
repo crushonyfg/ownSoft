@@ -5,24 +5,41 @@ import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import { maxPromptChars } from "./context-budget.mjs";
 import { codexMcpConfig } from "./mcp-configuration.mjs";
+import { inactivityTimeout } from "./model-activity.mjs";
+
+let selectedExecutable;
 
 export function codexExecutable() {
   if (process.platform !== "win32") return "codex";
+  if (selectedExecutable) return selectedExecutable;
   const architecture = process.arch === "arm64" ? "arm64" : "x64";
   const target = architecture === "arm64" ? "aarch64" : "x86_64";
   const directories = (process.env.PATH || "").split(delimiter).filter(Boolean);
   if (process.env.APPDATA) directories.unshift(join(process.env.APPDATA, "npm"));
+  const candidates = new Set();
   for (const directory of new Set(directories)) {
     const direct = join(directory, "codex.exe");
     const npmRoot = join(directory, "node_modules", "@openai", "codex", "node_modules");
     const npmBinary = join(npmRoot, "@openai", `codex-win32-${architecture}`,
       "vendor", `${target}-pc-windows-msvc`, "bin", "codex.exe");
     for (const candidate of [direct, npmBinary]) {
-      if (existsSync(candidate)) return candidate;
+      if (existsSync(candidate)) candidates.add(candidate);
     }
   }
   const bundled = desktopCodex();
-  if (bundled) return bundled;
+  if (bundled) candidates.add(bundled);
+  // An older npm installation can hide models offered by a newer desktop CLI, and vice versa.
+  const versions = [...candidates].map((path) => {
+    let version = [];
+    try {
+      const output = execFileSync(path, ["--version"], { encoding: "utf8", timeout: 5000, windowsHide: true });
+      version = output.match(/\b(\d+)\.(\d+)\.(\d+)/)?.slice(1).map(Number) || [];
+    } catch {}
+    return { path, major: version[0] ?? -1, minor: version[1] ?? -1, patch: version[2] ?? -1 };
+  });
+  versions.sort((left, right) => right.major - left.major || right.minor - left.minor || right.patch - left.patch);
+  selectedExecutable = versions[0]?.path;
+  if (selectedExecutable) return selectedExecutable;
   throw new Error("找不到 Codex CLI。安装 Codex 桌面版或官方 Codex CLI 后，再打开此应用。");
 }
 
@@ -278,7 +295,7 @@ export class Codex extends EventEmitter {
     });
   }
 
-  async answer(payload, { signal, update, activity = () => {}, tool = () => {}, usage = () => {},
+  async answer(payload, { signal, update, activity = () => {}, thinking = () => {}, tool = () => {}, usage = () => {},
     model: selectedModel, effort, cwd, resumeSession, persistSession = false }) {
     const account = await this.account();
     if (!account.signedIn) throw new Error("请先用 ChatGPT 订阅登录 Codex。");
@@ -314,7 +331,7 @@ export class Codex extends EventEmitter {
       signal.throwIfAborted();
       const input = [{ type: "text", text },
         ...(payload.images || []).map(({ path }) => ({ type: "localImage", path }))];
-      const answer = await this.#turn(thread.id, input, { signal, update, activity, tool, usage,
+      const answer = await this.#turn(thread.id, input, { signal, update, activity, thinking, tool, usage,
         effort: effort || model.defaultEffort });
       return { text: answer, sessionId: persistSession ? thread.id : undefined };
     } finally {
@@ -322,9 +339,10 @@ export class Codex extends EventEmitter {
     }
   }
 
-  #turn(threadId, input, { signal, update, activity, tool, usage, effort }) {
+  #turn(threadId, input, { signal, update, activity, thinking, tool, usage, effort }) {
     return new Promise((resolve, reject) => {
       const messages = new Map();
+      const summaries = new Map();
       let turnId;
       let finished = false;
       const subscriptions = [];
@@ -335,7 +353,7 @@ export class Codex extends EventEmitter {
       const finish = (error, result) => {
         if (finished) return;
         finished = true;
-        clearTimeout(timeout);
+        timeout.close();
         signal.removeEventListener("abort", interrupt);
         for (const [name, listener] of subscriptions) this.off(name, listener);
         if (error) reject(error);
@@ -354,13 +372,20 @@ export class Codex extends EventEmitter {
       const record = (params) => {
         if (params.threadId !== threadId || params.item?.type !== "agentMessage") return;
         messages.set(params.item.id, params.item);
-        update(output());
+        if (params.item.phase === "commentary") {
+          if (params.item.text) thinking({ id: params.item.id, kind: "commentary", text: params.item.text });
+        } else update(output());
       };
 
-      const timeout = setTimeout(() => {
-        finish(new Error("Codex 生成超时。可以重新发送问题。"));
+      const timeout = inactivityTimeout(600_000, () => {
+        finish(new Error("Codex 连续 10 分钟没有返回进度，已中断本轮。"));
         this.close();
-      }, 600_000);
+      });
+      for (const event of ["item/started", "item/completed", "item/agentMessage/delta",
+        "item/commandExecution/outputDelta", "item/mcpToolCall/progress", "thread/tokenUsage/updated",
+        "item/reasoning/summaryTextDelta", "item/reasoning/textDelta"]) {
+        add(event, (params) => { if (params.threadId === threadId) timeout.touch(); });
+      }
       add("disconnected", (error) => finish(error));
       const toolLabels = { webSearch: "搜索网页", commandExecution: "运行命令",
         fileChange: "修改文件", mcpToolCall: "调用外部工具",
@@ -381,6 +406,21 @@ export class Codex extends EventEmitter {
         params.item?.status === "failed" ? "failed" : "done"));
       add("item/started", record);
       add("item/completed", record);
+      add("item/reasoning/summaryTextDelta", (params) => {
+        if (params.threadId !== threadId || typeof params.delta !== "string") return;
+        const id = `summary:${params.itemId}:${params.summaryIndex || 0}`;
+        const text = (summaries.get(id) || "") + params.delta;
+        summaries.set(id, text);
+        thinking({ id, kind: "summary", text });
+      });
+      add("item/completed", (params) => {
+        if (params.threadId !== threadId || params.item?.type !== "reasoning" || !Array.isArray(params.item.summary)) return;
+        for (const [index, text] of (params.item.summary || []).entries()) {
+          if (typeof text === "string" && text) {
+            thinking({ id: `summary:${params.item.id}:${index}`, kind: "summary", text });
+          }
+        }
+      });
       add("thread/tokenUsage/updated", (params) => {
         if (params.threadId !== threadId) return;
         const counts = params.tokenUsage?.total ?? params.tokenUsage?.last;
@@ -389,8 +429,10 @@ export class Codex extends EventEmitter {
       add("item/agentMessage/delta", (params) => {
         if (params.threadId !== threadId) return;
         const item = messages.get(params.itemId) || { text: "" };
-        messages.set(params.itemId, { ...item, text: item.text + params.delta });
-        update(output());
+        const next = { ...item, text: item.text + params.delta };
+        messages.set(params.itemId, next);
+        if (next.phase === "commentary") thinking({ id: params.itemId, kind: "commentary", text: next.text });
+        else update(output());
       });
       add("turn/completed", (params) => {
         if (params.threadId !== threadId) return;
@@ -406,7 +448,7 @@ export class Codex extends EventEmitter {
       });
       signal.addEventListener("abort", interrupt, { once: true });
       this.#request("turn/start", {
-        threadId, effort, input
+        threadId, effort, input, summary: "auto"
       }).then(({ turn }) => {
         turnId = turn.id;
         if (!finished && signal.aborted) interrupt();

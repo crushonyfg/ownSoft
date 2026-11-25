@@ -413,11 +413,17 @@ body[data-chat-background="night"] :is(.paper-title, .paper-end) { background: #
 .tool-details { margin: 7px 0 12px; padding: 7px 10px; border: 1px solid var(--line);
   border-radius: 10px; background: light-dark(#f2f6f7, #263246); font-size: 12px; }
 .tool-details summary { cursor: pointer; color: var(--chat-ink); font-weight: 600; }
+.work-progress { margin: 7px 0 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; }
+.work-progress > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.work-steps { max-height: 300px; overflow: auto; padding-top: 8px; }
+.work-step { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; }
+.work-step + .work-step { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--line); }
 .tool-list { display: grid; gap: 5px; margin-top: 8px; }
 .tool-item { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .tool-status { color: #31855f; font-weight: 700; }
 .tool-status.is-running { color: #ba8234; animation: typing-pulse 1.2s infinite; }
 .tool-status.is-failed { color: var(--danger); }
+.generation-error { padding: 8px 10px; border: 1px solid var(--line); border-left: 3px solid var(--danger); border-radius: 5px; color: var(--danger); overflow-wrap: anywhere; }
 .tool-detail { color: var(--muted); overflow-wrap: anywhere; }
 .tool-result { flex-basis: 100%; margin: 2px 0 4px 20px; min-width: 0; }
 .tool-result summary { font-weight: 400; color: var(--muted); }
@@ -438,7 +444,7 @@ body[data-chat-background="night"] :is(.paper-title, .paper-end) { background: #
   border-radius: 14px; border: 2px solid #ffffffc7; background: #dbe7df;
   box-shadow: 0 4px 0 #31524c22, 0 9px 19px #2d474326;
 }
-.pixel-avatar svg { width: 36px; height: 36px; image-rendering: pixelated; animation: avatar-bob 3.2s ease-in-out infinite; }
+.pixel-avatar svg { width: 36px; height: 36px; image-rendering: pixelated; }
 .pixel-avatar[data-avatar="robot"] { background: #d2ecf5; }
 .pixel-avatar[data-avatar="fox"] { background: #ffe4ca; }
 .pixel-avatar[data-avatar="cat"] { background: #e6ddf4; }

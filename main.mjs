@@ -1,5 +1,5 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, net, Notification, powerMonitor, protocol, shell } from "electron";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -24,6 +24,9 @@ import { NotebookStore, requireText, validateMdComments } from "./store.mjs";
 import { mdCommentOrigin, mdDocumentOrigin, mdSelectionOrigin, mdTextLimit, reanchor } from "./md-document.mjs";
 import { childKey } from "./child-chats.mjs";
 import { todoPrompt } from "./todos.mjs";
+import { MarkdownFiles } from "./md-files.mjs";
+import { uiAssets, fileAsset } from "./ui-assets.mjs";
+import { windowStartup } from "./window-startup.mjs";
 import { readReviewFile, saveReviewFile, validateComments, validateTurns } from "./pdf-review.mjs";
 import {
   Backups, checkDatabase, copyData, dataInfo, exportArchive, finishPendingCopy, hasDatabase, importArchive, replaceDatabase,
@@ -44,8 +47,11 @@ const files = new Map([
   ["/pdf-review-ui.mjs", "ui/pdf-review-ui.mjs"], ["/workspace.css", "ui/workspace.css"],
   ["/comment-chat.mjs", "ui/comment-chat.mjs"], ["/pixel-avatars.mjs", "ui/pixel-avatars.mjs"],
   ["/chat-composer.mjs", "ui/chat-composer.mjs"], ["/threads-ui.mjs", "ui/threads-ui.mjs"],
+  ["/work-progress.mjs", "ui/work-progress.mjs"],
   ["/pdf-note.mjs", "ui/pdf-note.mjs"], ["/features.css", "ui/features.css"], ["/splitter.mjs", "ui/splitter.mjs"], ["/windows.css", "ui/windows.css"],
-  ["/md-review-ui.mjs", "ui/md-review-ui.mjs"], ["/md-document.mjs", "md-document.mjs"], ["/embedded-chat.mjs", "ui/embedded-chat.mjs"],
+  ["/text-edits.mjs", "text-edits.mjs"], ["/text-anchors.mjs", "text-anchors.mjs"],
+  ["/review-history.mjs", "ui/review-history.mjs"], ["/md-review-ui.mjs", "ui/md-review-ui.mjs"], ["/md-document.mjs", "md-document.mjs"], ["/embedded-chat.mjs", "ui/embedded-chat.mjs"],
+  ["/annotation-card.mjs", "ui/annotation-card.mjs"],
   ["/relation-view.mjs", "ui/relation-view.mjs"], ["/structure-ui.mjs", "ui/structure-ui.mjs"], ["/image-viewer.mjs", "ui/image-viewer.mjs"], ["/todo-ui.mjs", "ui/todo-ui.mjs"]
 ]);
 protocol.registerSchemesAsPrivileged([
@@ -53,6 +59,8 @@ protocol.registerSchemesAsPrivileged([
 ]);
 const override = process.env.AI_NOTEBOOK_DATA_DIR;
 app.setName("AI Notebook");
+// Apply the Windows rendering fallback to every launcher, including existing pinned shortcuts.
+if (process.platform === "win32") app.disableHardwareAcceleration();
 // Matches the Start Menu shortcut so a taskbar pin and the running window share one button.
 if (process.platform === "win32") app.setAppUserModelId("AI.Notebook");
 if (override) {
@@ -63,6 +71,7 @@ let window;
 const windows = new Set();
 let store;
 let profiles;
+let mdFiles;
 let attachments;
 let local;
 let dataSource;
@@ -99,7 +108,7 @@ function handle(name, operation) {
     }
     try {
       const data = await operation(payload, owner);
-      if (/^(?:notebook:change|note:(?:add-images|add-md)|annotation:(?:move|undo)|structure:(?:apply|undo)|image:edit|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send)$/.test(name)) {
+      if (/^(?:notebook:change|note:(?:add-images|add-md)|annotation:(?:move|undo)|structure:(?:apply|undo)|image:edit|members:change|turn:send|turn:detach|thread:send|review:(?:save|move-message|undo-message)|md:save|library:(?:create|rename|move|delete|create-from-messages)|folder:(?:create|rename|delete)|comment:fork|comment:send|md:resolve)$/.test(name)) {
         for (const frame of frames()) if (frame !== event.senderFrame) {
           try { frame.send("library:changed"); } catch {}
         }
@@ -419,6 +428,11 @@ function persona(member, profile, group, round = []) {
 async function modelReply({ member, profile, group }, input, controller, requestId, cwd, round = [], continuity = {}) {
   const effort = member.effort || "";
   const tools = [];
+  const source = { provider: profile.provider, model: member.model, effort,
+    memberId: member.id, memberName: member.name, avatar: member.avatar };
+  const progress = { text: "", tools, source };
+  const pending = activeTurns.get(requestId);
+  if (pending) pending.progress = progress;
   let counts;
   const result = await session(profile).answer({ ...input, persona: persona(member, profile, group, round) }, {
     signal: controller.signal,
@@ -426,8 +440,18 @@ async function modelReply({ member, profile, group }, input, controller, request
     model: member.model,
     effort,
     ...continuity,
-    update: (value) => notify("turn:progress", { requestId, text: value }),
+    update: (value) => {
+      if (value) progress.text = value;
+      notify("turn:progress", { requestId, text: value });
+    },
     activity: (value) => notify("turn:activity", { requestId, text: value }),
+    thinking: (step) => {
+      source.thinking ??= [];
+      const previous = source.thinking.find((item) => item.id === step.id);
+      if (previous) previous.text = step.text;
+      else source.thinking.push(step);
+      notify("turn:activity", { requestId, text: "正在处理", thinking: step });
+    },
     usage: (value) => { counts = value; },
     limits: (items) => profiles.recordLimits(profile.id, items),
     tool: (item) => {
@@ -450,8 +474,6 @@ async function modelReply({ member, profile, group }, input, controller, request
   const answer = stripSpeaker(raw, member.name);
   profiles.recordUsage(member.id, counts, new Date(), profile.id);
   for (const item of tools) if (item.status === "running") item.status = "done";
-  const source = { provider: profile.provider, model: member.model, effort,
-    memberId: member.id, memberName: member.name, avatar: member.avatar };
   return { answer, source, tools, sessionId: typeof result === "string" ? undefined : result.sessionId };
 }
 
@@ -485,6 +507,7 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
     for (const [index, speaker] of queue.entries()) {
       controller.signal.throwIfAborted();
       Object.assign(turn, { speaker, index });
+      delete turn.progress;
       notify("turn:member", { requestId, index, total: queue.length, member: publicMember(speaker) });
       const notebook = await withReviews(store.read(first.id));
       const current = branch && notebook.branches.find((item) => item.id === branchId);
@@ -518,6 +541,7 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
         const { answer, source, tools, sessionId } = await modelReply(speaker,
           { ...input, notebookId: first.id, files: prepared.files, images: prepared.images, dirs: prepared.dirs }, controller, requestId, cwd,
           queue.map(({ member }) => member.name), { persistSession, resumeSession });
+        delete turn.progress;
         // Moved to a private window while it was answering: the reply goes there, and members still
         // queued behind it are not asked (the user can ask them separately).
         if (turn.detached) {
@@ -549,6 +573,22 @@ async function generate({ requestId, branchId, question, memberIds, attachmentId
         if (!index) attachments.commit(files);
         if (index < queue.length - 1) notify("turn:saved", { requestId, notebook: saved });
       } catch (error) {
+        if (turn.progress) {
+          const { text: partial, tools, source } = turn.progress;
+          for (const item of tools) if (item.status === "running") item.status = "failed";
+          const interrupted = { message: String(error.message || error), stopped: controller.signal.aborted };
+          const answer = stripSpeaker(partial, speaker.member.name).trim() || "本轮生成已中断。";
+          if (turn.detached) {
+            saved = store.saveThreadReply(first.id, turn.detached, { id: randomUUID(), question: text,
+              answer, tools, source, interrupted, ...(!index && files.length ? { attachments: files } : {}) });
+          } else {
+            saved = store.saveReply(branchId, text, answer, source, index ? [] : files, first.id, tools,
+              { continueTurn: index > 0, interrupted });
+          }
+          if (!index) attachments.commit(files);
+          notify("turn:saved", { requestId, notebook: saved });
+          delete turn.progress;
+        }
         if (resumeSession) store.saveModelSession(first.id, sessionKey, null);
         if (index > 0 && !controller.signal.aborted) {
           throw new Error(`${speaker.member.name}：${error.message}（前面成员的回答已保存）`);
@@ -626,61 +666,15 @@ function reviewDocumentTarget({ reviewId, comments, history }) {
 
 const mdExtensions = new Set([".md", ".markdown", ".mdown", ".mkd", ".txt"]);
 
-async function readMdFile(path) {
-  if (!mdExtensions.has(extname(path).toLowerCase())) throw new Error("请选择 .md 或 .markdown 文件。");
-  const info = statSync(path);
-  if (!info.isFile() || info.size > mdTextLimit) throw new Error("文档需要是 5 MB 以内的文本文件。");
-  const bytes = await readFile(path);
-  let text;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw new Error("文档需要是 UTF-8 编码的文本。");
-  }
-  return { text: text.replace(/^\uFEFF/, ""), hash: sha256(bytes) };
-}
-
-// The file as it is now, if it changed since the app last read or wrote it.
-async function mdFileChange(doc) {
-  if (!doc.path || !existsSync(doc.path)) return null;
-  const file = await readMdFile(doc.path).catch(() => null);
-  return file && file.hash !== doc.fileHash ? file : null;
-}
-
-function saveMd(doc, changes = {}) {
-  return store.saveMdDocument(doc.id, { ...doc, ...changes });
-}
-
-// Opening picks up edits made to the file elsewhere, unless there are edits here not yet written
-// back; then the app's version is kept and the reader is told.
 async function openMd(doc) {
-  const file = await mdFileChange(doc);
-  if (!file) return { doc, notice: doc.path && !existsSync(doc.path) ? "找不到原文件，内容保存在应用里；可以另存为新文件。" : "" };
-  if (doc.unsynced && file.text !== doc.text) {
-    return { doc, notice: "原文件在别处也被修改过；这里保留应用里的版本，「保存到文件」会覆盖它。" };
-  }
-  const comments = doc.comments.map((item) => reanchor(file.text, item));
-  return { doc: saveMd(doc, { text: file.text, fileHash: file.hash, unsynced: false, comments }),
-    notice: file.text === doc.text ? "" : "已载入原文件的新内容。" };
+  const current = await mdFiles.open(doc.id);
+  return { doc: current, notice: current.fileConflict ? "文件和应用都有改动，请对照后保存。" : "" };
 }
-
-async function importMd(path) {
-  const existing = store.mdDocumentByPath(path);
-  if (existing) return openMd(existing);
-  const file = await readMdFile(path);
-  return { doc: store.saveMdDocument(randomUUID(), { name: basename(path), path, text: file.text, fileHash: file.hash }), notice: "" };
-}
-
+async function importMd(path) { return { doc: await mdFiles.import(path), notice: "" }; }
 function mdDoc(id) {
   const doc = store.mdDocument(id);
   if (!doc) throw new Error("这份文档已不存在。");
   return doc;
-}
-
-async function writeMd(doc, path) {
-  const bytes = Buffer.from(doc.text, "utf8");
-  await writeFile(path, bytes);
-  return saveMd(doc, { path, name: basename(path), fileHash: sha256(bytes), unsynced: false });
 }
 
 // What a question about a document is about: a selected passage, an annotation, or the whole text.
@@ -755,21 +749,39 @@ async function parentContext(notebook, includePdf = true) {
       return { context: [`来源：会话「${owner.title}」里的一条消息（待办就是从这里记下的）`,
         todo.quote && `选中的文字：\n${todo.quote}`, message && `那条消息：\n${message}`].filter(Boolean).join("\n\n") };
     }
+    if (parent.kind === "pdf-selection") {
+      const review = store.pdfReview(parent.hash);
+      return { context: commentContext({ kind: "selection", reference: `PDF「${review?.name || ""}」第 ${parent.selection.page} 页`,
+        quote: parent.selection.quote || "框选截图", text: "只讨论选中的这部分内容。" }),
+        refs: parent.selection.imageRef ? [parent.selection.imageRef] : [],
+        ...(includePdf ? { pdf: { name: review.name, bytes: await readFile(join(reviewFolder(), `${parent.hash}.pdf`)) } } : {}) };
+    }
+    if (parent.kind === "md-selection") {
+      const doc = await mdFiles.open(parent.mdId);
+      return doc ? { context: [doc.path && `Markdown 文件路径：${doc.path}`, doc.unsynced && "以下参考内容包含应用中尚未写回文件的草稿。",
+        commentContext(mdSelectionOrigin(doc.name, doc.text, parent.selection.start, parent.selection.quote, parent.selection))].filter(Boolean).join("\n\n") } : {};
+    }
     if (parent.kind === "pdf-chat" || parent.kind === "pdf-comment") {
       const review = store.pdfReview(parent.hash);
       if (!review) return {};
       const pdf = { name: review.name,
         ...(includePdf ? { bytes: await readFile(join(reviewFolder(), `${parent.hash}.pdf`)) } : {}) };
       const comment = review.comments.find((item) => item.id === parent.commentId);
-      const origin = comment ? pdfCommentOrigin(review.name, comment) : documentOrigin(review.name, review.comments);
+      let origin = comment ? pdfCommentOrigin(review.name, comment) : documentOrigin(review.name, review.comments);
+      if (comment && notebook.blocks.some((block) => block.noteType === "annotation" && !block.removed)) {
+        origin = { ...origin, kind: "selection", text: "" };
+      }
       return { context: commentContext(origin), pdf };
     }
     if (parent.kind === "md-chat" || parent.kind === "md-comment") {
-      const doc = store.mdDocument(parent.mdId);
+      const doc = await mdFiles.open(parent.mdId);
       if (!doc) return {};
       const comment = doc.comments.find((item) => item.id === parent.commentId);
-      return { context: commentContext(comment ? mdCommentOrigin(doc.name, doc.text, comment)
-        : mdDocumentOrigin(doc.name, doc.text, doc.comments)) };
+      let origin = comment ? mdCommentOrigin(doc.name, doc.text, comment) : mdDocumentOrigin(doc.name, doc.text, doc.comments);
+      if (comment && notebook.blocks.some((block) => block.noteType === "annotation" && !block.removed)) {
+        origin = { ...origin, kind: "selection", text: "" };
+      }
+      return { context: [doc.path && `Markdown 文件路径：${doc.path}`, doc.unsynced && "以下参考内容包含应用中尚未写回文件的草稿。", commentContext(origin)].filter(Boolean).join("\n\n") };
     }
   } catch (error) {
     console.error("Could not read where a chat came from:", error);
@@ -833,6 +845,7 @@ function shutDown() {
   for (const turn of activeTurns.values()) turn.controller.abort(new Error("应用已关闭。"));
   for (const client of sessions.values()) client.close?.();
   sessions.clear();
+  mdFiles?.close();
   store?.close();
   store = undefined;
 }
@@ -952,6 +965,14 @@ function setupDataHandlers() {
 }
 
 // review: the hash of the PDF this window reviews on its own (a PDF moved to another screen).
+function reportStartup(error, attempt = 0) {
+  console.error("Window startup failed:", error);
+  try {
+    appendFileSync(join(local || app.getPath("userData"), "startup.log"),
+      `${new Date().toISOString()} attempt=${attempt} ${error?.stack || error}\n`);
+  } catch {}
+}
+
 function createWindow(notebookId, review) {
   const target = new BrowserWindow({
     title: "AI 笔记本",
@@ -960,6 +981,7 @@ function createWindow(notebookId, review) {
     autoHideMenuBar: true,
     // The preload also runs in embedded chats (iframes of this same page).
     webPreferences: { preload: join(base, "preload.cjs"), sandbox: true, contextIsolation: true, nodeIntegration: false,
+      ...(process.env.AI_NOTEBOOK_TEST_HEADLESS === "1" ? { backgroundThrottling: false } : {}),
       nodeIntegrationInSubFrames: true }
   });
   target.notebookId = notebookId || store.activeId();
@@ -975,17 +997,21 @@ function createWindow(notebookId, review) {
   });
   target.webContents.on("will-prevent-unload", (event) => {
     const answer = dialog.showMessageBoxSync(target, {
-      type: "question", message: "PDF 批注有未保存的改动。",
+      type: "question", message: "仍有未保存的编辑。",
       buttons: ["继续编辑", "放弃改动并关闭"], defaultId: 0, cancelId: 0
     });
     if (answer === 1) event.preventDefault();
   });
-  target.once("ready-to-show", () => target.show());
   target.on("closed", () => {
     windows.delete(target);
     if (window === target) window = windows.values().next().value;
   });
-  target.loadURL(entryUrl);
+  target.startup = windowStartup(target, { url: entryUrl, hidden: process.env.AI_NOTEBOOK_TEST_HEADLESS === "1",
+    report: reportStartup, failed: (error) => {
+      if (process.env.AI_NOTEBOOK_TEST_HEADLESS !== "1") dialog.showErrorBox("无法打开应用界面",
+        `${error?.message || "页面加载失败"}\n重新点击应用图标可以重试。详细信息已写入数据文件夹的 startup.log。`);
+    } });
+  void target.startup.start();
   return target;
 }
 
@@ -993,14 +1019,14 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (window?.isMinimized()) window.restore();
-    window?.focus();
+    if (window && !window.isDestroyed()) void window.startup.reopen();
   });
   app.whenReady().then(async () => {
     const markdownModule = (await build({
       entryPoints: [join(base, "markdown.mjs")], bundle: true, platform: "browser", format: "esm",
       write: false, logLevel: "silent"
     })).outputFiles[0].text;
+    const staticUI = await uiAssets(base, files);
     protocol.handle("notebook", ({ url }) => {
       const { hostname, pathname } = new URL(url);
       if (hostname === "app" && pathname === "/markdown.mjs") {
@@ -1010,7 +1036,7 @@ if (!app.requestSingleInstanceLock()) {
       if (hostname === "app" && pathname.startsWith("/katex/")) {
         const asset = pathname.slice("/katex/".length);
         if (asset === "katex.min.css" || /^fonts\/KaTeX_[A-Za-z0-9-]+\.(?:woff2|woff|ttf)$/.test(asset)) {
-          return net.fetch(pathToFileURL(join(katexRuntime, asset)).href);
+          return fileAsset(join(katexRuntime, asset));
         }
         return new Response(null, { status: 404 });
       }
@@ -1018,7 +1044,7 @@ if (!app.requestSingleInstanceLock()) {
         const asset = pathname.slice("/pdf-runtime/".length);
         if (/^build\/pdf(?:\.worker)?\.min\.mjs$/.test(asset) ||
             /^(?:cmaps|standard_fonts|wasm)\/[a-zA-Z0-9_.-]+\.(?:bcmap|pfb|ttf|wasm|js)$/.test(asset)) {
-          return net.fetch(pathToFileURL(join(pdfRuntime, asset)).href);
+          return fileAsset(join(pdfRuntime, asset));
         }
       }
       if (hostname === "app" && pathname.startsWith("/note-image/")) {
@@ -1027,7 +1053,7 @@ if (!app.requestSingleInstanceLock()) {
         const image = (item) => item?.id === id && [".png", ".jpg", ".jpeg", ".webp"].includes(item.extension);
         const ref = /^[\da-f-]{36}$/i.test(id) &&
           (storedAttachments().find(image) || [attachments.pendingRef(id)].find(image));
-        return ref ? net.fetch(pathToFileURL(attachments.path(ref)).href) : new Response(null, { status: 404 });
+        return ref ? fileAsset(attachments.path(ref)) : new Response(null, { status: 404 });
       }
       // PDF notes are previewed in the chat; only stored attachments can be read this way.
       if (hostname === "app" && pathname.startsWith("/note-file/")) {
@@ -1035,10 +1061,9 @@ if (!app.requestSingleInstanceLock()) {
         const ref = /^[\da-f-]{36}$/i.test(id) &&
           (storedAttachments().find((item) => item.id === id && item.extension === ".pdf") ||
             [attachments.pendingRef(id)].find((item) => item?.extension === ".pdf"));
-        return ref ? net.fetch(pathToFileURL(attachments.path(ref)).href) : new Response(null, { status: 404 });
+        return ref ? fileAsset(attachments.path(ref)) : new Response(null, { status: 404 });
       }
-      const file = hostname === "app" && files.get(pathname);
-      return file ? net.fetch(pathToFileURL(join(base, file)).href) : new Response(null, { status: 404 });
+      return hostname === "app" ? staticUI(pathname) : new Response(null, { status: 404 });
     });
     // Keep notes outside AppData: packaged apps (Codex, Claude desktop) silently redirect AppData
     // writes of programs they launch into private folders, which splits the notebook by launcher.
@@ -1055,6 +1080,7 @@ if (!app.requestSingleInstanceLock()) {
       if (/^(?:import|export)-\d{8}-\d{6}-\d+\.sqlite$/.test(name)) rmSync(join(local, name), { force: true });
     }
     store = new NotebookStore(join(local, "notebook.sqlite"));
+    mdFiles = new MarkdownFiles(store, { changed: () => notify("library:changed"), error: (e) => console.error("MD file sync:", e) });
     backups = new Backups(local, store.db);
     autoBackup();
     // Conversations kept inside chats and reviews by earlier versions become child chats (backed up first).
@@ -1110,10 +1136,13 @@ if (!app.requestSingleInstanceLock()) {
     handle("annotation:message", ({ notebookId, messageId }) => store.annotationMessage(notebookId, messageId));
     handle("annotation:resolve", (messageId) => store.resolveAnnotationMessage(messageId));
     // Structural edits (move, remove, annotation <-> note block …), undoable; see store.structure.
-    const structured = ({ label, chats, focus }) => ({ label, chats, focus: focus || null });
+    const structured = ({ label, chats, focus, reviewAnnotation }) => ({ label, chats, focus: focus || null,
+      ...(reviewAnnotation ? { reviewAnnotation } : {}) });
     handle("structure:apply", (op) => {
       // A new picture file only comes from image:edit below; the page may only ask to restore.
       if (op?.type === "edit-image" && !op.restore) throw new Error("请在图片编辑器里保存。");
+      if (["selection-to-annotation", "undo-selection-annotation"].includes(op?.type) &&
+          [...activeTurns.values()].some((turn) => turn.notebookId === op.chat)) throw new Error("请等当前回答完成后再存为批注。");
       return structured(store.structure(op));
     });
     // An edited image note: the flattened picture becomes a new attachment; the original and the
@@ -1155,17 +1184,25 @@ if (!app.requestSingleInstanceLock()) {
     // The chat of any conversation (made, empty, if it has no messages yet): shown embedded where
     // the conversation lives, or as a full chat in a window of its own.
     // A review's chats talk with the members of the chat the review is opened from (rosterId).
-    const childChatId = (spec, owner) => {
+    const childChatId = async (spec, owner) => {
       const kind = spec?.kind;
       const rosterId = owner?.notebookId;
       if (kind === "note" || kind === "branch" || kind === "thread") {
         return store.openChildChat({ kind, notebookId: spec.notebookId, itemId: spec.itemId });
       }
-      if (kind === "pdf-chat" || kind === "pdf-comment") {
-        return store.openChildChat({ kind, hash: openReview(spec.reviewId).hash, commentId: spec.commentId, rosterId });
+      if (kind === "pdf-chat" || kind === "pdf-comment" || kind === "pdf-selection") {
+        let selection = spec.selection;
+        if (kind === "pdf-selection" && selection?.image) {
+          const staged = await attachments.stage([{ name: `PDF 第 ${selection.page} 页选区.png`, data: selection.image }], 1);
+          if (!staged.items.length) throw new Error(staged.errors.join("\n"));
+          selection = { ...selection, image: undefined, imageRef: staged.items[0] };
+        }
+        const id = store.openChildChat({ kind, hash: spec.hash || openReview(spec.reviewId).hash, commentId: spec.commentId, selection, rosterId });
+        if (selection?.imageRef) attachments.commit([selection.imageRef]);
+        return id;
       }
-      if (kind === "md-chat" || kind === "md-comment") {
-        return store.openChildChat({ kind, mdId: spec.mdId, commentId: spec.commentId, rosterId });
+      if (kind === "md-chat" || kind === "md-comment" || kind === "md-selection") {
+        return store.openChildChat({ kind, mdId: spec.mdId, commentId: spec.commentId, selection: spec.selection, rosterId });
       }
       if (kind === "todo") return store.openChildChat({ kind, itemId: spec.itemId });
       throw new Error("无法打开这段对话。");
@@ -1208,7 +1245,7 @@ if (!app.requestSingleInstanceLock()) {
       return tree;
     });
     handle("chat:open-child", async (spec, owner) => {
-      const id = childChatId(spec, owner);
+      const id = await childChatId(spec, owner);
       const target = createWindow(id);
       target.once("ready-to-show", () => target.focus());
       return id;
@@ -1367,6 +1404,7 @@ if (!app.requestSingleInstanceLock()) {
       return { exported: path };
     });
     handle("md:list", () => store.mdDocuments());
+    handle("review:state", ({ kind, id }) => kind === "md" ? store.mdDocument(id) : store.pdfReview(id));
     handle("note:add-md", ({ notebookId, mdId, afterId }) => store.addMarkdownBlock(notebookId, mdId, afterId));
     handle("review:move-message", ({ notebookId, ids, hash, anchor }) =>
       store.moveMessageToPdfAnnotation(notebookId, ids, hash, anchor));
@@ -1382,13 +1420,10 @@ if (!app.requestSingleInstanceLock()) {
       if (choice.canceled || !choice.filePaths[0]) return null;
       return importMd(choice.filePaths[0]);
     });
-    handle("md:new", () => ({ doc: store.saveMdDocument(randomUUID(), { name: "未命名.md", text: "# 新文档\n\n" }), notice: "" }));
+    handle("md:new", () => ({ doc: store.saveMdDocument(randomUUID(), { name: "未命名.md", text: "# 新文档\n\n", unsynced: true }), notice: "" }));
     // Saved as you type; toFile also writes the .md file (asking where when there is none yet).
-    handle("md:save", async ({ id, text, comments, chat, mode, toFile = false, saveAs = false }) => {
-      const doc = mdDoc(id);
-      const changed = typeof text === "string" && text !== doc.text;
-      let next = saveMd(doc, { text: typeof text === "string" ? text : doc.text, comments: comments ?? doc.comments,
-        chat: chat ?? doc.chat, mode: mode ?? doc.mode, unsynced: doc.unsynced || changed });
+    handle("md:save", async ({ id, text, comments, marks, base: baseVersion, mode, toFile = false, saveAs = false }) => {
+      let next = await mdFiles.save(id, { text, comments, marks, base: baseVersion, mode });
       if (!toFile && !saveAs) return next;
       let path = next.path;
       if (!path || saveAs) {
@@ -1397,9 +1432,14 @@ if (!app.requestSingleInstanceLock()) {
         if (choice.canceled || !choice.filePath) return next;
         path = extname(choice.filePath) ? choice.filePath : `${choice.filePath}.md`;
       }
-      next = await writeMd(next, path);
-      return next;
+      return mdFiles.save(id, {}, { toFile: true, path });
     });
+    handle("md:refresh", (id) => mdFiles.open(id));
+    handle("md:resolve", ({ id, ...resolution }) => mdFiles.resolve(id, resolution));
+    handle("md:versions", (id) => store.mdVersions(id));
+    handle("md:version-text", ({ id, seq }) => store.mdVersionText(id, seq));
+    handle("review:history", ({ kind, id }) => store.reviewHistory(kind, id).map((item) => ({ ...item,
+      running: [...activeTurns.values()].some((turn) => turn.notebookId === item.id) })));
     handle("md:reveal", (id) => {
       const doc = mdDoc(id);
       if (!doc.path || !existsSync(doc.path)) throw new Error("这份文档还没有对应的文件。");
@@ -1480,6 +1520,10 @@ if (!app.requestSingleInstanceLock()) {
       activeTurns.get(id)?.controller.abort(new Error("已停止生成。"));
     });
     createWindow();
+  }).catch((error) => {
+    reportStartup(error);
+    if (process.env.AI_NOTEBOOK_TEST_HEADLESS !== "1") dialog.showErrorBox("应用启动失败", error.message || String(error));
+    app.quit();
   });
   app.on("window-all-closed", () => app.quit());
   app.on("before-quit", () => {

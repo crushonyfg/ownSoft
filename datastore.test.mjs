@@ -55,6 +55,8 @@ test("a full export carries attachments, and copying data leaves the original in
   try {
     mkdirSync(join(dir, "attachments"));
     writeFileSync(join(dir, "attachments", "11111111-2222-4333-8444-555555555555.png"), "png");
+    mkdirSync(join(dir, "reviews"));
+    writeFileSync(join(dir, "reviews", "example.pdf"), "%PDF-reviewed");
     store.saveReply(null, "导出", "内容");
     const archive = join(dir, "backup.zip");
     exportArchive(store.db, dir, archive);
@@ -62,10 +64,12 @@ test("a full export carries attachments, and copying data leaves the original in
     const database = importArchive(archive, other);
     assert.equal(checkDatabase(database), 1);
     assert.ok(existsSync(join(other, "attachments", "11111111-2222-4333-8444-555555555555.png")));
+    assert.ok(existsSync(join(other, "reviews", "example.pdf")));
     const target = join(temp(), "moved");
     copyData(store.db, dir, target);
     assert.equal(checkDatabase(join(target, "notebook.sqlite")), 1);
     assert.deepEqual(readdirSync(join(target, "attachments")), ["11111111-2222-4333-8444-555555555555.png"]);
+    assert.ok(existsSync(join(target, "reviews", "example.pdf")));
     assert.ok(existsSync(join(dir, "notebook.sqlite")));
     assert.throws(() => copyData(store.db, dir, target), /已经有笔记数据库/);
   } finally {

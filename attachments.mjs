@@ -21,6 +21,7 @@ const turnFiles = (turns = []) => turns.flatMap((turn) => turn.attachments || []
 // annotations and their follow-ups, side branches and side conversations with single members.
 export function allAttachmentRefs(state) {
   return [
+    ...(state.parent?.selection?.imageRef ? [state.parent.selection.imageRef] : []),
     // An edited image keeps its original (to edit again or restore).
     ...state.blocks.flatMap((block) => [...(block.attachments || []), ...(block.imageEdit?.original ? [block.imageEdit.original] : []),
       ...turnFiles(block.review?.chat), ...(block.review?.comments || []).flatMap((item) => turnFiles(item.turns))]),

@@ -1,0 +1,18 @@
+{
+  "format": "ownsoft-testbed",
+  "version": 1,
+  "created": "2026-11-25T02:39:42.974Z",
+  "chats": 12,
+  "childChats": 10,
+  "blocks": 111,
+  "markdownDocuments": 1,
+  "pdfReviews": 0,
+  "markdownAnnotations": 6,
+  "portable": {
+    "credentialsIncluded": false,
+    "localFileBindings": false,
+    "nativeSessionsIncluded": false,
+    "scheduledAIEnabled": false
+  },
+  "sha256": "30ff43e08b4f580a9dd976548e84f34eaf539e2c8129f90da1990a136303ec7c"
+}

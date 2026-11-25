@@ -8,6 +8,7 @@ import { createComposer } from "./chat-composer.mjs";
 import { chatTurn, toolDetails } from "./comment-chat.mjs";
 import { renderMarkdown } from "./markdown-dom.mjs";
 import { pixelAvatar } from "./pixel-avatars.mjs";
+import { collapseWorkProgress, updateThinking } from "./work-progress.mjs";
 import { embedChat } from "./embedded-chat.mjs";
 
 const get = (id) => document.getElementById(id);
@@ -73,11 +74,12 @@ export function setupThreads(api, ctx) {
       paintPending(entry);
     });
   });
-  api.onActivity(({ requestId, text }) => {
+  api.onActivity(({ requestId, text, thinking }) => {
     const entry = running.get(requestId);
     if (!entry?.pending) return;
     entry.pending.activity = text;
-    paintPending(entry);
+    if (thinking) updateThinking(entry.pending.thinking ??= [], thinking);
+    paintPending(entry, true);
   });
   api.onTool(({ requestId, tool }) => {
     const entry = running.get(requestId);
@@ -357,12 +359,13 @@ export function setupThreads(api, ctx) {
     const avatar = entry.win.querySelector(".comment-progress .pixel-avatar");
     if (avatar) avatar.dataset.state = pending.activity?.includes("搜索") ? "searching" : pending.text ? "typing" : "thinking";
     if (withTools) {
-      const details = toolDetails(pending.tools);
+      const details = toolDetails(pending.tools, pending.thinking, { running: !pending.text, key: pending.id });
       entry.win.querySelector(".comment-progress-tools")?.replaceChildren(...(details ? [details] : []));
     }
     const output = entry.win.querySelector(".comment-progress-output");
     if (output) {
       renderMarkdown(output, pending.text);
+      if (pending.text) collapseWorkProgress(entry.win);
       if (!pending.text) output.append(create("span", "typing-dots", "● ● ●"));
     }
     if (entry.stick) entry.body.scrollTop = entry.body.scrollHeight;
@@ -391,8 +394,8 @@ export function setupThreads(api, ctx) {
   }
 
   function showFull(entry, thread) {
-    entry.win.classList.toggle("is-full-chat", Boolean(entry.fullView));
-    if (!entry.fullView) return;
+    entry.fullView = true;
+    entry.win.classList.add("is-full-chat");
     api.childChatId({ kind: "thread", notebookId: entry.notebookId, itemId: thread.id })
       .then((id) => { if (entry.fullView) embedChat(entry.full, id, { label: "私聊" }); })
       .catch((error) => ctx.notify(error.message));
@@ -452,44 +455,16 @@ export function setupThreads(api, ctx) {
         render();
       } catch (error) { ctx.notify(error.message); }
     });
-    const expand = button(entry.fullView ? "⤡" : "⤢", "thread-full", entry.fullView
-      ? "回到简洁视图" : "在这个窗口里切换为完整会话：编辑、收起、高亮、转批注等都能用");
-    expand.setAttribute("aria-pressed", String(Boolean(entry.fullView)));
-    expand.addEventListener("click", () => {
-      entry.fullView = !entry.fullView;
-      showFull(entry, thread);
-      render();
-    });
     const full = button("↗", "thread-full", "在新窗口以完整会话打开");
     full.addEventListener("click", () => api.openChildChat({ kind: "thread", notebookId: entry.notebookId, itemId: thread.id })
       .catch((error) => ctx.notify(error.message)));
-    tools.append(expand, full, layout, minimize, close);
+    tools.append(full, layout, minimize, close);
     entry.head.replaceChildren(who, badge, tools);
 
-    const previous = entry.body.scrollTop;
-    const parts = [];
-    if (thread.origin) {
-      const origin = create("details", "thread-origin");
-      origin.append(create("summary", "", `从${thread.origin.speaker ? ` ${thread.origin.speaker} 的` : "这条"}消息开始私聊`));
-      const quote = create("div", "markdown-content");
-      renderMarkdown(quote, thread.origin.text);
-      origin.append(quote);
-      parts.push(origin);
-    }
-    if (!thread.turns.length && !entry.pending) {
-      parts.push(create("p", "thread-empty", `和 ${member.name} 私聊。它能看到这份笔记的公共笔记块和群聊里已有的消息，但其他成员看不到这里，直到你发布。`));
-    }
-    parts.push(...thread.turns.map((turn) => chatTurn(turn, { speaker: ctx.speaker, openAttachment: ctx.openAttachment,
-      actions: turnActions(thread, turn) })));
-    if (entry.pending) parts.push(pendingView(entry));
-    entry.body.replaceChildren(...parts);
-    entry.body.scrollTop = entry.stick ? entry.body.scrollHeight : previous;
-    if (entry.composer.element.parentElement !== entry.win) entry.win.insertBefore(entry.composer.element, entry.body.nextSibling);
-    entry.composer.refresh();
-    if (entry.pending) paintPending(entry, true);
+    showFull(entry, thread);
   }
 
-  // ---- the row of avatars ---------------------------------------------------------------------------
+
   function paintDock() {
     const list = threads();
     const heads = list.map((thread) => {
@@ -573,7 +548,7 @@ export function setupThreads(api, ctx) {
     render();
     if (entry.open) {
       raise(entry);
-      entry.composer.focus();
+      entry.full.querySelector("iframe")?.focus();
     }
   }
 

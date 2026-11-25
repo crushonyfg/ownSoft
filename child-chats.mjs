@@ -27,9 +27,11 @@ export function chatTurns(chat) {
     if (!answer) continue;
     const source = first.source ?? question?.source;
     const tools = group.blocks.find((block) => block.tools?.length)?.tools;
+    const interrupted = group.blocks.find((block) => block.interrupted)?.interrupted;
     const files = fresh ? question?.attachments : undefined;
     turns.push({ id: first.id, question: question?.text.trim() || "（继续）", answer,
-      ...(source ? { source } : {}), ...(tools ? { tools } : {}), ...(files?.length ? { attachments: files } : {}) });
+      ...(source ? { source } : {}), ...(tools ? { tools } : {}), ...(interrupted ? { interrupted } : {}),
+      ...(files?.length ? { attachments: files } : {}) });
     fresh = false;
   }
   return turns;
@@ -38,6 +40,8 @@ export function chatTurns(chat) {
 function replyBlocks(turn, turnId = randomUUID()) {
   return splitReply(turn.answer).map((text, index) => ({
     id: index === 0 ? turn.id : randomUUID(), kind: "reply", turnId, text, marks: [],
+    ...(turn.interrupted ? { included: false } : {}),
+    ...(index === 0 && turn.interrupted ? { interrupted: turn.interrupted } : {}),
     ...(index === 0 && turn.source ? { source: turn.source } : {}),
     ...(index === 0 && turn.tools?.length ? { tools: turn.tools } : {})
   }));
@@ -132,10 +136,12 @@ export const childKey = {
   pdfComment: (hash, commentId) => `pdf-comment:${hash}:${commentId}`,
   mdChat: (id) => `md-chat:${id}`,
   mdComment: (id, commentId) => `md-comment:${id}:${commentId}`,
+  selection: (kind, id, selectionId) => `${kind}:${id}:${selectionId}`,
   todo: (id) => `todo:${id}`
 };
 
 export const childKinds = {
   note: "批注追问", branch: "分支", thread: "私聊", "pdf-chat": "PDF 全文对话", "pdf-comment": "PDF 批注追问",
-  "md-chat": "文档全文对话", "md-comment": "文档批注追问", todo: "待办"
+  "md-chat": "文档全文对话", "md-comment": "文档批注追问", "md-selection": "文档选区对话",
+  "pdf-selection": "PDF 选区对话", todo: "待办"
 };
